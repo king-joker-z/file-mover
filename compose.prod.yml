@@ -1,0 +1,32 @@
+version: "3"
+
+services:
+  file-mover:
+    image: king-joker-z/file-mover:latest   # GitHub Actions 自动构建，amd64 + arm64
+    container_name: file-mover
+    restart: unless-stopped
+    ports:
+      - "8787:8787"                          # Web UI: http://NAS-IP:8787
+    volumes:
+      # ===== 改成你自己的路径 =====
+      - /vol1/1000/docker/file-mover/local:/data/local     # 源目录：要迁移的本地文件
+      - /vol2/mount/cloud-drive:/data/cloud                # 目标目录：远程网盘挂载点（rclone mount / SMB / NFS 等）
+      - /vol1/1000/docker/file-mover/config:/app/config    # 配置与 SQLite 数据库持久化（必须挂载，否则重启丢队列）
+    environment:
+      - TZ=Asia/Shanghai
+      # 可选：文件权限映射（跨挂载 chown 报错时再启用）
+      # - PUID=1000
+      # - PGID=1000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/dashboard', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+# 极空间注意事项：
+# 1. 三个 volume 路径改为极空间里实际存在的目录；
+#    极空间 Docker UI 挂载时把宿主机目录映射到上面等号右边的容器路径即可。
+# 2. 网盘挂载建议由宿主机（如 rclone mount --allow-other）或另一容器完成，
+#    本容器只读写挂载点；网盘不稳定时到 Web UI「设置」开启安全模式（copy+校验+删源）。
+# 3. /app/config 不挂载的话，容器重建会丢失任务、队列与日志。

@@ -142,11 +142,13 @@ def api_update_settings(data: SettingsIn):
 WEB_DIST = os.environ.get("FILEMOVER_WEB", "/app/web/dist")
 
 if os.path.isdir(WEB_DIST):
-    app.mount("/assets", StaticFiles(directory=os.path.join(WEB_DIST, "assets")), name="assets")
+    assets_dir = os.path.join(WEB_DIST, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{path:path}")
     async def spa(path: str):
         full = os.path.join(WEB_DIST, path)
-        if path and os.path.isfile(full):
+        if path and os.path.isfile(full) and os.path.commonpath([os.path.abspath(full), os.path.abspath(WEB_DIST)]) == os.path.abspath(WEB_DIST):
             return FileResponse(full)
         return FileResponse(os.path.join(WEB_DIST, "index.html"))
