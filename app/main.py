@@ -7,7 +7,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from . import db, config, scheduler
+from . import db, config
+from .scheduler import scheduler
 
 
 @asynccontextmanager
