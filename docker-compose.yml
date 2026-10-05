@@ -1,0 +1,14 @@
+version: "3"
+services:
+  file-mover:
+    build: .
+    container_name: file-mover
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - /path/to/local:/data/local        # 源目录（改成你的本地目录）
+      - /path/to/cloud-mount:/data/cloud  # 目标目录（网盘挂载点）
+      - ./config:/app/config              # 配置与 SQLite 持久化
+    environment:
+      - TZ=Asia/Shanghai
