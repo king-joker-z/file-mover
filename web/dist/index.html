@@ -274,6 +274,7 @@ function makeNode(rel, name) {
 
   row.onclick = () => {
     pickerSelRel = rel; pickerSelAbs = "";
+    const tree = $("#picker-tree");
     tree.querySelectorAll(".dir-item.sel").forEach(x => x.classList.remove("sel"));
     row.classList.add("dir-item", "sel");
     $("#picker-sel").textContent = "已选: /" + rel;
