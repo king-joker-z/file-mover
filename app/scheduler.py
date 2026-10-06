@@ -129,6 +129,7 @@ class Scheduler:
             t0 = time.monotonic()
             result, detail = transfer.transfer(item, task)
             duration_ms = int((time.monotonic() - t0) * 1000)
+            wait_after = None
 
             if result == "success":
                 db.set_status(item["id"], "done")
@@ -138,13 +139,17 @@ class Scheduler:
             else:
                 retries = item.get("retries", 0) + 1
                 max_retries = config.get()["max_retries"]
+                detail = f"[第{retries}次尝试] {detail}"
                 if retries <= max_retries:
                     backoff = config.get()["retry_backoff_seconds"]
                     delay = backoff[min(retries - 1, len(backoff) - 1)]
                     db.set_status(item["id"], "failed", retries=retries,
                                   next_retry_at=time.time() + delay)
+                    detail += f"，{delay}s 后自动重试"
+                    wait_after = interval
                 else:
                     db.set_status(item["id"], "failed", retries=retries)
+                    detail += f"，已达最大重试次数({max_retries})，等待手动重试"
 
             db.add_log(item["task_id"], item["id"], item["src_path"], item["dst_path"],
                        item.get("size", 0), duration_ms, result, detail)
@@ -152,7 +157,7 @@ class Scheduler:
 
             # 节流：任务级间隔
             interval = max(0.0, float(task.get("interval_seconds", 5)))
-            self._stop.wait(timeout=interval)
+            self._stop.wait(timeout=wait_after if wait_after is not None else interval)
 
 
 scheduler = Scheduler()
