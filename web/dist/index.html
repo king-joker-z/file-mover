@@ -227,27 +227,26 @@ function openPicker(kind) {
   pickerPath = "";
   $("#picker-mask").style.display = "flex";
   browseDirs("");
-}
-function closePicker() { $("#picker-mask").style.display = "none"; }
+}function closePicker() { $("#picker-mask").style.display = "none"; }
 
-async function browseDirs(path) {
+async function browseDirs(path, isRetry) {
   const list = $("#picker-list"), crumb = $("#picker-crumb");
   list.innerHTML = '<div class="empty">加载中…</div>';
   try {
     const d = await api("/api/dirs" + (path ? "?path=" + encodeURIComponent(path) : ""));
     pickerPath = d.path; pickerRoot = d.root;
-    crumb.textContent = d.path + "（选择此目录 = 双击进入或点下方按钮）";
+    crumb.textContent = "当前：" + d.path + "（双击进入子目录，或直接点「选择当前目录」）";
     list.innerHTML = d.dirs.length
-      ? d.dirs.map(n => `<div class="dir-item" ondblclick="browseDirs('${esc(pickerPath)}'.replace(/\\\\/g,'/') + '/' + '${esc(n)}')" onclick="document.querySelectorAll('.dir-item').forEach(x=>x.classList.remove('sel'));this.classList.add('sel')">
-          <span>📁</span><span>${esc(n)}</span>
-          <button type="button" class="btn small gray" style="margin-left:auto" onclick="event.stopPropagation();browseDirs($('#picker-path-dir').value+'/${esc(n)}'.replace('//','/'))" hidden></button></div>`).join("")
-      : '<div class="empty">无子目录</div>';
-    // 绑定双击进入（简单可靠的事件委托）
+      ? d.dirs.map(n => `<div class="dir-item"><span>📁</span><span>${esc(n)}</span></div>`).join("")
+      : '<div class="empty">无子目录，可直接点「选择当前目录」</div>';
     Array.from(list.querySelectorAll(".dir-item")).forEach((el, i) => {
       el.onclick = () => { Array.from(list.children).forEach(x => x.classList.remove("sel")); el.classList.add("sel"); };
       el.ondblclick = () => browseDirs(joinDir(d.path, d.dirs[i]));
     });
-  } catch (e) { list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>'; }
+  } catch (e) {
+    if (path && !isRetry) { pickerPath = ""; return browseDirs("", true); }  // 路径失效回退根目录
+    list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
+  }
 }
 function joinDir(base, name) { return (base === "/" ? "" : base) + "/" + name; }
 
