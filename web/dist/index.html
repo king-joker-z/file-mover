@@ -29,6 +29,7 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .btn.small{padding:4px 10px;font-size:12px}
 .btn.red{background:var(--err)}
 .btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.green{background:var(--ok)}
 .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
 .tag.pending{background:#eef0f4;color:var(--muted)}
 .tag.transferring{background:#e3ecff;color:var(--primary)}
@@ -95,7 +96,7 @@ input:checked+.slider:before{transform:translateX(16px)}
       </div>
     </div>
     <div class="panel">
-      <h2>新建任务</h2>
+      <h2 id="form-title">新建任务</h2>
       <form id="task-form">
         <div class="row">
           <div class="field"><label>任务名称</label><input id="f-name" required placeholder="我的迁移任务" autocomplete="off"></div>
@@ -205,6 +206,8 @@ async function loadDash(){
   }catch(e){}
 }
 
+let editingTaskId = null;  // 非 null = 编辑模式
+
 async function loadTasks(){
   try{
     const tasks=await api("/api/tasks");
@@ -214,8 +217,31 @@ async function loadTasks(){
         <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}</td>
         <td><label class="switch"><input type="checkbox" ${t.enabled?"checked":""} onchange="toggleTask(${t.id})"><span class="slider"></span></label></td>
-        <td><button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
+        <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
+        <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
   }catch(e){}
+}
+
+async function editTask(id){
+  const t = (await api("/api/tasks")).find(x=>x.id===id);
+  if(!t) return;
+  editingTaskId = id;
+  $("#f-name").value=t.name; $("#f-src").value=t.src_dir; $("#f-dst").value=t.dst_dir;
+  $("#f-interval").value=t.interval_seconds; $("#f-scan").value=t.scan_interval;
+  $("#f-inc").value=t.include_patterns||""; $("#f-exc").value=t.exclude_patterns||"";
+  $("#f-conflict").value=t.conflict_policy; $("#f-path").value=t.path_rule;
+  $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
+  const btn=$("#task-form button[type=submit]");
+  btn.textContent="保存修改"; btn.classList.add("green");
+  $("#form-title").textContent = "编辑任务（ID "+id+"）— 保存后立即生效";
+  // 滚到表单
+  $("#form-title").scrollIntoView({behavior:"smooth"});
+}
+function resetFormMode(){
+  editingTaskId = null;
+  const btn=$("#task-form button[type=submit]");
+  btn.textContent="创建任务"; btn.classList.remove("green");
+  $("#form-title").textContent = "新建任务";
 }
 // ---- 目录弹窗选择器（树形懒展开，相对路径协议） ----
 let pickerKind = null;
@@ -303,13 +329,20 @@ $("#task-form").onsubmit=async e=>{
   const src = $("#f-src").value, dst = $("#f-dst").value;
   if (!src || !dst) { alert("请先点击「选择」挑选源目录和目标目录"); return; }
   if (dst === src || dst.startsWith(src + "/")) { alert("目标目录不能等于或在源目录内部"); return; }
-  await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+  const payload = {
     name:$("#f-name").value,src_dir:src,dst_dir:dst,
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
     include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
     conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value,
-    run_windows:$("#f-windows").value.trim()})});
-  e.target.reset();loadTasks();
+    run_windows:$("#f-windows").value.trim()};
+  try{
+    if (editingTaskId !== null) {
+      await api("/api/tasks/"+editingTaskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    } else {
+      await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    }
+  }catch(err){ alert("保存失败: "+err.message); return; }
+  e.target.reset(); resetFormMode(); loadTasks();
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
 async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
