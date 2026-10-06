@@ -98,7 +98,7 @@ input:checked+.slider:before{transform:translateX(16px)}
       <h2>新建任务</h2>
       <form id="task-form">
         <div class="row">
-          <div class="field"><label>任务名称</label><input id="f-name" required placeholder="我的迁移任务"></div>
+          <div class="field"><label>任务名称</label><input id="f-name" required placeholder="我的迁移任务" autocomplete="off"></div>
           <div class="field"><label>源目录</label>
             <div style="display:flex;gap:6px"><input id="f-src" readonly placeholder="点击右侧选择" style="flex:1;background:#f8f9fb;cursor:pointer" onclick="openPicker('src')">
             <button type="button" class="btn" onclick="openPicker('src')">选择</button></div></div>
