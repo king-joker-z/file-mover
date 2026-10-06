@@ -16,6 +16,7 @@ DEFAULTS = {
     "remove_empty_dirs": True,
     "ignore_suffixes": [".tmp", ".part", ".partial", ".downloading", ".!ut", ".crdownload"],
     "default_interval_seconds": 5,
+    "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
 }
 
 _lock = threading.Lock()

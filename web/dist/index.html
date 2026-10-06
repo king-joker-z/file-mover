@@ -171,6 +171,7 @@ input:checked+.slider:before{transform:translateX(16px)}
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-safe"> 安全模式（copy+校验+删源，适合不稳定挂载）</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-verify"> 迁移后校验大小</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-empty"> 清理迁移后的空目录</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-nfo"> nfo 预处理（迁移前修正：actor 数字UID name→role）</label>
         </div>
         <button class="btn" type="submit">保存设置</button>
         <span id="settings-msg" style="color:var(--ok);margin-left:12px;font-size:13px"></span>
@@ -396,6 +397,7 @@ async function loadSettings(){
     $("#g-retries").value=s.max_retries;
     $("#g-stable").checked=s.stable_check;$("#g-safe").checked=s.safe_mode;
     $("#g-verify").checked=s.verify_size;$("#g-empty").checked=s.remove_empty_dirs;
+    $("#g-nfo").checked=s.nfo_fix_enabled!==false;
   }catch(e){}
 }
 $("#settings-form").onsubmit=async e=>{
@@ -403,7 +405,8 @@ $("#settings-form").onsubmit=async e=>{
   await api("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({
     scan_interval:+$("#g-scan").value,stable_check_seconds:+$("#g-stable-s").value,
     max_retries:+$("#g-retries").value,stable_check:$("#g-stable").checked,
-    safe_mode:$("#g-safe").checked,verify_size:$("#g-verify").checked,remove_empty_dirs:$("#g-empty").checked})});
+    safe_mode:$("#g-safe").checked,verify_size:$("#g-verify").checked,remove_empty_dirs:$("#g-empty").checked,
+    nfo_fix_enabled:$("#g-nfo").checked})});
   $("#settings-msg").textContent="已保存 ✓";setTimeout(()=>$("#settings-msg").textContent="",2000);
 };
 

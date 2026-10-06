@@ -3,6 +3,8 @@ import os
 import shutil
 from typing import Optional, Tuple
 import hashlib
+from . import nfo_fix
+from . import config as app_config
 import tempfile
 from . import db, config
 
@@ -49,6 +51,26 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         return "failed", "源文件不存在（可能已被移动或删除）"
     src_size = _size(src)
 
+    # nfo 预处理：迁移前改写内容（安全模式走 copy 流程天然支持；直接模式下就地改写源文件）
+    detail_extra = ""
+    if src.lower().endswith(".nfo") and app_config.get().get("nfo_fix_enabled"):
+        try:
+            with open(src, "r", encoding="utf-8", errors="replace") as f:
+                original = f.read()
+            fixed, applied = nfo_fix.fix_nfo(original)
+            if applied:
+                if cfg.get("safe_mode"):
+                    # 安全模式：先写好改写内容，再 copy 这份新内容
+                    with open(src, "w", encoding="utf-8") as f:
+                        f.write(fixed)
+                else:
+                    with open(src, "w", encoding="utf-8") as f:
+                        f.write(fixed)
+                src_size = _size(src)
+                detail_extra = " +nfo:" + ",".join(applied)
+        except Exception as e:
+            return "failed", f"nfo 预处理失败: {e}"
+
     resolved = _resolve_conflict(dst, policy)
     if resolved is None:
         return "conflict", f"目标已存在: {dst}（策略 skip）"
@@ -73,6 +95,8 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                 raise IOError("校验失败：目标大小与源不一致")
 
         detail = f"ok ({how})" if how != "none" else "ok"
+        if detail_extra:
+            detail += detail_extra
         if cfg.get("remove_empty_dirs"):
             _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
         return "success", detail
