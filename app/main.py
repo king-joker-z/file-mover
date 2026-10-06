@@ -48,6 +48,31 @@ class SettingsIn(BaseModel):
     default_interval_seconds: Optional[float] = None
 
 
+# ---------- 目录浏览（供任务表单下拉选择） ----------
+
+# 挂载根目录：容器内即 /（compose 中 /data/local、/data/cloud 等都挂在这里）
+MOUNT_ROOT = os.environ.get("FILEMOVER_MOUNT_ROOT", "/")
+
+@app.get("/api/dirs")
+def api_dirs(path: Optional[str] = None):
+    """列出指定目录下的子目录。path 为空时列出挂载根下的顶层目录。
+    返回 {path: 当前绝对路径, dirs: [子目录名]}"""
+    import pathlib
+    base = pathlib.Path(MOUNT_ROOT).resolve()
+    if path:
+        target = (base / path.lstrip("/")).resolve()
+        # 防穿越：必须在根目录之下
+        if base != target and base not in target.parents:
+            raise HTTPException(400, "路径越界")
+    else:
+        target = base
+    if not target.is_dir():
+        raise HTTPException(404, "目录不存在")
+    dirs = sorted([p.name for p in target.iterdir()
+                   if p.is_dir() and not p.name.startswith(".")])
+    return {"path": str(target), "dirs": dirs}
+
+
 # ---------- dashboard ----------
 
 @app.get("/api/dashboard")

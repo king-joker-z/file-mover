@@ -84,8 +84,14 @@ input:checked+.slider:before{transform:translateX(16px)}
       <form id="task-form">
         <div class="row">
           <div class="field"><label>任务名称</label><input id="f-name" required placeholder="我的迁移任务"></div>
-          <div class="field"><label>源目录（容器内路径）</label><input id="f-src" required placeholder="/data/local"></div>
-          <div class="field"><label>目标目录（网盘挂载）</label><input id="f-dst" required placeholder="/data/cloud"></div>
+          <div class="field"><label>源目录（下拉选择）</label>
+            <div style="display:flex;gap:6px"><select id="f-src" required style="flex:1"></select>
+            <button type="button" class="btn small gray" onclick="dirUp('src')">↑</button>
+            <button type="button" class="btn small" onclick="dirInto('src')">进入</button></div></div>
+          <div class="field"><label>目标目录（下拉选择）</label>
+            <div style="display:flex;gap:6px"><select id="f-dst" required style="flex:1"></select>
+            <button type="button" class="btn small gray" onclick="dirUp('dst')">↑</button>
+            <button type="button" class="btn small" onclick="dirInto('dst')">进入</button></div></div>
         </div>
         <div class="row">
           <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" value="5"></div>
@@ -190,10 +196,51 @@ async function loadTasks(){
         <td><button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
   }catch(e){}
 }
+// ---- 目录下拉选择 ----
+const dirState = {src: {path: "", loaded: ""}, dst: {path: "", loaded: ""}};
+
+async function loadDirs(kind) {
+  const sel = $("#f-" + kind);
+  const st = dirState[kind];
+  try {
+    const d = await api("/api/dirs" + (st.path ? "?path=" + encodeURIComponent(st.path) : ""));
+    st.loaded = d.path;
+    sel.innerHTML = `<option value="">— 选择子目录 —</option>` +
+      d.dirs.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  } catch (e) { sel.innerHTML = '<option value="">加载失败</option>'; }
+}
+async function dirInto(kind) {
+  const sel = $("#f-" + kind);
+  if (!sel.value) return;
+  const cur = dirState[kind].loaded || dirState[kind].path || "/";
+  dirState[kind].path = (cur === "/" ? "" : cur) + "/" + sel.value;
+  await loadDirs(kind);
+}
+async function dirUp(kind) {
+  const cur = dirState[kind].loaded || "";
+  if (!cur || cur === "/") { dirState[kind].path = ""; await loadDirs(kind); return; }
+  dirState[kind].path = cur; await loadDirs(kind);
+  // 载入的是当前 path 本身，上级需要去掉最后一段
+  const p = dirState[kind].path.replace(/\/+$/, "");
+  dirState[kind].path = p.split("/").slice(0, -1).join("/") || "";
+  await loadDirs(kind);
+}
+function getSelDir(kind) {
+  const st = dirState[kind];
+  const sel = $("#f-" + kind);
+  if (!st.loaded) return "";
+  const cur = st.loaded === "/" ? "" : st.loaded;
+  return sel.value ? cur + "/" + sel.value : cur;
+}
+loadDirs("src"); loadDirs("dst");
+
 $("#task-form").onsubmit=async e=>{
   e.preventDefault();
+  const src = getSelDir("src"), dst = getSelDir("dst");
+  if (!src || !dst) { alert("请先通过下拉+「进入」选择源目录和目标目录"); return; }
+  if (dst === src || dst.startsWith(src + "/")) { alert("目标目录不能等于或在源目录内部"); return; }
   await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
-    name:$("#f-name").value,src_dir:$("#f-src").value,dst_dir:$("#f-dst").value,
+    name:$("#f-name").value,src_dir:src,dst_dir:dst,
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
     include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
     conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value})});
