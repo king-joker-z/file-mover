@@ -56,29 +56,33 @@ class SettingsIn(BaseModel):
 MOUNT_ROOT = os.environ.get("FILEMOVER_MOUNT_ROOT", "/")
 
 @app.get("/api/dirs")
-def api_dirs(path: Optional[str] = None):
-    """列出指定目录下的子目录。path 为空时自动定位挂载根：
-    优先 /data（compose 约定），否则 FILEMOVER_MOUNT_ROOT，否则 /。
-    返回 {path: 当前绝对路径, dirs: [子目录名], root: 浏览根}"""
+def api_dirs(rel: Optional[str] = None):
+    """列出浏览根下指定相对路径的子目录。
+    rel 为空 = 浏览根；否则是相对浏览根的相对路径（如 "local/子目录"）。
+    返回 {rel: 相对路径, path: 绝对路径(仅展示), dirs: [子目录名], root: 浏览根}"""
     import pathlib
     root = pathlib.Path(MOUNT_ROOT).resolve()
-    # 自动定位：MOUNT_ROOT 为 / 时，若 /data 存在则以其为浏览根
     if str(root) == "/":
         data_dir = pathlib.Path("/data")
         if data_dir.is_dir():
             root = data_dir.resolve()
-    if path:
-        target = (root / path.lstrip("/")).resolve()
-        # 防穿越：必须在根目录之下
-        if root != target and root not in target.parents:
-            raise HTTPException(400, "路径越界")
+    if rel:
+        rel = rel.strip("/")
+        if rel in ("", "."):
+            rel = ""
+        # 防穿越：分段校验，不允许 ".." 和绝对片段
+        parts = [p for p in rel.split("/") if p]
+        if any(p in ("..", "") for p in parts):
+            raise HTTPException(400, "路径非法")
+        target = root.joinpath(*parts)
     else:
         target = root
+        rel = ""
     if not target.is_dir():
         raise HTTPException(404, "目录不存在")
     dirs = sorted([p.name for p in target.iterdir()
                    if p.is_dir() and not p.name.startswith(".")])
-    return {"path": str(target), "dirs": dirs, "root": str(root)}
+    return {"rel": rel, "path": str(target), "dirs": dirs, "root": str(root)}
 
 
 # ---------- dashboard ----------

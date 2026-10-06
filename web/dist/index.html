@@ -217,39 +217,37 @@ async function loadTasks(){
         <td><button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
   }catch(e){}
 }
-// ---- 目录弹窗选择器（多级浏览） ----
+// ---- 目录弹窗选择器（多级浏览，相对路径协议） ----
 let pickerKind = null;   // "src" | "dst"
-let pickerPath = "";     // 当前浏览的绝对路径
-let pickerRoot = "/";
+let pickerRel = "";      // 相对浏览根的路径
+let pickerPath = "";     // 绝对路径（仅展示）
 
 function openPicker(kind) {
   pickerKind = kind;
-  pickerPath = "";
+  pickerRel = "";
   $("#picker-mask").style.display = "flex";
   browseDirs("");
 }function closePicker() { $("#picker-mask").style.display = "none"; }
 
-async function browseDirs(path, isRetry) {
+async function browseDirs(rel, isRetry) {
   const list = $("#picker-list"), crumb = $("#picker-crumb");
   list.innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const d = await api("/api/dirs" + (path ? "?path=" + encodeURIComponent(path) : ""));
-    pickerPath = d.path; pickerRoot = d.root;
-    crumb.textContent = "当前：" + d.path + "（双击进入子目录，或直接点「选择当前目录」）";
+    const d = await api("/api/dirs" + (rel ? "?rel=" + encodeURIComponent(rel) : ""));
+    pickerRel = d.rel; pickerPath = d.path;
+    crumb.textContent = "当前：" + (d.rel ? "/" + d.rel : "根目录") + "（双击进入子目录，或直接点「选择当前目录」）";
     list.innerHTML = d.dirs.length
       ? d.dirs.map(n => `<div class="dir-item"><span>📁</span><span>${esc(n)}</span></div>`).join("")
       : '<div class="empty">无子目录，可直接点「选择当前目录」</div>';
     Array.from(list.querySelectorAll(".dir-item")).forEach((el, i) => {
       el.onclick = () => { Array.from(list.children).forEach(x => x.classList.remove("sel")); el.classList.add("sel"); };
-      el.ondblclick = () => browseDirs(joinDir(d.path, d.dirs[i]));
+      el.ondblclick = () => browseDirs(d.rel ? d.rel + "/" + d.dirs[i] : d.dirs[i]);
     });
   } catch (e) {
-    if (path && !isRetry) { pickerPath = ""; return browseDirs("", true); }  // 路径失效回退根目录
+    if (rel && !isRetry) { pickerRel = ""; return browseDirs("", true); }  // 路径失效回退根目录
     list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
   }
 }
-function joinDir(base, name) { return (base === "/" ? "" : base) + "/" + name; }
-
 function confirmPicker() {
   if (!pickerKind) return;
   $("#f-" + pickerKind).value = pickerPath;
