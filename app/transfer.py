@@ -77,10 +77,14 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
     final_dst, how = resolved
 
     try:
-        os.makedirs(os.path.dirname(final_dst), exist_ok=True)
+        # 目标目录预检：网盘挂载不稳定时 makedirs/move 会抛 EIO，
+        # 先对目标父目录做一次轻量探测，给出更明确的错误信息
+        parent = os.path.dirname(final_dst)
+        if not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
 
         if cfg.get("safe_mode"):
-            tmp = os.path.join(os.path.dirname(final_dst),
+            tmp = os.path.join(parent,
                                "." + os.path.basename(final_dst) + ".moving")
             shutil.copy2(src, tmp)
             if cfg.get("verify_size") and (_size(tmp) != src_size):
@@ -100,7 +104,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         if cfg.get("remove_empty_dirs"):
             _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
         return "success", detail
-    except Exception as e:
+    except OSError as e:
         # 清理安全模式残留
         tmp = os.path.join(os.path.dirname(final_dst),
                            "." + os.path.basename(final_dst) + ".moving")
@@ -109,6 +113,20 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                 os.remove(tmp)
         except OSError:
             pass
+        # 错误分类，帮助定位网盘挂载问题
+        import errno as _errno
+        eno = e.errno
+        hints = {
+            _errno.EIO: "（网盘挂载返回 I/O 错误：挂载超时/网盘API失败/缓存盘异常，请检查挂载工具日志）",
+            _errno.EACCES: "（权限不足：检查 PUID/PGID 与挂载目录权限）",
+            _errno.EPERM: "（权限不足：检查 PUID/PGID 与挂载目录权限）",
+            _errno.ENOSPC: "（目标空间不足或挂载缓存盘已满）",
+            _errno.ENOENT: "（路径不存在：挂载点可能已掉线）",
+            _errno.EBUSY: "（挂载点忙：网盘可能正在同步）",
+        }
+        hint = hints.get(eno, "")
+        return "failed", f"{e} [errno={eno}]{hint}"
+    except Exception as e:
         return "failed", str(e)
 
 
