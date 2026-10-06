@@ -235,6 +235,8 @@ function openPicker(kind) {
   }).catch(e => tree.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>');
 }
 
+function closePicker() { $("#picker-mask").style.display = "none"; }
+
 function makeNode(rel, name) {
   const row = document.createElement("div");
   row.style.cssText = "display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;cursor:pointer";
@@ -294,8 +296,6 @@ function confirmPicker() {
   $("#f-" + pickerKind).value = pickerSelAbs || pickerSelRel;
   closePicker();
 }
-
-loadDirsRemoved = null;
 
 $("#task-form").onsubmit=async e=>{
   e.preventDefault();
