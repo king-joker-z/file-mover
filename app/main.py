@@ -35,6 +35,8 @@ class TaskIn(BaseModel):
     path_rule: str = "keep_structure"
     after_action: str = "delete"
     enabled: bool = True
+    # 运行周期：空 = 全天运行；否则窗口内运行，如 "01:00-07:00"，可多段逗号分隔
+    run_windows: str = ""
 
 
 class SettingsIn(BaseModel):
@@ -142,12 +144,25 @@ def api_retry_batch(ids: list[int]):
     return {"ok": True}
 
 
+@app.delete("/api/queue")
+def api_clear_queue(status: Optional[str] = None):
+    """清空队列。默认只清 done；传 status=failed/conflict/all 按需清除"""
+    n = db.clear_queue(status)
+    return {"ok": True, "removed": n}
+
+
 # ---------- logs ----------
 
 @app.get("/api/logs")
 def api_logs(task_id: Optional[int] = None, status: Optional[str] = None,
              limit: int = 100, offset: int = 0):
     return db.list_logs(task_id, status, limit, offset)
+
+
+@app.delete("/api/logs")
+def api_clear_logs():
+    n = db.clear_logs()
+    return {"ok": True, "removed": n}
 
 
 # ---------- settings ----------

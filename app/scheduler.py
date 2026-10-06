@@ -73,6 +73,35 @@ class Scheduler:
             self._scan_wake.wait(timeout=min(5, max(1, cfg["scan_interval"] / 6)))
             self._scan_wake.clear()
 
+    # ---------- 运行窗口 ----------
+
+    @staticmethod
+    def _in_run_window(task: dict, now=None) -> bool:
+        """run_windows 为空 = 全天运行；否则 "HH:MM-HH:MM" 多段逗号分隔，窗口内才运行"""
+        raw = (task.get("run_windows") or "").strip()
+        if not raw:
+            return True
+        t = now or time.localtime()
+        cur = t.tm_hour * 60 + t.tm_min
+        for seg in raw.split(","):
+            seg = seg.strip()
+            if not seg:
+                continue
+            try:
+                a, b = seg.split("-")
+                h1, m1 = map(int, a.strip().split(":"))
+                h2, m2 = map(int, b.strip().split(":"))
+            except ValueError:
+                return True  # 非法格式按全天运行，避免配置错误导致任务静默失效
+            start, end = h1 * 60 + m1, h2 * 60 + m2
+            if start <= end:
+                if start <= cur < end:
+                    return True
+            else:  # 跨午夜，如 23:00-06:00
+                if cur >= start or cur < end:
+                    return True
+        return False
+
     # ---------- 迁移主循环 ----------
 
     def _work_loop(self):
@@ -87,6 +116,12 @@ class Scheduler:
             if task is None or not task.get("enabled"):
                 db.set_status(item["id"], "pending")
                 self._stop.wait(timeout=2)
+                continue
+            # 运行窗口外：本条目放回 pending，等待窗口开启
+            if not self._in_run_window(task):
+                db.set_status(item["id"], "pending")
+                self.current_file = None
+                self._stop.wait(timeout=30)
                 continue
 
             self.current_file = item["rel_path"]

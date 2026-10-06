@@ -100,6 +100,10 @@ input:checked+.slider:before{transform:translateX(16px)}
           <div class="field"><label>排除（通配）</label><input id="f-exc" placeholder="*.tmp"></div>
         </div>
         <div class="row">
+          <div class="field"><label>运行周期（可多段，逗号分隔，留空=全天运行）</label>
+            <input id="f-windows" placeholder="01:00-07:00 或 01:00-07:00,23:00-24:00"></div>
+        </div>
+        <div class="row">
           <div class="field"><label>同名冲突策略</label>
             <select id="f-conflict"><option value="skip">跳过（提醒人工处理）</option><option value="overwrite">覆盖</option><option value="rename">自动重命名 name(1).ext</option></select></div>
           <div class="field"><label>目标路径规则</label>
@@ -123,7 +127,11 @@ input:checked+.slider:before{transform:translateX(16px)}
         <button data-s="done">done</button>
         <button data-s="failed">failed</button>
         <button data-s="conflict">conflict</button>
-        <button class="btn small red" style="margin-left:auto" onclick="retryFailed()">重试全部失败项</button>
+        <button class="btn small gray" style="margin-left:auto" onclick="clearQueue('done')">清除已完成</button>
+        <button class="btn small gray" onclick="clearQueue('failed')">清除失败</button>
+        <button class="btn small gray" onclick="clearQueue('conflict')">清除冲突</button>
+        <button class="btn small red" onclick="clearQueue('all')">清空全部</button>
+        <button class="btn small red" onclick="retryFailed()">重试全部失败项</button>
       </div>
       <div id="queue-list"></div>
     </div>
@@ -131,7 +139,7 @@ input:checked+.slider:before{transform:translateX(16px)}
 
   <!-- 日志 -->
   <div id="tab-logs" style="display:none">
-    <div class="panel"><h2>迁移日志</h2><div id="log-list"></div></div>
+    <div class="panel"><h2>迁移日志 <button class="btn small red" style="float:right" onclick="clearLogs()">清空日志</button></h2><div id="log-list"></div></div>
   </div>
 
   <!-- 设置 -->
@@ -188,9 +196,9 @@ async function loadTasks(){
   try{
     const tasks=await api("/api/tasks");
     if(!tasks.length){$("#task-list").innerHTML='<div class="empty">暂无任务，请先创建</div>';return;}
-    $("#task-list").innerHTML=`<table><tr><th>名称</th><th>源 → 目标</th><th>间隔</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
+    $("#task-list").innerHTML=`<table><tr><th>名称</th><th>源 → 目标</th><th>间隔</th><th>运行周期</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
       tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td>
-        <td>${t.interval_seconds}s</td>
+        <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}</td>
         <td><label class="switch"><input type="checkbox" ${t.enabled?"checked":""} onchange="toggleTask(${t.id})"><span class="slider"></span></label></td>
         <td><button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
@@ -243,7 +251,8 @@ $("#task-form").onsubmit=async e=>{
     name:$("#f-name").value,src_dir:src,dst_dir:dst,
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
     include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
-    conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value})});
+    conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value,
+    run_windows:$("#f-windows").value.trim()})});
   e.target.reset();loadTasks();
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
@@ -264,6 +273,16 @@ $$("#queue-filters button[data-s]").forEach(b=>b.onclick=()=>{
   curQueueFilter=b.dataset.s;loadQueue();
 });
 async function retryOne(id){await api(`/api/queue/${id}/retry`,{method:"POST"});loadQueue();}
+async function clearQueue(scope){
+  const names={done:"已完成",failed:"失败",conflict:"冲突",all:"全部"};
+  if(!confirm(`确认清除${names[scope]}队列条目？`))return;
+  const q=scope==="all"?"?status=all":scope==="done"?"":`?status=${scope}`;
+  await api(`/api/queue${q}`,{method:"DELETE"});loadQueue();loadDash();
+}
+async function clearLogs(){
+  if(!confirm("确认清空全部日志？"))return;
+  await api("/api/logs",{method:"DELETE"});loadLogs();
+}
 async function retryFailed(){
   const items=await api("/api/queue?status=failed&limit=500");
   if(items.length){await api("/api/queue/retry-batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(items.map(i=>i.id))});}

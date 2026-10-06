@@ -19,6 +19,7 @@ def get_conn() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _init_schema(_conn)
+        _migrate_schema(_conn)
     return _conn
 
 
@@ -37,6 +38,7 @@ def _init_schema(conn: sqlite3.Connection):
             conflict_policy TEXT NOT NULL DEFAULT 'skip',
             path_rule TEXT NOT NULL DEFAULT 'keep_structure',
             after_action TEXT NOT NULL DEFAULT 'delete',
+            run_windows TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -74,6 +76,14 @@ def _init_schema(conn: sqlite3.Connection):
     conn.commit()
 
 
+def _migrate_schema(conn: sqlite3.Connection):
+    """已存在的库补新列"""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    if "run_windows" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN run_windows TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+
 def now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -97,12 +107,13 @@ def create_task(data: dict) -> int:
         cur = conn.execute(
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
-               enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               run_windows, enabled, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
              data.get("path_rule", "keep_structure"), data.get("after_action", "delete"),
+             data.get("run_windows", ""),
              1 if data.get("enabled", True) else 0, now_str(), now_str()))
         return cur.lastrowid
 
@@ -112,7 +123,7 @@ def update_task(task_id: int, data: dict):
     fields, vals = [], []
     for k in ("name", "src_dir", "dst_dir", "interval_seconds", "scan_interval",
               "include_patterns", "exclude_patterns", "conflict_policy",
-              "path_rule", "after_action", "enabled"):
+              "path_rule", "after_action", "run_windows", "enabled"):
         if k in data:
             fields.append(f"{k}=?")
             vals.append(data[k])
@@ -221,6 +232,26 @@ def retry_queue(ids):
         conn.executemany(
             "UPDATE queue SET status='pending', next_retry_at=NULL, retries=0, updated_at=? WHERE id=?",
             [(now_str(), i) for i in ids])
+
+
+def clear_queue(status=None) -> int:
+    """清空队列。status: None=只清 done；'all'=全部；其他=指定状态"""
+    conn = get_conn()
+    with _lock, conn:
+        if status == "all":
+            cur = conn.execute("DELETE FROM queue")
+        elif status:
+            cur = conn.execute("DELETE FROM queue WHERE status=?", (status,))
+        else:
+            cur = conn.execute("DELETE FROM queue WHERE status='done'")
+        return cur.rowcount
+
+
+def clear_logs() -> int:
+    conn = get_conn()
+    with _lock, conn:
+        cur = conn.execute("DELETE FROM logs")
+        return cur.rowcount
 
 
 # ---------- logs ----------
