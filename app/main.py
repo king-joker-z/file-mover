@@ -65,7 +65,7 @@ def api_dirs(rel: Optional[str] = None):
     if str(root) == "/":
         data_dir = pathlib.Path("/data")
         if data_dir.is_dir():
-            root = data_dir.resolve()
+            root = data_dir.resolve()  # 浏览根=/data，rel 顶层即 local/cloud
     if rel:
         rel = rel.strip("/")
         if rel in ("", "."):

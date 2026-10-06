@@ -85,12 +85,12 @@ input:checked+.slider:before{transform:translateX(16px)}
     <!-- 目录选择弹窗 -->
     <div id="picker-mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center" onclick="if(event.target===this)closePicker()">
       <div style="background:#fff;border-radius:12px;width:440px;max-width:92vw;padding:18px">
-        <h2 style="font-size:15px;margin-bottom:10px">选择目录 <button type="button" class="btn small gray" style="float:right" onclick="closePicker()">✕</button></h2>
-        <div id="picker-crumb" class="log-detail" style="margin-bottom:10px;word-break:break-all"></div>
-        <div id="picker-list" style="max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:8px"></div>
-        <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
-          <button type="button" class="btn gray" onclick="browseDirs('')">回到根</button>
-          <button type="button" class="btn" onclick="confirmPicker()">选择当前目录</button>
+        <h2 style="font-size:15px;margin-bottom:4px">选择目录 <button type="button" class="btn small gray" style="float:right" onclick="closePicker()">✕</button></h2>
+        <div class="log-detail" style="margin-bottom:8px">点 <b>▸</b> 展开子层级，点击目录名选中</div>
+        <div id="picker-tree" style="max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px"></div>
+        <div class="log-detail" id="picker-sel" style="margin:8px 0;min-height:16px;word-break:break-all"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button type="button" class="btn gray" onclick="confirmPicker()">使用选中目录</button>
         </div>
       </div>
     </div>
@@ -217,40 +217,81 @@ async function loadTasks(){
         <td><button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
   }catch(e){}
 }
-// ---- 目录弹窗选择器（多级浏览，相对路径协议） ----
-let pickerKind = null;   // "src" | "dst"
-let pickerRel = "";      // 相对浏览根的路径
-let pickerPath = "";     // 绝对路径（仅展示）
+// ---- 目录弹窗选择器（树形懒展开，相对路径协议） ----
+let pickerKind = null;
+let pickerSelRel = "";    // 选中的相对路径
+let pickerSelAbs = "";    // 选中的绝对路径（展示用）
 
 function openPicker(kind) {
   pickerKind = kind;
-  pickerRel = "";
+  pickerSelRel = ""; pickerSelAbs = "";
+  $("#picker-sel").textContent = "";
   $("#picker-mask").style.display = "flex";
-  browseDirs("");
-}function closePicker() { $("#picker-mask").style.display = "none"; }
-
-async function browseDirs(rel, isRetry) {
-  const list = $("#picker-list"), crumb = $("#picker-crumb");
-  list.innerHTML = '<div class="empty">加载中…</div>';
-  try {
-    const d = await api("/api/dirs" + (rel ? "?rel=" + encodeURIComponent(rel) : ""));
-    pickerRel = d.rel; pickerPath = d.path;
-    crumb.textContent = "当前：" + (d.rel ? "/" + d.rel : "根目录") + "（双击进入子目录，或直接点「选择当前目录」）";
-    list.innerHTML = d.dirs.length
-      ? d.dirs.map(n => `<div class="dir-item"><span>📁</span><span>${esc(n)}</span></div>`).join("")
-      : '<div class="empty">无子目录，可直接点「选择当前目录」</div>';
-    Array.from(list.querySelectorAll(".dir-item")).forEach((el, i) => {
-      el.onclick = () => { Array.from(list.children).forEach(x => x.classList.remove("sel")); el.classList.add("sel"); };
-      el.ondblclick = () => browseDirs(d.rel ? d.rel + "/" + d.dirs[i] : d.dirs[i]);
-    });
-  } catch (e) {
-    if (rel && !isRetry) { pickerRel = ""; return browseDirs("", true); }  // 路径失效回退根目录
-    list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
-  }
+  const tree = $("#picker-tree");
+  tree.innerHTML = '<div class="empty">加载中…</div>';
+  api("/api/dirs").then(d => {
+    tree.innerHTML = "";
+    d.dirs.forEach(n => tree.appendChild(makeNode(d.rel ? d.rel + "/" + n : n, n)));
+  }).catch(e => tree.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>');
 }
+
+function makeNode(rel, name) {
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;cursor:pointer";
+  const arrow = document.createElement("span");
+  arrow.textContent = "▸";
+  arrow.style.cssText = "width:14px;color:var(--muted);cursor:pointer;user-select:none;flex:0 0 14px";
+  const label = document.createElement("span");
+  label.innerHTML = "📁 " + esc(name);
+  label.style.cssText = "flex:1;word-break:break-all";
+  row.appendChild(arrow); row.appendChild(label);
+
+  const childBox = document.createElement("div");
+  childBox.style.cssText = "margin-left:22px;display:none";
+
+  let loaded = false, expanded = false;
+  async function toggle() {
+    expanded = !expanded;
+    arrow.textContent = expanded ? "▾" : "▸";
+    childBox.style.display = expanded ? "" : "none";
+    if (expanded && !loaded) {
+      loaded = true;
+      childBox.innerHTML = '<div class="log-detail" style="padding:4px 8px">加载中…</div>';
+      try {
+        const d = await api("/api/dirs?rel=" + encodeURIComponent(rel));
+        childBox.innerHTML = "";
+        if (!d.dirs.length) childBox.innerHTML = '<div class="log-detail" style="padding:4px 8px">（无子目录）</div>';
+        d.dirs.forEach(n => childBox.appendChild(makeNode(d.rel ? d.rel + "/" + n : n, n)));
+      } catch (e) {
+        loaded = false;
+        childBox.innerHTML = '<div class="log-detail" style="padding:4px 8px">加载失败，点箭头重试</div>';
+      }
+    }
+  }
+  arrow.onclick = (ev) => { ev.stopPropagation(); toggle(); };
+
+  row.onclick = () => {
+    pickerSelRel = rel; pickerSelAbs = "";
+    tree.querySelectorAll(".dir-item.sel").forEach(x => x.classList.remove("sel"));
+    row.classList.add("dir-item", "sel");
+    $("#picker-sel").textContent = "已选: /" + rel;
+    // 顺手预取绝对路径用于回填
+    api("/api/dirs?rel=" + encodeURIComponent(rel)).then(d => {
+      pickerSelAbs = d.path;
+      $("#picker-sel").textContent = "已选: " + d.path;
+    }).catch(() => {});
+  };
+
+  row.appendChild(childBox);
+  const wrap = document.createElement("div");
+  wrap.appendChild(row); wrap.appendChild(childBox);
+  return wrap;
+}
+
 function confirmPicker() {
   if (!pickerKind) return;
-  $("#f-" + pickerKind).value = pickerPath;
+  if (!pickerSelRel) { alert("请先点击一个目录选中"); return; }
+  $("#f-" + pickerKind).value = pickerSelAbs || pickerSelRel;
   closePicker();
 }
 
