@@ -57,22 +57,28 @@ MOUNT_ROOT = os.environ.get("FILEMOVER_MOUNT_ROOT", "/")
 
 @app.get("/api/dirs")
 def api_dirs(path: Optional[str] = None):
-    """列出指定目录下的子目录。path 为空时列出挂载根下的顶层目录。
-    返回 {path: 当前绝对路径, dirs: [子目录名]}"""
+    """列出指定目录下的子目录。path 为空时自动定位挂载根：
+    优先 /data（compose 约定），否则 FILEMOVER_MOUNT_ROOT，否则 /。
+    返回 {path: 当前绝对路径, dirs: [子目录名], root: 浏览根}"""
     import pathlib
-    base = pathlib.Path(MOUNT_ROOT).resolve()
+    root = pathlib.Path(MOUNT_ROOT).resolve()
+    # 自动定位：MOUNT_ROOT 为 / 时，若 /data 存在则以其为浏览根
+    if str(root) == "/":
+        data_dir = pathlib.Path("/data")
+        if data_dir.is_dir():
+            root = data_dir.resolve()
     if path:
-        target = (base / path.lstrip("/")).resolve()
+        target = (root / path.lstrip("/")).resolve()
         # 防穿越：必须在根目录之下
-        if base != target and base not in target.parents:
+        if root != target and root not in target.parents:
             raise HTTPException(400, "路径越界")
     else:
-        target = base
+        target = root
     if not target.is_dir():
         raise HTTPException(404, "目录不存在")
     dirs = sorted([p.name for p in target.iterdir()
                    if p.is_dir() and not p.name.startswith(".")])
-    return {"path": str(target), "dirs": dirs}
+    return {"path": str(target), "dirs": dirs, "root": str(root)}
 
 
 # ---------- dashboard ----------

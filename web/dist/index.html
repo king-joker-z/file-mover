@@ -52,6 +52,9 @@ form input,form select{padding:8px 10px;border:1px solid var(--border);border-ra
 input:checked+.slider{background:var(--ok)}
 input:checked+.slider:before{transform:translateX(16px)}
 .log-detail{color:var(--muted);font-size:12px}
+.dir-item{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px}
+.dir-item:hover{background:#f4f6fb}
+.dir-item.sel{background:#e3ecff}
 </style>
 </head>
 <body>
@@ -79,19 +82,29 @@ input:checked+.slider:before{transform:translateX(16px)}
 
   <!-- 任务管理 -->
   <div id="tab-tasks" style="display:none">
+    <!-- 目录选择弹窗 -->
+    <div id="picker-mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center" onclick="if(event.target===this)closePicker()">
+      <div style="background:#fff;border-radius:12px;width:440px;max-width:92vw;padding:18px">
+        <h2 style="font-size:15px;margin-bottom:10px">选择目录 <button type="button" class="btn small gray" style="float:right" onclick="closePicker()">✕</button></h2>
+        <div id="picker-crumb" class="log-detail" style="margin-bottom:10px;word-break:break-all"></div>
+        <div id="picker-list" style="max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:8px"></div>
+        <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+          <button type="button" class="btn gray" onclick="browseDirs('')">回到根</button>
+          <button type="button" class="btn" onclick="confirmPicker()">选择当前目录</button>
+        </div>
+      </div>
+    </div>
     <div class="panel">
       <h2>新建任务</h2>
       <form id="task-form">
         <div class="row">
           <div class="field"><label>任务名称</label><input id="f-name" required placeholder="我的迁移任务"></div>
-          <div class="field"><label>源目录（下拉选择）</label>
-            <div style="display:flex;gap:6px"><select id="f-src" required style="flex:1"></select>
-            <button type="button" class="btn small gray" onclick="dirUp('src')">↑</button>
-            <button type="button" class="btn small" onclick="dirInto('src')">进入</button></div></div>
-          <div class="field"><label>目标目录（下拉选择）</label>
-            <div style="display:flex;gap:6px"><select id="f-dst" required style="flex:1"></select>
-            <button type="button" class="btn small gray" onclick="dirUp('dst')">↑</button>
-            <button type="button" class="btn small" onclick="dirInto('dst')">进入</button></div></div>
+          <div class="field"><label>源目录</label>
+            <div style="display:flex;gap:6px"><input id="f-src" readonly placeholder="点击右侧选择" style="flex:1;background:#f8f9fb;cursor:pointer" onclick="openPicker('src')">
+            <button type="button" class="btn" onclick="openPicker('src')">选择</button></div></div>
+          <div class="field"><label>目标目录</label>
+            <div style="display:flex;gap:6px"><input id="f-dst" readonly placeholder="点击右侧选择" style="flex:1;background:#f8f9fb;cursor:pointer" onclick="openPicker('dst')">
+            <button type="button" class="btn" onclick="openPicker('dst')">选择</button></div></div>
         </div>
         <div class="row">
           <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" value="5"></div>
@@ -204,48 +217,52 @@ async function loadTasks(){
         <td><button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
   }catch(e){}
 }
-// ---- 目录下拉选择 ----
-const dirState = {src: {path: "", loaded: ""}, dst: {path: "", loaded: ""}};
+// ---- 目录弹窗选择器（多级浏览） ----
+let pickerKind = null;   // "src" | "dst"
+let pickerPath = "";     // 当前浏览的绝对路径
+let pickerRoot = "/";
 
-async function loadDirs(kind) {
-  const sel = $("#f-" + kind);
-  const st = dirState[kind];
+function openPicker(kind) {
+  pickerKind = kind;
+  pickerPath = "";
+  $("#picker-mask").style.display = "flex";
+  browseDirs("");
+}
+function closePicker() { $("#picker-mask").style.display = "none"; }
+
+async function browseDirs(path) {
+  const list = $("#picker-list"), crumb = $("#picker-crumb");
+  list.innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const d = await api("/api/dirs" + (st.path ? "?path=" + encodeURIComponent(st.path) : ""));
-    st.loaded = d.path;
-    sel.innerHTML = `<option value="">— 选择子目录 —</option>` +
-      d.dirs.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
-  } catch (e) { sel.innerHTML = '<option value="">加载失败</option>'; }
+    const d = await api("/api/dirs" + (path ? "?path=" + encodeURIComponent(path) : ""));
+    pickerPath = d.path; pickerRoot = d.root;
+    crumb.textContent = d.path + "（选择此目录 = 双击进入或点下方按钮）";
+    list.innerHTML = d.dirs.length
+      ? d.dirs.map(n => `<div class="dir-item" ondblclick="browseDirs('${esc(pickerPath)}'.replace(/\\\\/g,'/') + '/' + '${esc(n)}')" onclick="document.querySelectorAll('.dir-item').forEach(x=>x.classList.remove('sel'));this.classList.add('sel')">
+          <span>📁</span><span>${esc(n)}</span>
+          <button type="button" class="btn small gray" style="margin-left:auto" onclick="event.stopPropagation();browseDirs($('#picker-path-dir').value+'/${esc(n)}'.replace('//','/'))" hidden></button></div>`).join("")
+      : '<div class="empty">无子目录</div>';
+    // 绑定双击进入（简单可靠的事件委托）
+    Array.from(list.querySelectorAll(".dir-item")).forEach((el, i) => {
+      el.onclick = () => { Array.from(list.children).forEach(x => x.classList.remove("sel")); el.classList.add("sel"); };
+      el.ondblclick = () => browseDirs(joinDir(d.path, d.dirs[i]));
+    });
+  } catch (e) { list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>'; }
 }
-async function dirInto(kind) {
-  const sel = $("#f-" + kind);
-  if (!sel.value) return;
-  const cur = dirState[kind].loaded || dirState[kind].path || "/";
-  dirState[kind].path = (cur === "/" ? "" : cur) + "/" + sel.value;
-  await loadDirs(kind);
+function joinDir(base, name) { return (base === "/" ? "" : base) + "/" + name; }
+
+function confirmPicker() {
+  if (!pickerKind) return;
+  $("#f-" + pickerKind).value = pickerPath;
+  closePicker();
 }
-async function dirUp(kind) {
-  const cur = dirState[kind].loaded || "";
-  if (!cur || cur === "/") { dirState[kind].path = ""; await loadDirs(kind); return; }
-  dirState[kind].path = cur; await loadDirs(kind);
-  // 载入的是当前 path 本身，上级需要去掉最后一段
-  const p = dirState[kind].path.replace(/\/+$/, "");
-  dirState[kind].path = p.split("/").slice(0, -1).join("/") || "";
-  await loadDirs(kind);
-}
-function getSelDir(kind) {
-  const st = dirState[kind];
-  const sel = $("#f-" + kind);
-  if (!st.loaded) return "";
-  const cur = st.loaded === "/" ? "" : st.loaded;
-  return sel.value ? cur + "/" + sel.value : cur;
-}
-loadDirs("src"); loadDirs("dst");
+
+loadDirsRemoved = null;
 
 $("#task-form").onsubmit=async e=>{
   e.preventDefault();
-  const src = getSelDir("src"), dst = getSelDir("dst");
-  if (!src || !dst) { alert("请先通过下拉+「进入」选择源目录和目标目录"); return; }
+  const src = $("#f-src").value, dst = $("#f-dst").value;
+  if (!src || !dst) { alert("请先点击「选择」挑选源目录和目标目录"); return; }
   if (dst === src || dst.startsWith(src + "/")) { alert("目标目录不能等于或在源目录内部"); return; }
   await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
     name:$("#f-name").value,src_dir:src,dst_dir:dst,
