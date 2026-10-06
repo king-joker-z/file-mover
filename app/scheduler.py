@@ -129,6 +129,9 @@ class Scheduler:
             t0 = time.monotonic()
             result, detail = transfer.transfer(item, task)
             duration_ms = int((time.monotonic() - t0) * 1000)
+
+            # 任务级间隔（提前计算，失败分支也要用）
+            interval = max(0.0, float(task.get("interval_seconds", 5)))
             wait_after = None
 
             if result == "success":
@@ -154,9 +157,6 @@ class Scheduler:
             db.add_log(item["task_id"], item["id"], item["src_path"], item["dst_path"],
                        item.get("size", 0), duration_ms, result, detail)
             self.current_file = None
-
-            # 节流：任务级间隔
-            interval = max(0.0, float(task.get("interval_seconds", 5)))
             self._stop.wait(timeout=wait_after if wait_after is not None else interval)
 
 
