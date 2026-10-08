@@ -17,6 +17,7 @@ DEFAULTS = {
     "ignore_suffixes": [".tmp", ".part", ".partial", ".downloading", ".!ut", ".crdownload"],
     "default_interval_seconds": 5,
     "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
+    "douyin_nfo_enabled": False,  # 对无 nfo 的抖音视频自动生成简易 nfo
 }
 
 _lock = threading.Lock()

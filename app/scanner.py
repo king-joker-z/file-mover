@@ -4,6 +4,7 @@ import time
 from typing import Optional, Tuple, List
 import fnmatch
 from . import db, config
+from .douyin_nfo import ensure_nfo, VIDEO_EXTS
 
 
 def _parse_patterns(raw: str) -> list[str]:
@@ -48,9 +49,19 @@ def scan_task(task: dict):
     includes = _parse_patterns(task.get("include_patterns"))
     excludes = _parse_patterns(task.get("exclude_patterns"))
     ignores = cfg.get("ignore_suffixes", [])
+    douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False)
     date_str = time.strftime("%Y-%m-%d")
 
     for root, _dirs, files in os.walk(src):
+        # 抖音 nfo 自动生成：对无伴生 nfo 的视频先生成（这样后续扫描会正常入队 nfo+视频）
+        if douyin_nfo_enabled:
+            for fn in files:
+                base, ext = os.path.splitext(fn)
+                if ext.lower() in VIDEO_EXTS and not os.path.isfile(os.path.join(root, base + ".nfo")):
+                    try:
+                        ensure_nfo(os.path.join(root, fn))
+                    except OSError:
+                        pass  # 生成失败不影响迁移
         for fn in files:
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue

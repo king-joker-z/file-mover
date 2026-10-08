@@ -49,6 +49,7 @@ class SettingsIn(BaseModel):
     remove_empty_dirs: Optional[bool] = None
     default_interval_seconds: Optional[float] = None
     nfo_fix_enabled: Optional[bool] = None
+    douyin_nfo_enabled: Optional[bool] = None
 
 
 # ---------- 目录浏览（供任务表单下拉选择） ----------
