@@ -1,5 +1,8 @@
-"""抖音视频 nfo 生成器：从 DouK-Downloader 文件名解析元数据"""
+"""抖音视频 nfo 生成器
+优先级：同目录 meta.json（Douyin_TikTok_Download_API v5 产物）> DouK 文件名解析 > 简易兜底
+"""
 import os
+import json
 import re
 from typing import Optional
 from datetime import datetime
@@ -12,6 +15,57 @@ _DATE_RE = re.compile(r"(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}(?:[ 日时]*\d{1,2}[:
 _SPLIT_RE = re.compile(r"\s*[-—_ ]\s*")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".flv", ".webm"}
+
+
+def _meta_from_metajson(video_path: str) -> Optional[dict]:
+    """从同目录 meta.json（Douyin_TikTok_Download_API v5 下载产物）读取元数据。
+    meta.json 字段: platform, post_id, kind, web_url, title, description,
+    publish_time, duration, author_uid, author_nickname, tags, ...
+    """
+    meta_path = os.path.join(os.path.dirname(video_path), "meta.json")
+    if not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            mj = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(mj, dict):
+        return None
+    # 兼容嵌套结构（顶层可能包 {post: {...}, author: {...}}）
+    post = mj.get("post") if isinstance(mj.get("post"), dict) else mj
+    author = mj.get("author") if isinstance(mj.get("author"), dict) else {}
+
+    post_id = str(post.get("post_id") or post.get("id") or mj.get("post_id") or "") or None
+    title = post.get("title") or post.get("description") or ""
+    desc = post.get("description") or title
+    pub = post.get("publish_time") or ""
+    # publish_time 可能是 iso 字符串或时间戳
+    date_str = None
+    if pub:
+        try:
+            if isinstance(pub, (int, float)):
+                date_str = datetime.fromtimestamp(pub).strftime("%Y-%m-%d")
+            else:
+                s = str(pub).replace("T", " ").split(".")[0].split("+")[0]
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        date_str = datetime.strptime(s.strip(), fmt).strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+        except (OSError, ValueError, OverflowError):
+            pass
+    nickname = (author.get("nickname") or author.get("name")
+                or mj.get("author_nickname") or "")
+    return {
+        "aweme_id": post_id,
+        "date": date_str,
+        "desc": desc or None,
+        "nickname": nickname or None,
+        "title": title or None,
+        "source": "meta.json",
+    }
 
 
 def parse_filename(filename: str, parent_dir: Optional[str] = None) -> Optional[dict]:
@@ -91,7 +145,8 @@ def build_nfo(meta: dict, nickname_fallback: str = "未知博主") -> str:
 
 
 def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") -> tuple[bool, str]:
-    """若视频无伴生 nfo 则生成。返回 (是否生成, nfo路径或原因)"""
+    """若视频无伴生 nfo 则生成。优先 meta.json，其次文件名解析。
+    返回 (是否生成, nfo路径或原因)"""
     base, ext = os.path.splitext(video_path)
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
@@ -100,6 +155,16 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
         return False, "已存在 nfo"
     filename = os.path.basename(video_path)
     parent = os.path.basename(os.path.dirname(video_path))
+
+    # 1) meta.json（Douyin_TikTok_Download_API v5）优先——字段准确
+    meta = _meta_from_metajson(video_path)
+    if meta:
+        content = build_nfo(meta, nickname_fallback=parent or "未知博主")
+        with open(nfo_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True, nfo_path
+
+    # 2) DouK 文件名解析
     meta = parse_filename(filename, parent_dir=parent)
     content = build_nfo(meta or {}, nickname_fallback=parent or "未知博主")
     with open(nfo_path, "w", encoding="utf-8") as f:
