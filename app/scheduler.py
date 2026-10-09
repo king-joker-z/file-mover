@@ -11,6 +11,7 @@ class Scheduler:
         self._threads = []
         self._scan_wake = threading.Event()
         self.last_scan_ts = {}
+        self.sync_progress = {}  # task_id -> 扫描进度
         self.current_file = None
         self.moved_today = 0
         self._today = time.strftime("%Y-%m-%d")
@@ -35,32 +36,33 @@ class Scheduler:
 
     def sync_now(self, task_id: int):
         """立即全量扫描指定任务（独立线程，跳过稳定性检测加速）。
-        立即返回触发状态；扫描在后台继续，完成后自动刷新由前端轮询看板/队列。
-        返回 {ok, error, stats(若同步等待到完成)}"""
-        result = {"ok": False, "error": None, "stats": None, "done": False}
+        立即返回；进度通过 self.sync_progress /api/sync-progress 暴露给 UI 轮询。"""
+        prog = self.sync_progress.get(task_id)
+        if prog and prog.get("running"):
+            return {"ok": True, "message": "扫描进行中", "already_running": True}
+
+        self.sync_progress[task_id] = {"running": True, "scanned": 0, "enqueued": 0,
+                                       "dedup_deleted": 0, "dedup_skipped": 0,
+                                       "skipped_symlink": 0, "current": "", "done": False,
+                                       "error": None}
 
         def _run():
+            prog = self.sync_progress[task_id]
             try:
                 task = db.get_task(task_id)
                 if task and task.get("enabled"):
-                    result["stats"] = scanner.scan_task(task, skip_stable_check=True)
+                    scanner.scan_task(task, skip_stable_check=True, progress=prog)
                     self.last_scan_ts[task_id] = time.time()
-                    result["ok"] = True
                 else:
-                    result["error"] = "任务不存在或已停用"
+                    prog["error"] = "任务不存在或已停用"
             except Exception as e:
                 traceback.print_exc()
-                result["error"] = str(e)
-            result["done"] = True
+                prog["error"] = str(e)
+            prog["done"] = True
+            prog["running"] = False
 
         threading.Thread(target=_run, name="fm-sync-now", daemon=True).start()
-        # 只短暂等待（15s）：小目录能拿到统计；大目录超时也返回"已触发"，
-        # 扫描在后台继续，绝不能误报失败
-        for _ in range(30):
-            if result.get("done"):
-                break
-            time.sleep(0.5)
-        return result
+        return {"ok": True, "message": "全量扫描已触发"}
 
     # ---------- 统计 ----------
 

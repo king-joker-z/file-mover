@@ -40,13 +40,18 @@ def compute_dst(dst_dir: str, rel_path: str, path_rule: str, date_str: str) -> s
     return os.path.join(dst_dir, rel_path)  # keep_structure
 
 
-def scan_task(task: dict, skip_stable_check: bool = False) -> dict:
+def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None) -> dict:
     """扫描一个任务的源目录并入队新文件。
     skip_stable_check=True 时跳过稳定性检测（立即同步用，用户确认文件已就绪）。
     返回统计: {enqueued, dedup_deleted, dedup_skipped, skipped_symlink}"""
     src = task["src_dir"]
     cfg = config.get()
     stats = {"enqueued": 0, "dedup_deleted": 0, "dedup_skipped": 0, "skipped_symlink": 0}
+    # progress 为外部传入的共享进度字典（立即同步用），扫描过程实时更新
+    def _bump(key, n=1):
+        stats[key] += n
+        if progress is not None:
+            progress[key] = stats[key]
     if not os.path.isdir(src):
         return stats
     includes = _parse_patterns(task.get("include_patterns"))
@@ -73,7 +78,7 @@ def scan_task(task: dict, skip_stable_check: bool = False) -> dict:
             for fn in files:
                 full = os.path.join(root, fn)
                 if os.path.islink(full):
-                    stats["skipped_symlink"] += 1
+                    _bump("skipped_symlink")
                     continue  # 软链占位跳过
                 rel = os.path.relpath(full, src)
                 try:
@@ -86,7 +91,7 @@ def scan_task(task: dict, skip_stable_check: bool = False) -> dict:
                             os.remove(full)
                         except OSError:
                             pass
-                        stats["dedup_deleted"] += 1
+                        _bump("dedup_deleted")
                         db.add_log(task["id"], None, full, "", size, 0,
                                    "success", "重复下载（此前已迁移过），已删除")
                         # 软链重建：保持源路径"文件存在"，dysync 对账不再重下
@@ -98,13 +103,13 @@ def scan_task(task: dict, skip_stable_check: bool = False) -> dict:
                             except OSError:
                                 pass
                     else:  # skip
-                        stats["dedup_skipped"] += 1
+                        _bump("dedup_skipped")
                         db.add_log(task["id"], None, full, "", size, 0,
                                    "skipped", "重复下载（此前已迁移过），保留跳过")
         for fn in files:
             full = os.path.join(root, fn)
             if os.path.islink(full):
-                stats["skipped_symlink"] += 1
+                _bump("skipped_symlink")
                 continue  # 软链占位跳过（已迁移留的软链不是迁移对象）
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue
@@ -122,6 +127,6 @@ def scan_task(task: dict, skip_stable_check: bool = False) -> dict:
                 continue
             dst = compute_dst(task["dst_dir"], rel, task.get("path_rule", "keep_structure"), date_str)
             if db.enqueue(task["id"], full, rel, dst, size):
-                stats["enqueued"] += 1
+                _bump("enqueued")
 
     return stats

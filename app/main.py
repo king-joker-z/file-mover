@@ -174,6 +174,12 @@ def api_toggle_task(task_id: int):
     return {"ok": True, "enabled": not task["enabled"]}
 
 
+@app.get("/api/tasks/{task_id}/sync-progress")
+def api_sync_progress(task_id: int):
+    """轮询立即同步的扫描进度"""
+    return scheduler.sync_progress.get(task_id, {"running": False, "done": True})
+
+
 @app.post("/api/tasks/{task_id}/sync-now")
 def api_sync_now(task_id: int):
     """立即全量扫描指定任务：跳过周期调度，立刻扫描源目录。
@@ -184,13 +190,7 @@ def api_sync_now(task_id: int):
     if not task.get("enabled"):
         raise HTTPException(400, "任务已停用，请先启用")
     result = scheduler.sync_now(task_id)
-    if not result.get("ok"):
-        # 真正的失败（任务不存在/停用/扫描异常）才报错；等待超时不算失败
-        if result.get("done"):
-            raise HTTPException(500, result.get("error") or "扫描失败")
-    return {"ok": True,
-            "message": ("全量扫描完成" if result.get("done") else "全量扫描已触发，后台进行中"),
-            "stats": result.get("stats")}
+    return {"ok": True, "message": result.get("message", "全量扫描已触发")}
 
 
 # ---------- queue ----------

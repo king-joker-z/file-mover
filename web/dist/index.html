@@ -372,16 +372,25 @@ $("#task-form").onsubmit=async e=>{
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
 async function syncNow(id, btn){
-  const old=btn.textContent; btn.textContent="扫描中…"; btn.disabled=true;
+  const old=btn.textContent; btn.disabled=true;
+  btn.textContent="扫描中…";
   try{
-    const r=await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
-    const st=r.stats;
-    btn.textContent = st ? `✓ 新入队${st.enqueued||0}` : "已触发 ✓";
-    loadQueue(); loadDash();
-    // 后台扫描继续时, 稍后再刷一次让用户看到入队结果
-    setTimeout(()=>{loadQueue();loadDash();}, 5000);
-    setTimeout(()=>{loadQueue();loadDash();}, 15000);
-    setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 3000);
+    await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
+    // 轮询进度
+    const poll=setInterval(async()=>{
+      try{
+        const p=await api(`/api/tasks/${id}/sync-progress`);
+        if(p.running){
+          btn.textContent=`扫描 ${p.scanned||0} | 新${p.enqueued||0}`;
+        }else{
+          clearInterval(poll);
+          btn.textContent=`✓ 新入队${p.enqueued||0}`;
+          if(p.error){btn.textContent="失败"; alert("扫描失败: "+p.error);}
+          loadQueue(); loadDash();
+          setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 3000);
+        }
+      }catch(e){clearInterval(poll);btn.textContent=old;btn.disabled=false;}
+    }, 500);
   }catch(e){
     btn.textContent="失败"; alert("触发失败: "+e.message);
     btn.textContent=old; btn.disabled=false;
