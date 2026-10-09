@@ -34,8 +34,10 @@ class Scheduler:
         self._scan_wake.set()
 
     def sync_now(self, task_id: int):
-        """立即全量扫描指定任务（独立线程，跳过稳定性检测加速），返回统计给 UI"""
-        result = {"ok": False, "error": None, "stats": None}
+        """立即全量扫描指定任务（独立线程，跳过稳定性检测加速）。
+        立即返回触发状态；扫描在后台继续，完成后自动刷新由前端轮询看板/队列。
+        返回 {ok, error, stats(若同步等待到完成)}"""
+        result = {"ok": False, "error": None, "stats": None, "done": False}
 
         def _run():
             try:
@@ -52,8 +54,9 @@ class Scheduler:
             result["done"] = True
 
         threading.Thread(target=_run, name="fm-sync-now", daemon=True).start()
-        # 等待扫描完成（最多 120s），让 UI 直接拿到统计
-        for _ in range(240):
+        # 只短暂等待（15s）：小目录能拿到统计；大目录超时也返回"已触发"，
+        # 扫描在后台继续，绝不能误报失败
+        for _ in range(30):
             if result.get("done"):
                 break
             time.sleep(0.5)

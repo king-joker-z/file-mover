@@ -185,8 +185,12 @@ def api_sync_now(task_id: int):
         raise HTTPException(400, "任务已停用，请先启用")
     result = scheduler.sync_now(task_id)
     if not result.get("ok"):
-        raise HTTPException(500, result.get("error") or "扫描失败")
-    return {"ok": True, "message": "全量扫描完成", "stats": result.get("stats")}
+        # 真正的失败（任务不存在/停用/扫描异常）才报错；等待超时不算失败
+        if result.get("done"):
+            raise HTTPException(500, result.get("error") or "扫描失败")
+    return {"ok": True,
+            "message": ("全量扫描完成" if result.get("done") else "全量扫描已触发，后台进行中"),
+            "stats": result.get("stats")}
 
 
 # ---------- queue ----------
