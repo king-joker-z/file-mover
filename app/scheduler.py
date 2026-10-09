@@ -11,7 +11,8 @@ class Scheduler:
         self._threads = []
         self._scan_wake = threading.Event()
         self._sync_requests = set()
-        self.last_scan_ts = {}
+        self._scan_lock = threading.Lock()
+        self.last_scan_ts = {1: time.time()}  # 防启动即触发; 各任务扫描时自动覆盖
         self.sync_progress = {}  # task_id -> 扫描进度
         self.current_file = None
         self.moved_today = 0
@@ -22,6 +23,13 @@ class Scheduler:
 
     def start(self):
         db.reset_stuck_transferring()
+        # 启动时把所有任务的周期扫描计时设为当前时间，避免启动即全量扫描
+        for tid in self.sync_progress.keys() or []:
+            pass
+        now = time.time()
+        import app.db as _db
+        for t in _db.list_tasks():
+            self.last_scan_ts[t["id"]] = now
         for name, target in (("scanner", self._scan_loop),
                              ("worker", self._work_loop)):
             t = threading.Thread(target=target, name=f"fm-{name}", daemon=True)
@@ -60,10 +68,11 @@ class Scheduler:
                 task = db.get_task(task_id)
                 if task and task.get("enabled"):
                     prog["current"] = ""
-                    scanner.scan_task(task, skip_stable_check=True,
-                                      progress=prog,
-                                      on_dir=lambda root, n: prog.__setitem__(
-                                          "scanned", prog.get("scanned", 0) + n))
+                    with self._scan_lock:
+                        scanner.scan_task(task, skip_stable_check=True,
+                                          progress=prog,
+                                          on_dir=lambda root, n: prog.__setitem__(
+                                              "scanned", prog.get("scanned", 0) + n))
                 else:
                     prog["error"] = "任务不存在或已停用"
             except Exception as e:
@@ -99,15 +108,25 @@ class Scheduler:
         while not self._stop.is_set():
             cfg = config.get()
             now = time.time()
+            # 立即同步请求最优先处理（用户点了按钮马上要看到反应）
+            self._process_sync_requests()
             for task in db.list_tasks():
+                if self._sync_requests:
+                    break  # 新的立即同步请求到来, 让位
                 if not task.get("enabled"):
                     continue
                 interval = task.get("scan_interval") or cfg["scan_interval"]
                 if now - self.last_scan_ts.get(task["id"], 0) >= interval:
+                    if self._sync_requests or self._scan_lock.locked():
+                        break  # 有立即同步等待/进行中, 周期扫描让位
+                    if not self._scan_lock.acquire(timeout=0.1):
+                        break
                     try:
                         scanner.scan_task(task)
                     except Exception:
                         traceback.print_exc()
+                    finally:
+                        self._scan_lock.release()
                     self.last_scan_ts[task["id"]] = now
             self._process_sync_requests()
             self._scan_wake.wait(timeout=min(5, max(1, cfg["scan_interval"] / 6)))
