@@ -177,14 +177,16 @@ def api_toggle_task(task_id: int):
 @app.post("/api/tasks/{task_id}/sync-now")
 def api_sync_now(task_id: int):
     """立即全量扫描指定任务：跳过周期调度，立刻扫描源目录。
-    软链自动跳过，非软链文件正常入队迁移（含重复下载检测）。"""
+    软链自动跳过，非软链文件正常入队迁移（含重复下载检测）。返回扫描统计。"""
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
     if not task.get("enabled"):
         raise HTTPException(400, "任务已停用，请先启用")
-    scheduler.sync_now(task_id)
-    return {"ok": True, "message": "全量扫描已触发"}
+    result = scheduler.sync_now(task_id)
+    if not result.get("ok"):
+        raise HTTPException(500, result.get("error") or "扫描失败")
+    return {"ok": True, "message": "全量扫描完成", "stats": result.get("stats")}
 
 
 # ---------- queue ----------

@@ -34,16 +34,30 @@ class Scheduler:
         self._scan_wake.set()
 
     def sync_now(self, task_id: int):
-        """立即全量扫描指定任务（在独立线程执行，立即返回给 UI）"""
+        """立即全量扫描指定任务（独立线程，跳过稳定性检测加速），返回统计给 UI"""
+        result = {"ok": False, "error": None, "stats": None}
+
         def _run():
             try:
                 task = db.get_task(task_id)
                 if task and task.get("enabled"):
-                    scanner.scan_task(task)
+                    result["stats"] = scanner.scan_task(task, skip_stable_check=True)
                     self.last_scan_ts[task_id] = time.time()
-            except Exception:
+                    result["ok"] = True
+                else:
+                    result["error"] = "任务不存在或已停用"
+            except Exception as e:
                 traceback.print_exc()
+                result["error"] = str(e)
+            result["done"] = True
+
         threading.Thread(target=_run, name="fm-sync-now", daemon=True).start()
+        # 等待扫描完成（最多 120s），让 UI 直接拿到统计
+        for _ in range(240):
+            if result.get("done"):
+                break
+            time.sleep(0.5)
+        return result
 
     # ---------- 统计 ----------
 

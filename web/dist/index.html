@@ -374,13 +374,16 @@ async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"
 async function syncNow(id, btn){
   const old=btn.textContent; btn.textContent="扫描中…"; btn.disabled=true;
   try{
-    await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
-    btn.textContent="已触发 ✓";
-  }catch(e){ btn.textContent="失败"; alert("触发失败: "+e.message); }
-  setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 2000);
-  // 扫描异步执行, 稍等后刷新队列与看板让用户看到新增任务
-  setTimeout(()=>{loadQueue();loadDash();}, 1500);
-  setTimeout(()=>{loadQueue();loadDash();}, 4000);
+    const r=await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
+    const st=r.stats||{};
+    btn.textContent=`✓ 新入队${st.enqueued||0}`;
+    // 扫描完成, 立即刷新队列与看板让用户看到结果
+    loadQueue(); loadDash();
+    setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 2500);
+  }catch(e){
+    btn.textContent="失败"; alert("触发失败: "+e.message);
+    btn.textContent=old; btn.disabled=false;
+  }
 }
 async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
 
