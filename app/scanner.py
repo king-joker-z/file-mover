@@ -64,23 +64,39 @@ def scan_task(task: dict):
                     except OSError:
                         pass  # 生成失败不影响迁移
         # 重复下载检测：下载器把已迁移的文件重新下载回来 → 直接处置，不再入队
+        # 注意：源路径的符号链接本身也会被 os.walk 枚举到，此处跳过软链
+        # （软链是迁移成功后特意留下的占位，不是重复下载的文件）
         if re_download_action != "keep":
             for fn in files:
                 full = os.path.join(root, fn)
+                if os.path.islink(full):
+                    continue  # 软链占位跳过
+                if os.path.islink(full):
+                    continue  # 软链占位跳过
                 rel = os.path.relpath(full, src)
                 try:
                     size = os.path.getsize(full)
                 except OSError:
                     continue
                 if size > 0 and db.is_re_migrated(task["id"], rel, size):
-                    db.add_log(task["id"], None, full, "", size, 0,
-                               "success" if re_download_action == "delete" else "skipped",
-                               f"重复下载（此前已迁移过），已{ '删除' if re_download_action=='delete' else '跳过' }")
                     if re_download_action == "delete":
                         try:
                             os.remove(full)
                         except OSError:
                             pass
+                        db.add_log(task["id"], None, full, "", size, 0,
+                                   "success", "重复下载（此前已迁移过），已删除")
+                        # 软链重建：保持源路径"文件存在"，dysync 对账不再重下
+                        if cfg.get("symlink_enabled"):
+                            try:
+                                target = os.path.join(task["dst_dir"], rel)
+                                if os.path.isfile(target):
+                                    os.symlink(target, full)
+                            except OSError:
+                                pass
+                    else:  # skip
+                        db.add_log(task["id"], None, full, "", size, 0,
+                                   "skipped", "重复下载（此前已迁移过），保留跳过")
         for fn in files:
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue

@@ -19,6 +19,7 @@ DEFAULTS = {
     "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
     "douyin_nfo_enabled": False,  # 对无 nfo 的抖音视频自动生成简易 nfo
     "re_download_action": "delete",  # 已迁移文件被重新下载: delete=删除 / skip=保留跳过 / keep=照常迁移
+    "symlink_enabled": True,  # 迁移后在源路径创建符号链接（供 dysync 对账/Emby 播放，防重下循环）
 }
 
 _lock = threading.Lock()

@@ -88,10 +88,12 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         # 幂等保护：若目标文件与源大小一致，说明上次迁移实际已成功
         # （网盘挂载瞬断导致校验误报失败），本次直接按成功处理并清理源文件
         if _already_migrated(src, dst):
-            try:
-                os.remove(src)
-            except OSError:
-                pass
+            # 源路径是软链占位时不删除（保留给 dysync 对账）
+            if not os.path.islink(src):
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
             return "success", "ok (上次迁移实际已完成，本次幂等确认)"
         return "conflict", f"目标已存在: {dst}（策略 skip）"
     final_dst, how = resolved
@@ -138,8 +140,19 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         detail = f"ok ({how})" if how != "none" else "ok"
         if detail_extra:
             detail += detail_extra
+        # 符号链接：在源路径留下指向目标的软链（dysync 对账不再重下；Emby 可播）
+        # 校验异常分支（目标已确认存在）同样需要软链，此处统一处理
+        if app_config.get().get("symlink_enabled") and task.get("after_action", "delete") == "delete":
+            if _symlink_source(src, final_dst):
+                detail += "，+symlink"
+            else:
+                detail += "，symlink创建失败(不影响迁移)"
         if cfg.get("remove_empty_dirs"):
-            _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
+            # 有符号链接时目录非空，跳过空目录清理（避免误删软链）
+            if _has_symlink_in_dir(os.path.dirname(src)):
+                pass
+            else:
+                _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
         return "success", detail
     except OSError as e:
         # 清理安全模式残留
@@ -165,6 +178,29 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         return "failed", f"{e} [errno={eno}]{hint}"
     except Exception as e:
         return "failed", str(e)
+
+
+def _symlink_source(src: str, dst: str) -> bool:
+    """迁移成功后在源路径创建指向目标的符号链接。
+    用途：下载器（dysync）对账时文件"仍然存在"不会重下；Emby/Jellyfin 跟随软链可播。
+    返回是否创建成功。失败静默（不影响迁移成功状态）。"""
+    try:
+        if os.path.lexists(src):   # 源还在（keep 模式等），不覆盖
+            return False
+        os.makedirs(os.path.dirname(src), exist_ok=True)
+        os.symlink(dst, src)
+        return True
+    except OSError:
+        return False
+
+
+def _has_symlink_in_dir(directory: str) -> bool:
+    """目录内是否存在符号链接（有的话跳过空目录清理，避免误删软链）"""
+    try:
+        return any(os.path.islink(os.path.join(directory, e))
+                   for e in os.listdir(directory))
+    except OSError:
+        return False
 
 
 def _remove_empty_parent_dirs(start: str, stop_at: str):
