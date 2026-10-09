@@ -67,6 +67,8 @@ input:checked+.slider:before{transform:translateX(16px)}
     <button data-tab="queue">队列</button>
     <button data-tab="logs">日志</button>
     <button data-tab="settings">设置</button>
+    <button data-tab="browse">文件浏览</button>
+    <button data-tab="browse">文件浏览</button>
   </div>
 
   <!-- 仪表盘 -->
@@ -158,6 +160,18 @@ input:checked+.slider:before{transform:translateX(16px)}
     <div class="panel"><h2>迁移日志 <button class="btn small red" style="float:right" onclick="clearLogs()">清空日志</button></h2><div id="log-list"></div></div>
   </div>
 
+  <!-- 文件浏览 -->
+  <div id="tab-browse" style="display:none">
+    <div class="panel">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+        <span id="browse-crumb" class="log-detail" style="flex:1;word-break:break-all"></span>
+        <button class="btn small gray" onclick="browseUp()">上级</button>
+      </div>
+      <div id="browse-list"></div>
+    </div>
+  </div>
+
+  <div id="tab-browse" style="display:none"></div>
   <!-- 设置 -->
   <div id="tab-settings" style="display:none">
     <div class="panel">
@@ -196,7 +210,8 @@ let curQueueFilter="";
 // tabs
 $$(".tabs button").forEach(b=>b.onclick=()=>{
   $$(".tabs button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["dash","tasks","queue","logs","settings"].forEach(t=>$("#tab-"+t).style.display=t===b.dataset.tab?"":"none");
+  ["dash","tasks","queue","logs","settings","browse"].forEach(t=>{const el=$("#tab-"+t);if(el)el.style.display=t===b.dataset.tab?"":"none";});
+  if(b.dataset.tab==="browse")browseTo("");
   if(b.dataset.tab==="tasks")loadTasks();
   if(b.dataset.tab==="queue")loadQueue();
   if(b.dataset.tab==="logs")loadLogs();
@@ -427,6 +442,26 @@ $("#settings-form").onsubmit=async e=>{
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(n){if(!n)return"-";const u=["B","KB","MB","GB"];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return n.toFixed(1)+u[i];}
 
+let browseRel="";
+function browseTo(rel){
+  browseRel=rel||"";
+  api("/api/browse"+(browseRel?"?rel="+encodeURIComponent(browseRel):"")).then(d=>{
+    $("#browse-crumb").textContent="当前: /"+(d.rel||"");
+    const box=$("#browse-list");
+    if(!d.items.length){box.innerHTML='<div class="empty">空目录</div>';return;}
+    box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th><th>软链指向</th></tr>`+
+      d.items.map(it=>{
+        const icon=it.type==="symlink"?"🔗":(it.type==="dir"?"📁":"📄");
+        const click=it.type==="dir"?`onclick="browseTo('${(d.rel?d.rel+"/":"")+it.name}')"`:"";
+        return `<tr ${click} style="${it.type==="dir"?"cursor:pointer":""}">
+          <td>${icon} ${it.type==="symlink"?"软链":(it.type==="dir"?"目录":"文件")}</td>
+          <td style="word-break:break-all">${esc(it.name)}</td>
+          <td>${it.type==="file"?fmtSize(it.size):"-"}</td>
+          <td class="log-detail" style="word-break:break-all">${esc(it.target)}</td></tr>`;
+      }).join("")+"</table>";
+  }).catch(e=>$("#browse-list").innerHTML='<div class="empty">'+esc(e.message)+'</div>');
+}
+function browseUp(){browseTo(browseRel.split("/").slice(0,-1).join(""));}
 loadDash();setInterval(loadDash,3000);
 </script>
 </body>

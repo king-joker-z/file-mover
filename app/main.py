@@ -90,6 +90,40 @@ def api_dirs(rel: Optional[str] = None):
     return {"rel": rel, "path": str(target), "dirs": dirs, "root": str(root)}
 
 
+@app.get("/api/browse")
+def api_browse(rel: Optional[str] = None, limit: int = 500):
+    """文件级浏览（含软链识别）：列出目录下所有条目并标注类型。
+    用于 Web UI 检查软链是否生成，无需 SSH。"""
+    import pathlib
+    root = pathlib.Path(MOUNT_ROOT).resolve()
+    if str(root) == "/":
+        data_dir = pathlib.Path("/data")
+        if data_dir.is_dir():
+            root = data_dir.resolve()
+    if rel:
+        rel = rel.strip("/")
+        parts = [p for p in rel.split("/") if p]
+        if any(p in ("..", "") for p in parts):
+            raise HTTPException(400, "路径非法")
+        target = root.joinpath(*parts) if parts else root
+    else:
+        target = root
+        rel = ""
+    if not target.is_dir():
+        raise HTTPException(404, "目录不存在")
+    items = []
+    for p in sorted(target.iterdir(), key=lambda x: x.name):
+        is_link = p.is_symlink()
+        try:
+            size = 0 if is_link else (p.stat().st_size if p.exists() else 0)
+            t = "symlink" if is_link else ("dir" if p.is_dir() else "file")
+            link_target = os.readlink(p) if is_link else ""
+        except OSError:
+            t, size, link_target = "file", 0, ""
+        items.append({"name": p.name, "type": t, "size": size, "target": link_target})
+    return {"rel": rel, "path": str(target), "items": items[:limit]}
+
+
 # ---------- dashboard ----------
 
 @app.get("/api/dashboard")
