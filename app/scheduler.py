@@ -10,6 +10,7 @@ class Scheduler:
         self._stop = threading.Event()
         self._threads = []
         self._scan_wake = threading.Event()
+        self._sync_requests = set()
         self.last_scan_ts = {}
         self.sync_progress = {}  # task_id -> 扫描进度
         self.current_file = None
@@ -35,24 +36,34 @@ class Scheduler:
         self._scan_wake.set()
 
     def sync_now(self, task_id: int):
-        """立即全量扫描指定任务（独立线程，跳过稳定性检测加速）。
-        立即返回；进度通过 self.sync_progress /api/sync-progress 暴露给 UI 轮询。"""
+        """请求立即全量扫描：由唯一的 _scan_loop 线程优先执行（无并发扫描）。
+        进度通过 self.sync_progress /api/sync-progress 暴露给 UI 轮询。"""
         prog = self.sync_progress.get(task_id)
         if prog and prog.get("running"):
-            return {"ok": True, "message": "扫描进行中", "already_running": True}
-
+            return {"ok": True, "message": "扫描进行中"}
         self.sync_progress[task_id] = {"running": True, "scanned": 0, "enqueued": 0,
                                        "dedup_deleted": 0, "dedup_skipped": 0,
                                        "skipped_symlink": 0, "current": "", "done": False,
                                        "error": None}
+        self._sync_requests.add(task_id)
+        self._scan_wake.set()
+        return {"ok": True, "message": "全量扫描已触发"}
 
-        def _run():
-            prog = self.sync_progress[task_id]
+    def _process_sync_requests(self):
+        """在 _scan_loop 线程内执行：处理待处理的立即同步请求"""
+        while self._sync_requests:
+            task_id = self._sync_requests.pop()
+            prog = self.sync_progress.get(task_id)
+            if not prog:
+                continue
             try:
                 task = db.get_task(task_id)
                 if task and task.get("enabled"):
-                    scanner.scan_task(task, skip_stable_check=True, progress=prog)
-                    self.last_scan_ts[task_id] = time.time()
+                    prog["current"] = ""
+                    scanner.scan_task(task, skip_stable_check=True,
+                                      progress=prog,
+                                      on_dir=lambda root, n: prog.__setitem__(
+                                          "scanned", prog.get("scanned", 0) + n))
                 else:
                     prog["error"] = "任务不存在或已停用"
             except Exception as e:
@@ -60,9 +71,6 @@ class Scheduler:
                 prog["error"] = str(e)
             prog["done"] = True
             prog["running"] = False
-
-        threading.Thread(target=_run, name="fm-sync-now", daemon=True).start()
-        return {"ok": True, "message": "全量扫描已触发"}
 
     # ---------- 统计 ----------
 
@@ -101,6 +109,7 @@ class Scheduler:
                     except Exception:
                         traceback.print_exc()
                     self.last_scan_ts[task["id"]] = now
+            self._process_sync_requests()
             self._scan_wake.wait(timeout=min(5, max(1, cfg["scan_interval"] / 6)))
             self._scan_wake.clear()
 

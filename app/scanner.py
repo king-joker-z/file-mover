@@ -40,7 +40,7 @@ def compute_dst(dst_dir: str, rel_path: str, path_rule: str, date_str: str) -> s
     return os.path.join(dst_dir, rel_path)  # keep_structure
 
 
-def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None) -> dict:
+def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None, on_dir=None) -> dict:
     """扫描一个任务的源目录并入队新文件。
     skip_stable_check=True 时跳过稳定性检测（立即同步用，用户确认文件已就绪）。
     返回统计: {enqueued, dedup_deleted, dedup_skipped, skipped_symlink}"""
@@ -62,9 +62,19 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
     date_str = time.strftime("%Y-%m-%d")
 
     for root, _dirs, files in os.walk(src):
+        # 每层目录回调: 更新进度 (sync_now 传入)
+        if on_dir:
+            try:
+                on_dir(root, len(files))
+            except Exception:
+                pass
         # 抖音 nfo 自动生成：对无伴生 nfo 的视频先生成（这样后续扫描会正常入队 nfo+视频）
+        # 注意：软链跳过 —— dysync 留下的软链目标可能悬空，避免 ensure_nfo 对软链做无用功
         if douyin_nfo_enabled:
             for fn in files:
+                full_p = os.path.join(root, fn)
+                if os.path.islink(full_p):
+                    continue
                 base, ext = os.path.splitext(fn)
                 if ext.lower() in VIDEO_EXTS and not os.path.isfile(os.path.join(root, base + ".nfo")):
                     try:

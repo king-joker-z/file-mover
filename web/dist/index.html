@@ -372,31 +372,42 @@ $("#task-form").onsubmit=async e=>{
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
 async function syncNow(id, btn){
-  const old=btn.textContent; btn.disabled=true;
-  btn.textContent="扫描中…";
+  syncUI[id] = {running:true, scanned:0, enqueued:0, error:null};
+  btn.textContent="扫描中…"; btn.disabled=true;
   try{
     await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
-    // 轮询进度
-    const poll=setInterval(async()=>{
-      try{
-        const p=await api(`/api/tasks/${id}/sync-progress`);
-        if(p.running){
-          btn.textContent=`扫描 ${p.scanned||0} | 新${p.enqueued||0}`;
-        }else{
-          clearInterval(poll);
-          btn.textContent=`✓ 新入队${p.enqueued||0}`;
-          if(p.error){btn.textContent="失败"; alert("扫描失败: "+p.error);}
-          loadQueue(); loadDash();
-          setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 3000);
-        }
-      }catch(e){clearInterval(poll);btn.textContent=old;btn.disabled=false;}
-    }, 500);
   }catch(e){
     btn.textContent="失败"; alert("触发失败: "+e.message);
-    btn.textContent=old; btn.disabled=false;
+    btn.disabled=false; delete syncUI[id]; return;
   }
+  pollSyncProgress();
 }
-async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
+function updateSyncBtn(id){
+  const st = syncUI[id]; if(!st) return;
+  const btn = document.querySelector(`button[onclick*="syncNow(${id},"]`);
+  if(!btn) return;
+  if(st.error){ btn.textContent="失败"; btn.disabled=false; return; }
+  if(st.running){ btn.textContent=`扫描 ${st.scanned} | 新${st.enqueued}`; }
+  else{ btn.textContent=`✓ 新入队${st.enqueued}`; btn.disabled=false;
+        setTimeout(()=>{ if(!syncUI[id] || !syncUI[id].running){ btn.textContent="立即同步"; } }, 4000); }
+}
+let pollTimer = null;
+function pollSyncProgress(){
+  if(pollTimer) return;
+  pollTimer = setInterval(async()=>{
+    const running = Object.keys(syncUI).filter(id=>syncUI[id].running);
+    if(!running.length){ clearInterval(pollTimer); pollTimer=null; return; }
+    for(const id of running){
+      try{
+        const p = await api(`/api/tasks/${id}/sync-progress`);
+        const st = syncUI[id]; if(!st) continue;
+        st.scanned=p.scanned||0; st.enqueued=p.enqueued||0;
+        if(!p.running){ st.running=false; loadQueue(); loadDash(); }
+        updateSyncBtn(parseInt(id));
+      }catch(e){}
+    }
+  }, 500);
+}async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
 
 async function loadQueue(){
   try{
