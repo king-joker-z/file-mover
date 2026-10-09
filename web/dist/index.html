@@ -202,6 +202,7 @@ input:checked+.slider:before{transform:translateX(16px)}
 </div>
 
 <script>
+window.syncUI = window.syncUI || {};
 const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
 let curQueueFilter="";
 
@@ -372,7 +373,9 @@ $("#task-form").onsubmit=async e=>{
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
 async function syncNow(id, btn){
-  syncUI[id] = {running:true, scanned:0, enqueued:0, error:null};
+  // 全局同步进度状态（按 task_id），跨页签/重绘保持
+  window.syncUI = window.syncUI || {};
+  window.syncUI = window.syncUI || {}; syncUI_ref = window.syncUI; syncUI_ref[id] = {running:true, scanned:0, enqueued:0, error:null};
   btn.textContent="扫描中…"; btn.disabled=true;
   try{
     await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
