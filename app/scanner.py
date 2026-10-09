@@ -71,8 +71,6 @@ def scan_task(task: dict):
                 full = os.path.join(root, fn)
                 if os.path.islink(full):
                     continue  # 软链占位跳过
-                if os.path.islink(full):
-                    continue  # 软链占位跳过
                 rel = os.path.relpath(full, src)
                 try:
                     size = os.path.getsize(full)
@@ -98,6 +96,9 @@ def scan_task(task: dict):
                         db.add_log(task["id"], None, full, "", size, 0,
                                    "skipped", "重复下载（此前已迁移过），保留跳过")
         for fn in files:
+            full = os.path.join(root, fn)
+            if os.path.islink(full):
+                continue  # 软链占位跳过（已迁移留的软链不是迁移对象）
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue
             full = os.path.join(root, fn)

@@ -241,6 +241,7 @@ async function loadTasks(){
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}</td>
         <td><label class="switch"><input type="checkbox" ${t.enabled?"checked":""} onchange="toggleTask(${t.id})"><span class="slider"></span></label></td>
         <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
+        <button class="btn small green" onclick="syncNow(${t.id}, this)">立即同步</button>
         <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
   }catch(e){}
 }
@@ -370,6 +371,12 @@ $("#task-form").onsubmit=async e=>{
   e.target.reset(); resetFormMode(); loadTasks();
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
+async function syncNow(id, btn){
+  const old=btn.textContent; btn.textContent="扫描中…"; btn.disabled=true;
+  try{ await api(`/api/tasks/${id}/sync-now`,{method:"POST"}); }
+  finally{ setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 1500); }
+  loadQueue(); loadDash();
+}
 async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
 
 async function loadQueue(){

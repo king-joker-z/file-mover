@@ -33,6 +33,18 @@ class Scheduler:
     def wake_scan(self):
         self._scan_wake.set()
 
+    def sync_now(self, task_id: int):
+        """立即全量扫描指定任务（在独立线程执行，立即返回给 UI）"""
+        def _run():
+            try:
+                task = db.get_task(task_id)
+                if task and task.get("enabled"):
+                    scanner.scan_task(task)
+                    self.last_scan_ts[task_id] = time.time()
+            except Exception:
+                traceback.print_exc()
+        threading.Thread(target=_run, name="fm-sync-now", daemon=True).start()
+
     # ---------- 统计 ----------
 
     def stats(self) -> dict:
