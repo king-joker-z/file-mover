@@ -285,6 +285,25 @@ def record_migrated(task_id: int, rel_path: str, size: int):
         conn.execute(
             "INSERT OR REPLACE INTO migrated_files (task_id, rel_path, size, migrated_at) VALUES (?,?,?,?)",
             (task_id, rel_path, size, now_str()))
+        # 清理 done 的 queue 条目: 防 queue 表无限增长, 保持 UNIQUE 检查快速
+        conn.execute(
+            "DELETE FROM queue WHERE task_id=? AND rel_path=? AND status='done'",
+            (task_id, rel_path))
+    conn = get_conn()
+    with _lock, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO migrated_files (task_id, rel_path, size, migrated_at) VALUES (?,?,?,?)",
+            (task_id, rel_path, size, now_str()))
+
+
+def get_migrated_set(task_id: int) -> set:
+    """返回该任务已迁移的 (rel_path, size) 集合"""
+    conn = get_conn()
+    with _lock:
+        rows = conn.execute(
+            "SELECT rel_path, size FROM migrated_files WHERE task_id=?",
+            (task_id,)).fetchall()
+        return {(r["rel_path"], r["size"]) for r in rows}
 
 
 def is_re_migrated(task_id: int, rel_path: str, size: int) -> bool:

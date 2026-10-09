@@ -55,6 +55,8 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
     if not os.path.isdir(src):
         return stats
     includes = _parse_patterns(task.get("include_patterns"))
+    # 批量预加载已迁移指纹集合 (避免逐文件 DB 查询, 900+ 文件时性能关键)
+    migrated_set = db.get_migrated_set(task["id"])
     excludes = _parse_patterns(task.get("exclude_patterns"))
     ignores = cfg.get("ignore_suffixes", [])
     douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False)
@@ -95,7 +97,7 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                     size = os.path.getsize(full)
                 except OSError:
                     continue
-                if size > 0 and db.is_re_migrated(task["id"], rel, size):
+                if size > 0 and (rel, size) in migrated_set:
                     if re_download_action == "delete":
                         try:
                             os.remove(full)
