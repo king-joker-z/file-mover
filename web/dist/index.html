@@ -373,9 +373,14 @@ $("#task-form").onsubmit=async e=>{
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
 async function syncNow(id, btn){
   const old=btn.textContent; btn.textContent="扫描中…"; btn.disabled=true;
-  try{ await api(`/api/tasks/${id}/sync-now`,{method:"POST"}); }
-  finally{ setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 1500); }
-  loadQueue(); loadDash();
+  try{
+    await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
+    btn.textContent="已触发 ✓";
+  }catch(e){ btn.textContent="失败"; alert("触发失败: "+e.message); }
+  setTimeout(()=>{btn.textContent=old;btn.disabled=false;}, 2000);
+  // 扫描异步执行, 稍等后刷新队列与看板让用户看到新增任务
+  setTimeout(()=>{loadQueue();loadDash();}, 1500);
+  setTimeout(()=>{loadQueue();loadDash();}, 4000);
 }
 async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
 
@@ -448,7 +453,7 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&l
 function fmtSize(n){if(!n)return"-";const u=["B","KB","MB","GB"];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return n.toFixed(1)+u[i];}
 
 let browseRel="";
-function browseTo(rel){
+function browseTo(rel, isRetry){
   browseRel=rel||"";
   api("/api/browse"+(browseRel?"?rel="+encodeURIComponent(browseRel):"")).then(d=>{
     $("#browse-crumb").textContent="当前: /"+(d.rel||"");
@@ -468,7 +473,10 @@ function browseTo(rel){
     box.querySelectorAll("tr[data-rel]").forEach(tr=>{
       tr.onclick=()=>browseTo(decodeURIComponent(tr.dataset.rel));
     });
-  }).catch(e=>$("#browse-list").innerHTML='<div class="empty">'+esc(e.message)+'</div>');
+  }).catch(e=>{
+    if(browseRel && !isRetry){ return browseTo("", true); }  // 失败回退根
+    $("#browse-list").innerHTML='<div class="empty">'+esc(e.message)+'</div>';
+  });
 }
 function browseUp(){browseTo(browseRel.split("/").slice(0,-1).join(""));}
 loadDash();setInterval(loadDash,3000);
