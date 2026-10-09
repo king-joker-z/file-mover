@@ -289,11 +289,6 @@ def record_migrated(task_id: int, rel_path: str, size: int):
         conn.execute(
             "DELETE FROM queue WHERE task_id=? AND rel_path=? AND status='done'",
             (task_id, rel_path))
-    conn = get_conn()
-    with _lock, conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO migrated_files (task_id, rel_path, size, migrated_at) VALUES (?,?,?,?)",
-            (task_id, rel_path, size, now_str()))
 
 
 def get_migrated_set(task_id: int) -> set:
@@ -304,6 +299,27 @@ def get_migrated_set(task_id: int) -> set:
             "SELECT rel_path, size FROM migrated_files WHERE task_id=?",
             (task_id,)).fetchall()
         return {(r["rel_path"], r["size"]) for r in rows}
+
+
+
+def get_migrated_rels(task_id: int) -> set:
+    """返回该任务已迁移的 rel_path 集合（刮削小文件宽松匹配用）"""
+    conn = get_conn()
+    with _lock:
+        rows = conn.execute(
+            "SELECT rel_path FROM migrated_files WHERE task_id=?",
+            (task_id,)).fetchall()
+        return {r["rel_path"] for r in rows}
+
+
+def get_migrated_size(task_id: int, rel_path: str) -> int:
+    """返回该任务已迁移文件的记录 size，未找到返回 -1"""
+    conn = get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT size FROM migrated_files WHERE task_id=? AND rel_path=?",
+            (task_id, rel_path)).fetchone()
+        return row["size"] if row else -1
 
 
 def is_re_migrated(task_id: int, rel_path: str, size: int) -> bool:

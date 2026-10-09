@@ -63,31 +63,29 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         return "failed", "源文件不存在（可能已被移动或删除）"
     src_size = _size(src)
 
-    # nfo 预处理：迁移前改写内容（安全模式走 copy 流程天然支持；直接模式下就地改写源文件）
+    # nfo 预处理：读取源内容修正，迁移时把修正版写入目标（源文件保持原始不动）
+    # 好处：dysync 对账不受影响（源 size 不变），且软链穿透写污染可自愈
+    # 注意：nfo_fix 无需修正时仍返回原文 → nfo_fixed_content 非 None，
+    # 保证污染自愈重迁时覆写目标（幂等/冲突分支需要区分此场景）
     detail_extra = ""
+    nfo_fixed_content = None
     if src.lower().endswith(".nfo") and app_config.get().get("nfo_fix_enabled"):
         try:
             with open(src, "r", encoding="utf-8", errors="replace") as f:
                 original = f.read()
-            fixed, applied = nfo_fix.fix_nfo(original)
+            nfo_fixed_content, applied = nfo_fix.fix_nfo(original)
             if applied:
-                if cfg.get("safe_mode"):
-                    # 安全模式：先写好改写内容，再 copy 这份新内容
-                    with open(src, "w", encoding="utf-8") as f:
-                        f.write(fixed)
-                else:
-                    with open(src, "w", encoding="utf-8") as f:
-                        f.write(fixed)
-                src_size = _size(src)
                 detail_extra = " +nfo:" + ",".join(applied)
         except Exception as e:
             return "failed", f"nfo 预处理失败: {e}"
 
     resolved = _resolve_conflict(dst, policy)
     if resolved is None:
-        # 幂等保护：若目标文件与源大小一致，说明上次迁移实际已成功
-        # （网盘挂载瞬断导致校验误报失败），本次直接按成功处理并清理源文件
-        if _already_migrated(src, dst):
+        # skip 策略冲突：目标已存在。若已有迁移记录（本条为污染自愈重迁），
+        # 必须走 nfo 修正覆写，不能按幂等成功放行（否则污染内容留在云端）
+        if nfo_fixed_content is not None and db.get_migrated_size(task["id"], item["rel_path"]) >= 0:
+            resolved = (dst, "overwrite")
+        elif _already_migrated(src, dst):
             # 源路径是软链占位时不删除（保留给 dysync 对账）
             if not os.path.islink(src):
                 try:
@@ -98,7 +96,8 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             if task.get("symlink_enabled") and not os.path.lexists(src):
                 _symlink_source(src, dst)
             return "success", "ok (上次迁移实际已完成，本次幂等确认)"
-        return "conflict", f"目标已存在: {dst}（策略 skip）"
+        else:
+            return "conflict", f"目标已存在: {dst}（策略 skip）"
     final_dst, how = resolved
 
     try:
@@ -107,6 +106,27 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         parent = os.path.dirname(final_dst)
         if not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
+
+        if nfo_fixed_content is not None:
+            # nfo 修正版直接写入目标（源保持原始，dysync 对账不受影响）
+            # 直接覆写目标（污染场景目标/软链仍存在且内容就是污染内容）
+            with open(final_dst, "w", encoding="utf-8") as f:
+                f.write(nfo_fixed_content)
+            try:
+                os.remove(src)
+            except OSError as rm_err:
+                # 删源失败但目标已写入，不影响成功判定
+                src_removed = False
+                detail = f"ok (nfo修正)，源文件删除失败: {rm_err}{detail_extra}"
+            else:
+                src_removed = True
+                detail = f"ok (nfo修正){detail_extra}"
+            # 任务开启软链时在源路径留下指向目标的软链（dysync 对账）
+            if src_removed and task.get("symlink_enabled") and _symlink_source(src, final_dst):
+                detail += "，+symlink"
+            if cfg.get("remove_empty_dirs") and not _has_symlink_in_dir(os.path.dirname(src)):
+                _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
+            return "success", detail
 
         if cfg.get("safe_mode"):
             tmp = os.path.join(parent,

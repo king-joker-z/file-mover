@@ -57,6 +57,7 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
     includes = _parse_patterns(task.get("include_patterns"))
     # 批量预加载已迁移指纹集合 (避免逐文件 DB 查询, 900+ 文件时性能关键)
     migrated_set = db.get_migrated_set(task["id"])
+    migrated_rels = db.get_migrated_rels(task["id"])
     excludes = _parse_patterns(task.get("exclude_patterns"))
     ignores = cfg.get("ignore_suffixes", [])
     douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False)
@@ -97,7 +98,13 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                     size = os.path.getsize(full)
                 except OSError:
                     continue
-                if size > 0 and (rel, size) in migrated_set:
+                is_dup = size > 0 and (rel, size) in migrated_set
+                # 刮削小文件(nfo/封面): dysync 重下内容确定性高(且 file-mover 可能改写过),
+                # rel 命中即视为重复, 忽略 size 差异
+                if not is_dup and size > 0 and rel.lower().endswith((".nfo", ".jpg", ".png")) \
+                        and rel in migrated_rels:
+                    is_dup = True
+                    is_dup = True  # 同路径同大小: 下载器重复下载, 防循环
                     if re_download_action == "delete":
                         try:
                             os.remove(full)
@@ -120,8 +127,27 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                                    "skipped", "重复下载（此前已迁移过），保留跳过")
         for fn in files:
             full = os.path.join(root, fn)
+            rel = os.path.relpath(full, src)
             if os.path.islink(full):
-                _bump("skipped_symlink")
+                # 软链占位：检查目标是否被穿透写污染（nfo 修正版被覆盖）
+                if douyin_nfo_enabled and fn.lower().endswith(".nfo") and task.get("symlink_enabled"):
+                    try:
+                        expected = db.get_migrated_size(task["id"], rel)
+                        actual = os.path.getsize(full)
+                        if expected >= 0 and actual != expected:
+                            # 已污染：重新入队迁移（nfo_fix 会修正）
+                            # 注意：不能先删目标 —— 污染内容就存在于目标上，
+                            # 源软链也指向它，删了内容就丢了（会导致 nfo 丢失）
+                            dst_p = compute_dst(task["dst_dir"], rel,
+                                                task.get("path_rule", "keep_structure"), date_str)
+                            if db.enqueue(task["id"], full, rel, dst_p, actual):
+                                _bump("enqueued")
+                                db.add_log(task["id"], None, full, dst_p, actual,
+                                           0, "success", "软链穿透写污染，重新入队修正")
+                    except OSError:
+                        pass
+                else:
+                    _bump("skipped_symlink")
                 continue  # 软链占位跳过（已迁移留的软链不是迁移对象）
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue

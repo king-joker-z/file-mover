@@ -1,4 +1,5 @@
 """后台线程：扫描循环 + 迁移主循环（节流逐个迁移）"""
+import os
 import threading
 import time
 import traceback
@@ -198,7 +199,11 @@ class Scheduler:
                 self.moved_today += 1
                 # 记录迁移指纹：用于识别下载器重新下载的重复文件
                 try:
-                    db.record_migrated(item["task_id"], item["rel_path"], item.get("size", 0))
+                    # 记录迁移后目标文件的实际 size（nfo_fix 可能改写内容）
+                    final_size = item.get("size", 0)
+                    if os.path.isfile(item["dst_path"]):
+                        final_size = os.path.getsize(item["dst_path"])
+                    db.record_migrated(item["task_id"], item["rel_path"], final_size)
                 except Exception:
                     traceback.print_exc()
             elif result == "conflict":
