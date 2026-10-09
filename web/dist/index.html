@@ -173,6 +173,12 @@ input:checked+.slider:before{transform:translateX(16px)}
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-empty"> 清理迁移后的空目录</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-nfo"> nfo 预处理（迁移前修正：actor 数字UID name→role）</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-douyin"> 抖音 nfo 自动生成（无 nfo 的视频按文件名生成简易 nfo）</label>
+          <div class="field" style="min-width:280px"><label>重复下载处置（下载器把已迁移的文件重新下回源目录时）</label>
+            <select id="g-redownload" style="width:auto">
+              <option value="delete">自动删除（推荐，防迁移循环）</option>
+              <option value="skip">保留并跳过</option>
+              <option value="keep">照常迁移</option>
+            </select></div>
         </div>
         <button class="btn" type="submit">保存设置</button>
         <span id="settings-msg" style="color:var(--ok);margin-left:12px;font-size:13px"></span>
@@ -399,6 +405,7 @@ async function loadSettings(){
     $("#g-stable").checked=s.stable_check;$("#g-safe").checked=s.safe_mode;
     $("#g-verify").checked=s.verify_size;$("#g-empty").checked=s.remove_empty_dirs;
     $("#g-nfo").checked=s.nfo_fix_enabled!==false;$("#g-douyin").checked=!!s.douyin_nfo_enabled;
+    $("#g-redownload").value=s.re_download_action||"delete";
   }catch(e){}
 }
 $("#settings-form").onsubmit=async e=>{
@@ -408,7 +415,8 @@ $("#settings-form").onsubmit=async e=>{
     max_retries:+$("#g-retries").value,stable_check:$("#g-stable").checked,
     safe_mode:$("#g-safe").checked,verify_size:$("#g-verify").checked,remove_empty_dirs:$("#g-empty").checked,
     nfo_fix_enabled:$("#g-nfo").checked,
-    douyin_nfo_enabled:$("#g-douyin").checked})});
+    douyin_nfo_enabled:$("#g-douyin").checked,
+    re_download_action:$("#g-redownload").value})});
   $("#settings-msg").textContent="已保存 ✓";setTimeout(()=>$("#settings-msg").textContent="",2000);
 };
 

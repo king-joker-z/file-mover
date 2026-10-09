@@ -137,6 +137,11 @@ class Scheduler:
             if result == "success":
                 db.set_status(item["id"], "done")
                 self.moved_today += 1
+                # 记录迁移指纹：用于识别下载器重新下载的重复文件
+                try:
+                    db.record_migrated(item["task_id"], item["rel_path"], item.get("size", 0))
+                except Exception:
+                    traceback.print_exc()
             elif result == "conflict":
                 db.set_status(item["id"], "conflict")
             else:

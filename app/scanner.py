@@ -50,6 +50,7 @@ def scan_task(task: dict):
     excludes = _parse_patterns(task.get("exclude_patterns"))
     ignores = cfg.get("ignore_suffixes", [])
     douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False)
+    re_download_action = cfg.get("re_download_action", "delete")  # delete/skip/keep
     date_str = time.strftime("%Y-%m-%d")
 
     for root, _dirs, files in os.walk(src):
@@ -62,6 +63,24 @@ def scan_task(task: dict):
                         ensure_nfo(os.path.join(root, fn))
                     except OSError:
                         pass  # 生成失败不影响迁移
+        # 重复下载检测：下载器把已迁移的文件重新下载回来 → 直接处置，不再入队
+        if re_download_action != "keep":
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, src)
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    continue
+                if size > 0 and db.is_re_migrated(task["id"], rel, size):
+                    db.add_log(task["id"], None, full, "", size, 0,
+                               "success" if re_download_action == "delete" else "skipped",
+                               f"重复下载（此前已迁移过），已{ '删除' if re_download_action=='delete' else '跳过' }")
+                    if re_download_action == "delete":
+                        try:
+                            os.remove(full)
+                        except OSError:
+                            pass
         for fn in files:
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue

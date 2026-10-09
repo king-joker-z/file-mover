@@ -50,6 +50,7 @@ class SettingsIn(BaseModel):
     default_interval_seconds: Optional[float] = None
     nfo_fix_enabled: Optional[bool] = None
     douyin_nfo_enabled: Optional[bool] = None
+    re_download_action: Optional[str] = None
 
 
 # ---------- 目录浏览（供任务表单下拉选择） ----------

@@ -71,17 +71,36 @@ def _init_schema(conn: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
         CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
+        CREATE TABLE IF NOT EXISTS migrated_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            migrated_at TEXT NOT NULL,
+            UNIQUE(task_id, rel_path, size)
+        );
+        CREATE INDEX IF NOT EXISTS idx_migrated_lookup ON migrated_files(task_id, rel_path);
         """
     )
     conn.commit()
 
 
 def _migrate_schema(conn: sqlite3.Connection):
-    """已存在的库补新列"""
+    """已存在的库补新列/新表"""
     cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
     if "run_windows" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN run_windows TEXT NOT NULL DEFAULT ''")
         conn.commit()
+    # migrated_files 表（老库升级）
+    conn.execute("""CREATE TABLE IF NOT EXISTS migrated_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            migrated_at TEXT NOT NULL,
+            UNIQUE(task_id, rel_path, size))""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_migrated_lookup ON migrated_files(task_id, rel_path)")
+    conn.commit()
 
 
 def now_str() -> str:
@@ -252,6 +271,27 @@ def clear_logs() -> int:
     with _lock, conn:
         cur = conn.execute("DELETE FROM logs")
         return cur.rowcount
+
+
+# ---------- migrated_files（重复下载检测） ----------
+
+def record_migrated(task_id: int, rel_path: str, size: int):
+    conn = get_conn()
+    with _lock, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO migrated_files (task_id, rel_path, size, migrated_at) VALUES (?,?,?,?)",
+            (task_id, rel_path, size, now_str()))
+
+
+def is_re_migrated(task_id: int, rel_path: str, size: int) -> bool:
+    """该文件此前已迁移过，且现在源目录又出现了相同 rel_path+size 的文件
+    → 判定为下载器重新下载的重复文件"""
+    conn = get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT 1 FROM migrated_files WHERE task_id=? AND rel_path=? AND size=? LIMIT 1",
+            (task_id, rel_path, size)).fetchone()
+        return row is not None
 
 
 # ---------- logs ----------
