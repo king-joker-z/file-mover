@@ -87,7 +87,7 @@ def scan_task(task: dict):
                         db.add_log(task["id"], None, full, "", size, 0,
                                    "success", "重复下载（此前已迁移过），已删除")
                         # 软链重建：保持源路径"文件存在"，dysync 对账不再重下
-                        if cfg.get("symlink_enabled"):
+                        if task.get("symlink_enabled"):
                             try:
                                 target = os.path.join(task["dst_dir"], rel)
                                 if os.path.isfile(target):

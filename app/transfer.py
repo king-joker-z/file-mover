@@ -142,7 +142,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             detail += detail_extra
         # 符号链接：在源路径留下指向目标的软链（dysync 对账不再重下；Emby 可播）
         # 校验异常分支（目标已确认存在）同样需要软链，此处统一处理
-        if app_config.get().get("symlink_enabled") and task.get("after_action", "delete") == "delete":
+        if task.get("symlink_enabled") and task.get("after_action", "delete") == "delete":
             if _symlink_source(src, final_dst):
                 detail += "，+symlink"
             else:

@@ -124,6 +124,8 @@ input:checked+.slider:before{transform:translateX(16px)}
             <select id="f-path"><option value="keep_structure">保持相对结构（并入已有目录）</option><option value="flatten">平铺到目标根</option><option value="by_date">按日期归档</option></select></div>
           <div class="field"><label>迁移后源文件</label>
             <select id="f-after"><option value="delete">删除（迁移）</option><option value="keep">保留（复制）</option></select></div>
+          <div class="field" style="min-width:240px"><label>源路径符号链接（防下载器重下，默认关）</label>
+            <select id="f-symlink"><option value="0">关闭</option><option value="1">开启</option></select></div>
         </div>
         <button class="btn" type="submit">创建任务</button>
       </form>
@@ -239,6 +241,8 @@ async function editTask(id){
   $("#f-inc").value=t.include_patterns||""; $("#f-exc").value=t.exclude_patterns||"";
   $("#f-conflict").value=t.conflict_policy; $("#f-path").value=t.path_rule;
   $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
+  $("#f-symlink").value = t.symlink_enabled ? "1" : "0";
+  $("#f-symlink").value = t.symlink_enabled ? "1" : "0";
   const btn=$("#task-form button[type=submit]");
   btn.textContent="保存修改"; btn.classList.add("green");
   $("#form-title").textContent = "编辑任务（ID "+id+"）— 保存后立即生效";
@@ -342,7 +346,7 @@ $("#task-form").onsubmit=async e=>{
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
     include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
     conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value,
-    run_windows:$("#f-windows").value.trim()};
+    run_windows:$("#f-windows").value.trim(),symlink_enabled:$("#f-symlink").value==="1"};
   try{
     if (editingTaskId !== null) {
       await api("/api/tasks/"+editingTaskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
