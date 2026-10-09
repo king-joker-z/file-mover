@@ -4,7 +4,7 @@ import time
 from typing import Optional, Tuple, List
 import fnmatch
 from . import db, config
-from .douyin_nfo import ensure_nfo, VIDEO_EXTS
+from .douyin_nfo import ensure_nfo, backfill_nfo_for_link, VIDEO_EXTS
 
 
 def _parse_patterns(raw: str) -> list[str]:
@@ -148,6 +148,21 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                         pass
                 else:
                     _bump("skipped_symlink")
+                # nfo 补齐：dysync 重下/时序竞态可能跳过刮削，导致网盘有视频没 nfo。
+                # 对软链视频检查网盘目标位置，缺 nfo 直接生成写入网盘（不碰软链）
+                if douyin_nfo_enabled and task.get("symlink_enabled"):
+                    base, ext = os.path.splitext(fn)
+                    if ext.lower() in VIDEO_EXTS:
+                        try:
+                            target = os.path.realpath(full)
+                            if os.path.isfile(target):
+                                ok, info = backfill_nfo_for_link(full, target)
+                                if ok:
+                                    db.add_log(task["id"], None, full, info,
+                                               os.path.getsize(info), 0,
+                                               "success", "网盘缺 nfo，已按抖音规则补齐生成")
+                        except OSError:
+                            pass
                 continue  # 软链占位跳过（已迁移留的软链不是迁移对象）
             if any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue

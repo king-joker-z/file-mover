@@ -170,3 +170,32 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
     with open(nfo_path, "w", encoding="utf-8") as f:
         f.write(content)
     return True, nfo_path
+
+
+def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:
+    """软链视频的 nfo 补齐：dysync 重下/时序竞态可能跳过刮削，
+    导致网盘里有视频但没 nfo。对源软链视频直接在网盘目标位置生成 nfo。
+    - link_path: 源目录软链路径（用于读取链接名与博主目录名）
+    - cloud_video: 网盘目标视频路径（nfo 写到它旁边）
+    返回 (是否生成, nfo路径或原因)"""
+    base, ext = os.path.splitext(cloud_video)
+    if ext.lower() not in VIDEO_EXTS:
+        return False, "非视频文件"
+    nfo_path = base + ".nfo"
+    if os.path.isfile(nfo_path):
+        return False, "已存在 nfo"
+    filename = os.path.basename(link_path)
+    parent = os.path.basename(os.path.dirname(link_path))
+
+    # 源目录若有 meta.json 优先使用（字段准确）
+    meta = _meta_from_metajson(os.path.realpath(link_path)) \
+        if os.path.isdir(os.path.dirname(os.path.realpath(link_path))) else None
+    if meta is None:
+        meta = parse_filename(filename, parent_dir=parent) or {}
+    try:
+        content = build_nfo(meta, nickname_fallback=parent or "未知博主")
+        with open(nfo_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True, nfo_path
+    except OSError as e:
+        return False, f"写入失败: {e}"
