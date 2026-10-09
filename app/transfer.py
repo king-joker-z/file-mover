@@ -94,6 +94,9 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                     os.remove(src)
                 except OSError:
                     pass
+            # 任务开启软链时确保占位存在（dysync 重下覆盖/删除软链后恢复）
+            if task.get("symlink_enabled") and not os.path.lexists(src):
+                _symlink_source(src, dst)
             return "success", "ok (上次迁移实际已完成，本次幂等确认)"
         return "conflict", f"目标已存在: {dst}（策略 skip）"
     final_dst, how = resolved
