@@ -68,7 +68,6 @@ input:checked+.slider:before{transform:translateX(16px)}
     <button data-tab="logs">日志</button>
     <button data-tab="settings">设置</button>
     <button data-tab="browse">文件浏览</button>
-    <button data-tab="browse">文件浏览</button>
   </div>
 
   <!-- 仪表盘 -->
@@ -171,7 +170,6 @@ input:checked+.slider:before{transform:translateX(16px)}
     </div>
   </div>
 
-  <div id="tab-browse" style="display:none"></div>
   <!-- 设置 -->
   <div id="tab-settings" style="display:none">
     <div class="panel">
@@ -450,15 +448,19 @@ function browseTo(rel){
     const box=$("#browse-list");
     if(!d.items.length){box.innerHTML='<div class="empty">空目录</div>';return;}
     box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th><th>软链指向</th></tr>`+
-      d.items.map(it=>{
+      d.items.map((it,i)=>{
         const icon=it.type==="symlink"?"🔗":(it.type==="dir"?"📁":"📄");
-        const click=it.type==="dir"?`onclick="browseTo('${(d.rel?d.rel+"/":"")+it.name}')"`:"";
+        const childRel=(d.rel?d.rel+"/":"")+it.name;
+        const click=it.type==="dir"?`data-rel="${esc(encodeURIComponent(childRel))}"`:"";
         return `<tr ${click} style="${it.type==="dir"?"cursor:pointer":""}">
           <td>${icon} ${it.type==="symlink"?"软链":(it.type==="dir"?"目录":"文件")}</td>
           <td style="word-break:break-all">${esc(it.name)}</td>
           <td>${it.type==="file"?fmtSize(it.size):"-"}</td>
           <td class="log-detail" style="word-break:break-all">${esc(it.target)}</td></tr>`;
       }).join("")+"</table>";
+    box.querySelectorAll("tr[data-rel]").forEach(tr=>{
+      tr.onclick=()=>browseTo(decodeURIComponent(tr.dataset.rel));
+    });
   }).catch(e=>$("#browse-list").innerHTML='<div class="empty">'+esc(e.message)+'</div>');
 }
 function browseUp(){browseTo(browseRel.split("/").slice(0,-1).join(""));}
