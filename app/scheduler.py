@@ -24,13 +24,10 @@ class Scheduler:
 
     def start(self):
         db.reset_stuck_transferring()
-        # 启动时把所有任务的周期扫描计时设为当前时间，避免启动即全量扫描
-        for tid in self.sync_progress.keys() or []:
-            pass
+        self._stop.clear()
         now = time.time()
-        import app.db as _db
-        for t in _db.list_tasks():
-            self.last_scan_ts[t["id"]] = now
+        for task in db.list_tasks():
+            self.last_scan_ts[task["id"]] = now
         for name, target in (("scanner", self._scan_loop),
                              ("worker", self._work_loop)):
             t = threading.Thread(target=target, name=f"fm-{name}", daemon=True)
@@ -40,6 +37,9 @@ class Scheduler:
     def stop(self):
         self._stop.set()
         self._scan_wake.set()
+        for thread in self._threads:
+            thread.join()  # 正在传输的文件完成验证后才允许服务退出
+        self._threads.clear()
 
     def wake_scan(self):
         self._scan_wake.set()
@@ -68,6 +68,8 @@ class Scheduler:
             try:
                 task = db.get_task(task_id)
                 if task and task.get("enabled"):
+                    if not self._task_paths_safe(task):
+                        raise ValueError("任务目录重叠或与其他任务冲突，已拒绝扫描")
                     prog["current"] = ""
                     with self._scan_lock:
                         scanner.scan_task(task, skip_stable_check=True,
@@ -114,7 +116,7 @@ class Scheduler:
             for task in db.list_tasks():
                 if self._sync_requests:
                     break  # 新的立即同步请求到来, 让位
-                if not task.get("enabled"):
+                if not task.get("enabled") or not self._task_paths_safe(task):
                     continue
                 interval = task.get("scan_interval") or cfg["scan_interval"]
                 if now - self.last_scan_ts.get(task["id"], 0) >= interval:
@@ -132,6 +134,14 @@ class Scheduler:
             self._process_sync_requests()
             self._scan_wake.wait(timeout=min(5, max(1, cfg["scan_interval"] / 6)))
             self._scan_wake.clear()
+
+    def _task_paths_safe(self, task):
+        from .main import validate_task_paths
+        try:
+            validate_task_paths(task, db.list_tasks(), task["id"])
+            return True
+        except (ValueError, RuntimeError, OSError):
+            return False
 
     # ---------- 运行窗口 ----------
 
@@ -152,7 +162,10 @@ class Scheduler:
                 h1, m1 = map(int, a.strip().split(":"))
                 h2, m2 = map(int, b.strip().split(":"))
             except ValueError:
-                return True  # 非法格式按全天运行，避免配置错误导致任务静默失效
+                return False  # 非法窗口绝不按全天执行
+            if not (0 <= h1 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59
+                    and (0 <= h2 <= 23 or (h2 == 24 and m2 == 0))):
+                return False
             start, end = h1 * 60 + m1, h2 * 60 + m2
             if start <= end:
                 if start <= cur < end:
@@ -166,67 +179,66 @@ class Scheduler:
 
     def _work_loop(self):
         while not self._stop.is_set():
-            task_map = {t["id"]: t for t in db.list_tasks()}
-            item = db.take_next_pending()
-            if item is None:
+            try:
+                self._work_once()
+            except Exception:
+                traceback.print_exc()
                 self.current_file = None
-                self._stop.wait(timeout=1)
-                continue
-            task = task_map.get(item["task_id"])
-            if task is None or not task.get("enabled"):
-                db.set_status(item["id"], "pending")
                 self._stop.wait(timeout=2)
-                continue
-            # 运行窗口外：本条目放回 pending，等待窗口开启
-            if not self._in_run_window(task):
-                db.set_status(item["id"], "pending")
-                self.current_file = None
-                self._stop.wait(timeout=30)
-                continue
 
-            self.current_file = item["rel_path"]
-            db.set_status(item["id"], "transferring")
-            t0 = time.monotonic()
+    def _work_once(self):
+        task_map = {t["id"]: t for t in db.list_tasks()}
+        eligible = [tid for tid, task in task_map.items() if task.get("enabled")
+                    and self._in_run_window(task) and self._task_paths_safe(task)]
+        item = db.take_next_pending(eligible)
+        if item is None:
+            self.current_file = None
+            self._stop.wait(timeout=1)
+            return
+        task = task_map.get(item["task_id"])
+        if task is None or not task.get("enabled") or not self._in_run_window(task):
+            db.set_status(item["id"], "pending")
+            return
+
+        self.current_file = item["rel_path"]
+        started = time.monotonic()
+        try:
             result, detail = transfer.transfer(item, task)
-            duration_ms = int((time.monotonic() - t0) * 1000)
-
-            # 任务级间隔（提前计算，失败分支也要用）
-            interval = max(0.0, float(task.get("interval_seconds", 5)))
-            wait_after = None
-
-            if result == "success":
+        except Exception as exc:
+            traceback.print_exc()
+            result, detail = "failed", f"迁移异常: {exc}"
+        duration_ms = int((time.monotonic() - started) * 1000)
+        interval = max(0.0, float(task.get("interval_seconds", 5)))
+        if result == "success":
+            try:
+                final_size = os.path.getsize(item["dst_path"])
+                if db.get_task(item["task_id"]):
+                    db.record_migrated(item["task_id"], item["rel_path"], final_size,
+                                       item["dst_path"])
                 db.set_status(item["id"], "done")
                 self.moved_today += 1
-                # 记录迁移指纹：用于识别下载器重新下载的重复文件
-                try:
-                    # 记录迁移后目标文件的实际 size（nfo_fix 可能改写内容）
-                    final_size = item.get("size", 0)
-                    if os.path.isfile(item["dst_path"]):
-                        final_size = os.path.getsize(item["dst_path"])
-                    db.record_migrated(item["task_id"], item["rel_path"], final_size)
-                except Exception:
-                    traceback.print_exc()
-            elif result == "conflict":
-                db.set_status(item["id"], "conflict")
+            except Exception as exc:
+                result, detail = "failed", f"目标校验或记账失败: {exc}"
+        if result == "conflict":
+            db.set_status(item["id"], "conflict")
+        elif result == "failed":
+            retries = item.get("retries", 0) + 1
+            cfg = config.get()
+            detail = f"[第{retries}次尝试] {detail}"
+            if retries <= cfg["max_retries"]:
+                backoff = cfg["retry_backoff_seconds"]
+                delay = backoff[min(retries - 1, len(backoff) - 1)]
+                db.set_status(item["id"], "failed", retries=retries,
+                              next_retry_at=time.time() + delay)
+                detail += f"，{delay}s 后自动重试"
             else:
-                retries = item.get("retries", 0) + 1
-                max_retries = config.get()["max_retries"]
-                detail = f"[第{retries}次尝试] {detail}"
-                if retries <= max_retries:
-                    backoff = config.get()["retry_backoff_seconds"]
-                    delay = backoff[min(retries - 1, len(backoff) - 1)]
-                    db.set_status(item["id"], "failed", retries=retries,
-                                  next_retry_at=time.time() + delay)
-                    detail += f"，{delay}s 后自动重试"
-                    wait_after = interval
-                else:
-                    db.set_status(item["id"], "failed", retries=retries)
-                    detail += f"，已达最大重试次数({max_retries})，等待手动重试"
-
-            db.add_log(item["task_id"], item["id"], item["src_path"], item["dst_path"],
-                       item.get("size", 0), duration_ms, result, detail)
-            self.current_file = None
-            self._stop.wait(timeout=wait_after if wait_after is not None else interval)
+                db.set_status(item["id"], "failed", retries=retries)
+                detail += f"，已达最大重试次数({cfg['max_retries']})，等待手动重试"
+        db.add_log(item["task_id"], item["id"], item["src_path"], item["dst_path"],
+                   item.get("size", 0), duration_ms, result, detail)
+        db.cleanup_orphan_queue(item["id"])
+        self.current_file = None
+        self._stop.wait(timeout=interval)
 
 
 scheduler = Scheduler()

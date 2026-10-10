@@ -1,11 +1,16 @@
 """FastAPI 入口 + REST API"""
+import hmac
+import ipaddress
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from typing import Literal, Optional
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import db, config
 from .scheduler import scheduler
@@ -13,6 +18,7 @@ from .scheduler import scheduler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    config.get()  # 损坏/非法配置必须在启动后台线程之前显式失败
     scheduler.start()
     yield
     scheduler.stop()
@@ -24,35 +30,140 @@ app = FastAPI(title="File Mover", lifespan=lifespan)
 # ---------- schemas ----------
 
 class TaskIn(BaseModel):
-    name: str
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
     src_dir: str
     dst_dir: str
-    interval_seconds: float = Field(default=5, ge=0)
+    interval_seconds: float = Field(default=5, ge=0, allow_inf_nan=False)
     scan_interval: int = Field(default=0, ge=0)  # 0=用全局
     include_patterns: str = ""
     exclude_patterns: str = ""
-    conflict_policy: str = "skip"
-    path_rule: str = "keep_structure"
+    conflict_policy: Literal["skip", "overwrite", "rename"] = "skip"
+    path_rule: Literal["keep_structure", "flatten", "by_date"] = "keep_structure"
     after_action: str = "delete"
     enabled: bool = True
     # 运行周期：空 = 全天运行；否则窗口内运行，如 "01:00-07:00"，可多段逗号分隔
     run_windows: str = ""
     symlink_enabled: bool = False
 
+    @field_validator("run_windows")
+    @classmethod
+    def validate_run_windows(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        for segment in value.split(","):
+            parts = segment.strip().split("-")
+            if len(parts) != 2:
+                raise ValueError("运行窗口必须为 HH:MM-HH:MM")
+            try:
+                if any(len(part.strip().split(":")) != 2 for part in parts):
+                    raise ValueError("运行窗口必须为 HH:MM-HH:MM")
+                start_hour, start_minute = (int(n) for n in parts[0].strip().split(":"))
+                end_hour, end_minute = (int(n) for n in parts[1].strip().split(":"))
+            except ValueError as exc:
+                raise ValueError("运行窗口必须为 HH:MM-HH:MM") from exc
+            if not (0 <= start_hour <= 23 and 0 <= start_minute <= 59
+                    and 0 <= end_minute <= 59 and (0 <= end_hour <= 23
+                    or (end_hour == 24 and end_minute == 0))
+                    and (start_hour, start_minute) != (end_hour, end_minute)):
+                raise ValueError("运行窗口时间非法")
+        return value
+
 
 class SettingsIn(BaseModel):
-    scan_interval: Optional[int] = None
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    scan_interval: Optional[int] = Field(default=None, ge=1, le=86400)
     stable_check: Optional[bool] = None
-    stable_check_seconds: Optional[int] = None
-    max_retries: Optional[int] = None
+    stable_check_seconds: Optional[int] = Field(default=None, ge=0, le=3600)
+    max_retries: Optional[int] = Field(default=None, ge=0, le=100)
     safe_mode: Optional[bool] = None
     verify_size: Optional[bool] = None
     remove_empty_dirs: Optional[bool] = None
-    default_interval_seconds: Optional[float] = None
+    default_interval_seconds: Optional[float] = Field(default=None, ge=0, le=86400, allow_inf_nan=False)
     nfo_fix_enabled: Optional[bool] = None
     douyin_nfo_enabled: Optional[bool] = None
-    re_download_action: Optional[str] = None
+    re_download_action: Optional[Literal["delete", "skip", "keep"]] = None
     symlink_enabled: Optional[bool] = None
+
+
+def _task_path(value: str, field: str) -> Path:
+    """归一化路径并解析现有软链；不存在的尾部仍可校验包含关系。"""
+    if not value or not os.path.isabs(value) or "\x00" in value:
+        raise ValueError(f"{field} 必须是绝对路径")
+    path = Path(value).resolve(strict=False)
+    if path == Path("/"):
+        raise ValueError(f"{field} 不能是文件系统根目录")
+    return path
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
+
+
+def validate_task_paths(task: dict, other_tasks: list[dict] = None, task_id: int = None) -> None:
+    """纯校验：包括自身嵌套及跨任务读写重叠，供 API/调度器复用。"""
+    src = _task_path(task["src_dir"], "src_dir")
+    dst = _task_path(task["dst_dir"], "dst_dir")
+    if _overlaps(src, dst):
+        raise ValueError("源目录与目标目录不能相同或互相包含")
+    for other in other_tasks or []:
+        if other.get("id") == task_id:
+            continue
+        other_src = _task_path(other["src_dir"], "已有任务 src_dir")
+        other_dst = _task_path(other["dst_dir"], "已有任务 dst_dir")
+        if any(_overlaps(a, b) for a in (src, dst) for b in (other_src, other_dst)):
+            raise ValueError(f"目录与已有任务 {other.get('id', '')} 重叠，可能导致重复迁移或循环")
+
+
+def _validate_task(data: TaskIn, task_id: int = None) -> None:
+    if data.after_action not in ("delete", "keep"):
+        raise HTTPException(400, "after_action 非法")
+    try:
+        validate_task_paths(data.model_dump(), db.list_tasks(), task_id)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _local_request(request: Request) -> bool:
+    """不信任代理地址；代理必须设置 FILEMOVER_API_TOKEN。"""
+    host = request.headers.get("host", "")
+    try:
+        hostname = urlsplit("//" + host).hostname
+        local_host = hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+        local_client = ipaddress.ip_address(request.client.host).is_loopback
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if not local_host or not local_client:
+        return False
+    # 反向代理即使抹去 Forwarded 头，也不能借 loopback 客户端身份绕过鉴权。
+    # 无 Token 时只开放显式绑定在回环地址的本机服务。
+    bind_host = os.environ.get("FILEMOVER_BIND_HOST", "")
+    if bind_host not in ("127.0.0.1", "::1", "localhost"):
+        return False
+    if any(h in request.headers for h in ("forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host")):
+        return False
+    origin = request.headers.get("origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != host.lower():
+            return False
+    return True
+
+
+@app.middleware("http")
+async def authorize_api(request: Request, call_next):
+    if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        token = os.environ.get("FILEMOVER_API_TOKEN")
+        if token:
+            supplied = request.headers.get("authorization", "")
+            if not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+                return JSONResponse({"detail": "需要有效的 API Token"}, status_code=401,
+                                    headers={"WWW-Authenticate": "Bearer"})
+        elif not _local_request(request):
+            return JSONResponse({"detail": "远程访问 API 必须配置 FILEMOVER_API_TOKEN"}, status_code=403)
+    return await call_next(request)
 
 
 # ---------- 目录浏览（供任务表单下拉选择） ----------
@@ -83,6 +194,8 @@ def api_dirs(rel: Optional[str] = None):
     else:
         target = root
         rel = ""
+    if not target.resolve().is_relative_to(root):
+        raise HTTPException(400, "路径非法")
     if not target.is_dir():
         raise HTTPException(404, "目录不存在")
     dirs = sorted([p.name for p in target.iterdir()
@@ -109,6 +222,8 @@ def api_browse(rel: Optional[str] = None, limit: int = 500):
     else:
         target = root
         rel = ""
+    if not target.resolve().is_relative_to(root):
+        raise HTTPException(400, "路径非法")
     if not target.is_dir():
         raise HTTPException(404, "目录不存在")
     items = []
@@ -140,20 +255,25 @@ def api_list_tasks():
 
 @app.post("/api/tasks")
 def api_create_task(data: TaskIn):
-    if data.conflict_policy not in ("skip", "overwrite", "rename"):
-        raise HTTPException(400, "conflict_policy 非法")
-    if data.path_rule not in ("keep_structure", "flatten", "by_date"):
-        raise HTTPException(400, "path_rule 非法")
-    if data.after_action not in ("delete", "keep") and not data.after_action.startswith("keep_days:"):
-        raise HTTPException(400, "after_action 非法")
-    return {"id": db.create_task(data.model_dump())}
+    _validate_task(data)
+    task_id = db.create_task(data.model_dump())
+    scheduler.wake_scan()
+    return {"id": task_id}
 
 
 @app.put("/api/tasks/{task_id}")
 def api_update_task(task_id: int, data: TaskIn):
-    if not db.get_task(task_id):
+    existing = db.get_task(task_id)
+    if not existing:
         raise HTTPException(404, "任务不存在")
-    db.update_task(task_id, data.model_dump())
+    _validate_task(data, task_id)
+    payload = data.model_dump()
+    if "enabled" not in data.model_fields_set:
+        payload.pop("enabled")  # 编辑表单不提交启停状态，必须经 toggle 显式切换
+    try:
+        db.update_task(task_id, payload)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     scheduler.wake_scan()
     return {"ok": True}
 
@@ -189,6 +309,8 @@ def api_sync_now(task_id: int):
         raise HTTPException(404, "任务不存在")
     if not task.get("enabled"):
         raise HTTPException(400, "任务已停用，请先启用")
+    if not scheduler._task_paths_safe(task):
+        raise HTTPException(400, "任务路径不安全，已拒绝扫描")
     result = scheduler.sync_now(task_id)
     return {"ok": True, "message": result.get("message", "全量扫描已触发")}
 
@@ -242,7 +364,9 @@ def api_get_settings():
 
 @app.put("/api/settings")
 def api_update_settings(data: SettingsIn):
-    data_dict = {k: v for k, v in data.model_dump().items() if v is not None}
+    data_dict = data.model_dump(exclude_unset=True)
+    if any(value is None for value in data_dict.values()):
+        raise HTTPException(422, "设置项不可为 null")
     return config.update(data_dict)
 
 

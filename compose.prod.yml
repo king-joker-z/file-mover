@@ -14,11 +14,12 @@ services:
       - /vol1/1000/docker/file-mover/config:/app/config    # 配置与 SQLite 数据库持久化（必须挂载，否则重启丢队列）
     environment:
       - TZ=Asia/Shanghai
+      - FILEMOVER_API_TOKEN=${FILEMOVER_API_TOKEN:?Set FILEMOVER_API_TOKEN before exposing port 8787}
       # 可选：文件权限映射（跨挂载 chown 报错时再启用）
       # - PUID=1000
       # - PGID=1000
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/dashboard', timeout=5)"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; req=urllib.request.Request('http://127.0.0.1:8787/api/dashboard', headers={'Authorization': 'Bearer ' + os.environ['FILEMOVER_API_TOKEN']}); urllib.request.urlopen(req, timeout=5)"]
       interval: 60s
       timeout: 10s
       retries: 3

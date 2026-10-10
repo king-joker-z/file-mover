@@ -6,6 +6,14 @@ _UID_NAME_RE = re.compile(
     r"(<actor>\s*<name>)\s*\d+\s*(</name>\s*<role>)(.*?)(</role>)",
     re.S)
 
+def prepare_nfo(data: bytes, enabled: bool) -> tuple[bytes, list[str]]:
+    """只在规则真正命中时重编码，未修正的 NFO 保持原始字节。"""
+    if not enabled:
+        return data, []
+    fixed, applied = fix_nfo(data.decode("utf-8", errors="surrogateescape"))
+    return (fixed.encode("utf-8", errors="surrogateescape"), applied) if applied else (data, [])
+
+
 def fix_nfo(text: str) -> tuple[str, list[str]]:
     """返回 (修改后的文本, 应用的规则列表)"""
     applied = []

@@ -144,6 +144,24 @@ def build_nfo(meta: dict, nickname_fallback: str = "未知博主") -> str:
     return "\n".join(lines) + "\n"
 
 
+def _create_nfo(path: str, content: str) -> bool:
+    """排他创建，已存在文件或软链绝不截断；写入失败保留残留供核查。"""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        # 写入失败的残留也属于用户数据，交给人工核查而非竞态中误删新文件。
+        raise
+    return True
+
+
 def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") -> tuple[bool, str]:
     """若视频无伴生 nfo 则生成。优先 meta.json，其次文件名解析。
     返回 (是否生成, nfo路径或原因)"""
@@ -151,7 +169,7 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
     nfo_path = base + ".nfo"
-    if os.path.isfile(nfo_path):
+    if os.path.lexists(nfo_path):
         return False, "已存在 nfo"
     filename = os.path.basename(video_path)
     parent = os.path.basename(os.path.dirname(video_path))
@@ -160,16 +178,12 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
     meta = _meta_from_metajson(video_path)
     if meta:
         content = build_nfo(meta, nickname_fallback=parent or "未知博主")
-        with open(nfo_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return True, nfo_path
+        return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
 
     # 2) DouK 文件名解析
     meta = parse_filename(filename, parent_dir=parent)
     content = build_nfo(meta or {}, nickname_fallback=parent or "未知博主")
-    with open(nfo_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return True, nfo_path
+    return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
 
 
 def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:
@@ -182,7 +196,7 @@ def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
     nfo_path = base + ".nfo"
-    if os.path.isfile(nfo_path):
+    if os.path.lexists(nfo_path):
         return False, "已存在 nfo"
     filename = os.path.basename(link_path)
     parent = os.path.basename(os.path.dirname(link_path))
@@ -194,8 +208,6 @@ def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:
         meta = parse_filename(filename, parent_dir=parent) or {}
     try:
         content = build_nfo(meta, nickname_fallback=parent or "未知博主")
-        with open(nfo_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return True, nfo_path
+        return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
     except OSError as e:
         return False, f"写入失败: {e}"

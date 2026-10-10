@@ -12,3 +12,4 @@ services:
       - ./config:/app/config              # 配置与 SQLite 持久化
     environment:
       - TZ=Asia/Shanghai
+      - FILEMOVER_API_TOKEN=${FILEMOVER_API_TOKEN:?Set FILEMOVER_API_TOKEN before exposing port 8787}

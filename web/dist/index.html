@@ -60,7 +60,7 @@ input:checked+.slider:before{transform:translateX(16px)}
 </head>
 <body>
 <div class="container">
-  <h1><span class="dot"></span>File Mover <span style="font-size:12px;color:var(--muted)">本地文件 → 网盘 定期迁移</span></h1>
+  <h1><span class="dot"></span>File Mover <span style="font-size:12px;color:var(--muted)">本地文件 → 网盘 定期迁移</span><button class="btn small gray" style="margin-left:auto" onclick="if(setApiToken())loadDash()">API Token</button></h1>
   <div class="tabs">
     <button class="active" data-tab="dash">仪表盘</button>
     <button data-tab="tasks">任务管理</button>
@@ -217,7 +217,33 @@ $$(".tabs button").forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==="settings")loadSettings();
 });
 
-async function api(path,opts){const r=await fetch(path,opts);if(!r.ok)throw new Error(await r.text());return r.json();}
+let tokenPrompt = null, tokenPromptDismissed = false;
+function setApiToken(){
+  tokenPromptDismissed = false;
+  const value=prompt("输入 API Token（仅保存在此标签页；留空清除）",sessionStorage.getItem("filemover_api_token")||"");
+  if(value===null){tokenPromptDismissed=true;return false;}
+  if(value.trim())sessionStorage.setItem("filemover_api_token",value.trim());
+  else sessionStorage.removeItem("filemover_api_token");
+  return !!value.trim();
+}
+async function api(path,opts={}){
+  async function send(){
+    const headers=new Headers(opts.headers||{}),token=sessionStorage.getItem("filemover_api_token");
+    if(token)headers.set("Authorization","Bearer "+token);
+    return fetch(path,{...opts,headers,credentials:"same-origin"});
+  }
+  let r=await send();
+  if(r.status===401 && !tokenPromptDismissed){
+    sessionStorage.removeItem("filemover_api_token");
+    if(!tokenPrompt)tokenPrompt=Promise.resolve().then(()=>setApiToken()).finally(()=>{tokenPrompt=null;});
+    if(await tokenPrompt)r=await send();
+  }
+  if(!r.ok){
+    const body=await r.json().catch(()=>({}));
+    throw new Error(typeof body.detail==="string"?body.detail:`请求失败 (${r.status})`);
+  }
+  return r.json();
+}
 
 async function loadDash(){
   try{
@@ -227,7 +253,7 @@ async function loadDash(){
     $("#current-file").textContent=d.current_file?("迁移中: "+d.current_file):"空闲";
     const h=Math.floor(d.uptime_seconds/3600),m=Math.floor(d.uptime_seconds%3600/60);
     $("#uptime").textContent=`已运行 ${h}小时${m}分钟 · 扫描间隔 ${d.settings.scan_interval}s`;
-  }catch(e){}
+  }catch(e){$("#current-file").textContent=e.message;}
 }
 
 let editingTaskId = null;  // 非 null = 编辑模式
@@ -256,7 +282,6 @@ async function editTask(id){
   $("#f-inc").value=t.include_patterns||""; $("#f-exc").value=t.exclude_patterns||"";
   $("#f-conflict").value=t.conflict_policy; $("#f-path").value=t.path_rule;
   $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
-  $("#f-symlink").value = t.symlink_enabled ? "1" : "0";
   $("#f-symlink").value = t.symlink_enabled ? "1" : "0";
   const btn=$("#task-form button[type=submit]");
   btn.textContent="保存修改"; btn.classList.add("green");
@@ -347,7 +372,8 @@ function makeNode(rel, name) {
 function confirmPicker() {
   if (!pickerKind) return;
   if (!pickerSelRel) { alert("请先点击一个目录选中"); return; }
-  $("#f-" + pickerKind).value = pickerSelAbs || pickerSelRel;
+  if(!pickerSelAbs){alert("目录路径尚未加载完成，请稍后重试");return;}
+  $("#f-" + pickerKind).value = pickerSelAbs;
   closePicker();
 }
 
@@ -355,7 +381,7 @@ $("#task-form").onsubmit=async e=>{
   e.preventDefault();
   const src = $("#f-src").value, dst = $("#f-dst").value;
   if (!src || !dst) { alert("请先点击「选择」挑选源目录和目标目录"); return; }
-  if (dst === src || dst.startsWith(src + "/")) { alert("目标目录不能等于或在源目录内部"); return; }
+  if (dst === src || dst.startsWith(src + "/") || src.startsWith(dst + "/")) { alert("源目录与目标目录不能相同或互相包含"); return; }
   const payload = {
     name:$("#f-name").value,src_dir:src,dst_dir:dst,
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
@@ -467,7 +493,7 @@ async function loadSettings(){
 }
 $("#settings-form").onsubmit=async e=>{
   e.preventDefault();
-  await api("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+  try{await api("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({
     scan_interval:+$("#g-scan").value,stable_check_seconds:+$("#g-stable-s").value,
     max_retries:+$("#g-retries").value,stable_check:$("#g-stable").checked,
     safe_mode:$("#g-safe").checked,verify_size:$("#g-verify").checked,remove_empty_dirs:$("#g-empty").checked,
@@ -475,6 +501,7 @@ $("#settings-form").onsubmit=async e=>{
     douyin_nfo_enabled:$("#g-douyin").checked,
     re_download_action:$("#g-redownload").value})});
   $("#settings-msg").textContent="已保存 ✓";setTimeout(()=>$("#settings-msg").textContent="",2000);
+  }catch(err){$("#settings-msg").textContent="保存失败: "+err.message;}
 };
 
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
