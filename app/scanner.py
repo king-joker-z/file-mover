@@ -106,21 +106,27 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                     is_dup = True
                     is_dup = True  # 同路径同大小: 下载器重复下载, 防循环
                     if re_download_action == "delete":
-                        try:
-                            os.remove(full)
-                        except OSError:
-                            pass
-                        _bump("dedup_deleted")
-                        db.add_log(task["id"], None, full, "", size, 0,
-                                   "success", "重复下载（此前已迁移过），已删除")
-                        # 软链重建：保持源路径"文件存在"，dysync 对账不再重下
-                        if task.get("symlink_enabled"):
+                        # 安全检查：网盘目标必须存在才允许删源（否则内容无处可去）。
+                        # 目标不存在说明网盘侧已丢失/未同步，保留源走正常迁移更安全。
+                        target_chk = os.path.join(task["dst_dir"], rel)
+                        if not os.path.isfile(target_chk):
+                            _bump("dedup_skipped")
+                            db.add_log(task["id"], None, full, "", size, 0,
+                                       "skipped", "重复下载但网盘目标缺失，保留源走迁移")
+                        else:
                             try:
-                                target = os.path.join(task["dst_dir"], rel)
-                                if os.path.isfile(target):
-                                    os.symlink(target, full)
+                                os.remove(full)
                             except OSError:
                                 pass
+                            _bump("dedup_deleted")
+                            db.add_log(task["id"], None, full, "", size, 0,
+                                       "success", "重复下载（此前已迁移过），已删除")
+                            # 软链重建：保持源路径"文件存在"，dysync 对账不再重下
+                            if task.get("symlink_enabled"):
+                                try:
+                                    os.symlink(target_chk, full)
+                                except OSError:
+                                    pass
                     else:  # skip
                         _bump("dedup_skipped")
                         db.add_log(task["id"], None, full, "", size, 0,
