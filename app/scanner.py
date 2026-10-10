@@ -4,7 +4,8 @@ import time
 from typing import Optional, Tuple, List
 import fnmatch
 from . import db, config, nfo_fix, transfer
-from .douyin_nfo import ensure_nfo, backfill_nfo_for_link, VIDEO_EXTS
+from .douyin_nfo import (ensure_nfo, ensure_filename_nfo, backfill_nfo_for_link,
+                         VIDEO_EXTS, POSTER_EXTS)
 
 
 def _parse_patterns(raw: str) -> list[str]:
@@ -72,7 +73,9 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
     initial_device = transfer._mount_identity(task["dst_dir"])
     excludes = _parse_patterns(task.get("exclude_patterns"))
     ignores = cfg.get("ignore_suffixes", [])
-    douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False)
+    filename_nfo_enabled = task.get("filename_nfo_enabled", False)
+    # 两种生成格式不能在同一任务上竞争同一个 .nfo 路径。
+    douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False) and not filename_nfo_enabled
     re_download_action = cfg.get("re_download_action", "delete")  # delete/skip/keep
     date_str = time.strftime("%Y-%m-%d")
 
@@ -83,9 +86,20 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                 on_dir(root, len(files))
             except Exception:
                 pass
-        # 抖音 nfo 自动生成：对无伴生 nfo 的视频先生成（这样后续扫描会正常入队 nfo+视频）
-        # 注意：软链跳过 —— dysync 留下的软链目标可能悬空，避免 ensure_nfo 对软链做无用功
-        if douyin_nfo_enabled:
+        # 按任务选择一种补全格式；生成的新 NFO 加入本轮文件列表并经正常队列迁移。
+        # 软链视频不能触发源目录 NFO 生成，避免处理遗留占位。
+        if filename_nfo_enabled or douyin_nfo_enabled:
+            # 发现已有 NFO 时必须使用原始目录清单，不能因过滤器排除它就误补一份。
+            # 封面清单则只包含本任务会迁移的文件，避免 NFO 引用被过滤的图片。
+            poster_files = [name for name in files if not name.startswith(".")
+                            and not any(name.endswith(s) for s in ignores)
+                            and not (excludes and _match_any(
+                                os.path.relpath(os.path.join(root, name), src), name,
+                                excludes))
+                            and (not includes or _match_any(
+                                os.path.relpath(os.path.join(root, name), src), name,
+                                includes) or (os.path.splitext(name)[1].lower() in POSTER_EXTS
+                                             and os.path.splitext(name)[0].lower().endswith("-poster")))]
             for fn in list(files):
                 full_p = os.path.join(root, fn)
                 rel_video = os.path.relpath(full_p, src)
@@ -97,13 +111,16 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                             and not _stable(full_p, cfg.get("stable_check_seconds", 2)))):
                     continue
                 base, ext = os.path.splitext(fn)
-                if ext.lower() in VIDEO_EXTS and not os.path.lexists(os.path.join(root, base + ".nfo")):
+                if ext.lower() in VIDEO_EXTS:
                     try:
-                        created, _ = ensure_nfo(os.path.join(root, fn))
+                        if filename_nfo_enabled:
+                            created, _ = ensure_filename_nfo(full_p, files, poster_files)
+                        else:
+                            created, _ = ensure_nfo(full_p)
                         if created:
                             files.append(base + ".nfo")
                     except OSError:
-                        pass  # 生成失败不影响迁移
+                        pass  # 生成失败不影响视频迁移
         # 重复下载检测：下载器把已迁移的文件重新下载回来 → 直接处置，不再入队
         # 注意：源路径的符号链接本身也会被 os.walk 枚举到，此处跳过软链
         # （软链是迁移成功后特意留下的占位，不是重复下载的文件）
@@ -212,11 +229,19 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                 continue
             rel = os.path.relpath(full, src)
             companion_included = False
-            if fn.lower().endswith(".nfo") and includes:
-                base = os.path.splitext(fn)[0]
+            if includes and (fn.lower().endswith(".nfo") or
+                             (filename_nfo_enabled and
+                              os.path.splitext(fn)[1].lower() in POSTER_EXTS)):
+                stem, extension = os.path.splitext(fn)
+                video_stem = (stem[:-7] if extension.lower() in POSTER_EXTS
+                              and stem.lower().endswith("-poster") else stem)
                 companion_included = any(
-                    os.path.splitext(name)[0] == base
+                    os.path.splitext(name)[0].casefold() == video_stem.casefold()
                     and os.path.splitext(name)[1].lower() in VIDEO_EXTS
+                    and not os.path.islink(os.path.join(root, name))
+                    and not any(name.endswith(s) for s in ignores)
+                    and not (excludes and _match_any(
+                        os.path.relpath(os.path.join(root, name), src), name, excludes))
                     and _match_any(os.path.relpath(os.path.join(root, name), src), name, includes)
                     for name in files)
             if includes and not (_match_any(rel, fn, includes) or companion_included):

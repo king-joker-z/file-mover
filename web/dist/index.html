@@ -127,6 +127,8 @@ input:checked+.slider:before{transform:translateX(16px)}
             <select id="f-after"><option value="delete">删除（迁移）</option><option value="keep">保留（复制）</option></select></div>
           <div class="field" style="min-width:240px"><label>源路径符号链接（防下载器重下，默认关）</label>
             <select id="f-symlink"><option value="0">关闭</option><option value="1">开启</option></select></div>
+          <div class="field" style="min-width:260px"><label>缺失 NFO 补全（标题-作者-YYYYMMDD，默认关）</label>
+            <select id="f-filename-nfo"><option value="0">关闭</option><option value="1">开启（按视频文件名和 -poster 封面）</option></select></div>
         </div>
         <button class="btn" type="submit">创建任务</button>
       </form>
@@ -265,7 +267,7 @@ async function loadTasks(){
     $("#task-list").innerHTML=`<table><tr><th>名称</th><th>源 → 目标</th><th>间隔</th><th>运行周期</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
       tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td>
         <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
-        <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}</td>
+        <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.filename_nfo_enabled?" · NFO补全":""}</td>
         <td><label class="switch"><input type="checkbox" ${t.enabled?"checked":""} onchange="toggleTask(${t.id})"><span class="slider"></span></label></td>
         <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
         <button class="btn small green" onclick="syncNow(${t.id}, this)">立即同步</button>
@@ -283,6 +285,7 @@ async function editTask(id){
   $("#f-conflict").value=t.conflict_policy; $("#f-path").value=t.path_rule;
   $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
   $("#f-symlink").value = t.symlink_enabled ? "1" : "0";
+  $("#f-filename-nfo").value = t.filename_nfo_enabled ? "1" : "0";
   const btn=$("#task-form button[type=submit]");
   btn.textContent="保存修改"; btn.classList.add("green");
   $("#form-title").textContent = "编辑任务（ID "+id+"）— 保存后立即生效";
@@ -387,7 +390,8 @@ $("#task-form").onsubmit=async e=>{
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
     include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
     conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value,
-    run_windows:$("#f-windows").value.trim(),symlink_enabled:$("#f-symlink").value==="1"};
+    run_windows:$("#f-windows").value.trim(),symlink_enabled:$("#f-symlink").value==="1",
+    filename_nfo_enabled:$("#f-filename-nfo").value==="1"};
   try{
     if (editingTaskId !== null) {
       await api("/api/tasks/"+editingTaskId,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});

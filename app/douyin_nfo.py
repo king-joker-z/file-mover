@@ -4,6 +4,7 @@
 import os
 import json
 import re
+from xml.sax.saxutils import escape
 from typing import Optional
 from datetime import datetime
 
@@ -15,6 +16,7 @@ _DATE_RE = re.compile(r"(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}(?:[ 日时]*\d{1,2}[:
 _SPLIT_RE = re.compile(r"\s*[-—_ ]\s*")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".flv", ".webm"}
+POSTER_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def _meta_from_metajson(video_path: str) -> Optional[dict]:
@@ -184,6 +186,59 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
     meta = parse_filename(filename, parent_dir=parent)
     content = build_nfo(meta or {}, nickname_fallback=parent or "未知博主")
     return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
+
+
+def _xml_text(value: str) -> str:
+    """文件名可能含有 XML 1.0 不允许的控制字符。"""
+    clean = "".join(ch for ch in value if ch in "\t\n\r" or
+                    32 <= ord(ch) <= 0x10FFFF and not 0xD800 <= ord(ch) <= 0xDFFF
+                    and (ord(ch) & 0xFFFF) not in (0xFFFE, 0xFFFF))
+    return escape(clean)
+
+
+def ensure_filename_nfo(video_path: str, filenames: list[str],
+                        poster_filenames: list[str] | None = None) -> tuple[bool, str]:
+    """按 标题-作者-YYYYMMDD 生成独立 NFO；不覆盖任何已有同名文件。"""
+    stem, ext = os.path.splitext(os.path.basename(video_path))
+    if ext.lower() not in VIDEO_EXTS:
+        return False, "非视频文件"
+    if os.path.islink(video_path) or not os.path.isfile(video_path):
+        return False, "源视频不存在或是软链"
+    parts = stem.rsplit("-", 2)
+    if len(parts) != 3 or not parts[0].strip() or not parts[1].strip():
+        return False, "文件名不符合 标题-作者-YYYYMMDD"
+    try:
+        if not re.fullmatch(r"[0-9]{8}", parts[2]):
+            raise ValueError("日期格式错误")
+        date = datetime.strptime(parts[2], "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return False, "文件名日期无效"
+    # 同目录已有同名 NFO（包含大写扩展名/软链）时绝不抢占下载器的内容。
+    if any(os.path.splitext(name)[0].casefold() == stem.casefold()
+           and os.path.splitext(name)[1].lower() == ".nfo" for name in filenames):
+        return False, "已存在 nfo"
+    nfo_path = os.path.join(os.path.dirname(video_path), stem + ".nfo")
+    if os.path.lexists(nfo_path):
+        return False, "已存在 nfo"
+    poster = next((name for name in (poster_filenames if poster_filenames is not None else filenames)
+                   if os.path.splitext(name)[0].casefold() == (stem + "-poster").casefold()
+                   and os.path.splitext(name)[1].lower() in POSTER_EXTS
+                   and os.path.isfile(os.path.join(os.path.dirname(video_path), name))
+                   and not os.path.islink(os.path.join(os.path.dirname(video_path), name))), None)
+    title, author = _xml_text(parts[0].strip()), _xml_text(parts[1].strip())
+    lines = ['<?xml version="1.0" encoding="utf-8" standalone="yes"?>', '<movie>',
+             '  <lockdata>true</lockdata>', f'  <title>{title}</title>',
+             f'  <releasedate>{date}</releasedate>', f'  <premiered>{date}</premiered>',
+             '  <genre>时尚</genre>', '  <genre>随拍</genre>',
+             '  <actor>', f'    <name>{author}</name>',
+             '    <role>主演</role>', '    <tmdbid></tmdbid>', '  </actor>']
+    if poster:
+        artwork = _xml_text(poster)
+        lines.extend((f'  <thumb aspect="poster">{artwork}</thumb>',
+                      '  <fanart>', f'    <thumb>{artwork}</thumb>', '  </fanart>'))
+    lines.append('</movie>')
+    return ((True, nfo_path) if _create_nfo(nfo_path, "\n".join(lines) + "\n")
+            else (False, "已存在 nfo"))
 
 
 def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:

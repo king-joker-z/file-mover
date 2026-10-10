@@ -3,6 +3,8 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -176,6 +178,105 @@ class NfoSafetyTests(unittest.TestCase):
         self.source("clip.mp4", b"video")
         stats = scanner.scan_task(self.task, skip_stable_check=True)
         self.assertEqual(stats["enqueued"], 2)
+
+    def test_filename_nfo_is_opt_in_and_matches_requested_xml(self):
+        stem = "抛去我的缺点不谈那我不全是优点吗川崎莫奈川崎莫奈睡莲川崎世界-半口小希-20260601"
+        video = self.source(stem + ".mp4", b"video")
+        poster = self.source(stem + "-poster.jpg", b"poster")
+        self.task["include_patterns"] = "*.mp4"
+        self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 1)
+        self.assertFalse((self.src / (stem + ".nfo")).exists())
+        self.task["filename_nfo_enabled"] = True
+        stats = scanner.scan_task(self.task, skip_stable_check=True)
+        self.assertEqual(stats["enqueued"], 2)
+        content = (self.src / (stem + ".nfo")).read_text(encoding="utf-8")
+        movie = ET.fromstring(content)
+        self.assertEqual(movie.findtext("title"), stem.rsplit("-", 2)[0])
+        self.assertEqual(movie.findtext("releasedate"), "2026-06-01")
+        self.assertEqual(movie.findtext("premiered"), "2026-06-01")
+        self.assertEqual([e.text for e in movie.findall("genre")], ["时尚", "随拍"])
+        self.assertEqual(movie.findtext("actor/name"), "半口小希")
+        self.assertEqual(movie.findtext("actor/role"), "主演")
+        self.assertEqual(movie.findtext("lockdata"), "true")
+        self.assertEqual(movie.findtext("thumb"), poster.name)
+        self.assertEqual(movie.findtext("fanart/thumb"), poster.name)
+        self.assertEqual({item["rel_path"] for item in db.list_queue()},
+                         {video.name, poster.name, stem + ".nfo"})
+        for item in db.list_queue():
+            result, detail = transfer.transfer(item, self.task)
+            self.assertEqual(result, "success", detail)
+        self.assertEqual((self.dst / (stem + ".nfo")).read_text(encoding="utf-8"), content)
+        self.assertEqual((self.dst / poster.name).read_bytes(), b"poster")
+
+    def test_filename_nfo_does_not_override_existing_nfo_even_if_filtered(self):
+        self.task.update(filename_nfo_enabled=True, exclude_patterns="*.NFO")
+        self.source("title-author-20260601.mp4", b"video")
+        existing = self.source("title-author-20260601.NFO", b"downloaded")
+        stats = scanner.scan_task(self.task, skip_stable_check=True)
+        self.assertEqual(stats["enqueued"], 1)
+        self.assertEqual(existing.read_bytes(), b"downloaded")
+        self.assertEqual(os.listdir(self.src).count("title-author-20260601.NFO"), 1)
+        self.assertNotIn("title-author-20260601.nfo", os.listdir(self.src))
+
+    def test_filename_nfo_without_eligible_poster_omits_artwork(self):
+        self.task.update(filename_nfo_enabled=True, include_patterns="*.mp4",
+                         exclude_patterns="*-poster.jpg")
+        self.source("title-author-20260601.mp4", b"video")
+        self.source("title-author-20260601-poster.jpg", b"poster")
+        scanner.scan_task(self.task, skip_stable_check=True)
+        movie = ET.parse(self.src / "title-author-20260601.nfo").getroot()
+        self.assertIsNone(movie.find("thumb"))
+        self.assertIsNone(movie.find("fanart"))
+        self.assertEqual({item["rel_path"] for item in db.list_queue()},
+                         {"title-author-20260601.mp4", "title-author-20260601.nfo"})
+
+    def test_filename_nfo_rejects_invalid_names_and_escapes_xml(self):
+        self.task["filename_nfo_enabled"] = True
+        self.source("title-author-20260230.mp4", b"video")
+        self.source("title-author.mp4", b"video")
+        self.source("A&B <C>-D&E-20260228.mp4", b"video")
+        stats = scanner.scan_task(self.task, skip_stable_check=True)
+        self.assertEqual(stats["enqueued"], 4)
+        self.assertFalse((self.src / "title-author-20260230.nfo").exists())
+        self.assertFalse((self.src / "title-author.nfo").exists())
+        movie = ET.parse(self.src / "A&B <C>-D&E-20260228.nfo").getroot()
+        self.assertEqual(movie.findtext("title"), "A&B <C>")
+        self.assertEqual(movie.findtext("actor/name"), "D&E")
+
+    def test_filename_nfo_exclusive_creation_under_concurrent_scan(self):
+        video = self.source("title-author-20260601.mp4", b"video")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: douyin_nfo.ensure_filename_nfo(
+                str(video), [video.name]), range(8)))
+        self.assertEqual(sum(created for created, _ in results), 1)
+        self.assertEqual(ET.parse(self.src / "title-author-20260601.nfo").getroot().tag,
+                         "movie")
+
+    def test_filename_nfo_takes_precedence_over_global_douyin_generation(self):
+        self.settings["douyin_nfo_enabled"] = True
+        self.task["filename_nfo_enabled"] = True
+        self.source("title-author-20260601.mp4", b"video")
+        scanner.scan_task(self.task, skip_stable_check=True)
+        movie = ET.parse(self.src / "title-author-20260601.nfo").getroot()
+        self.assertEqual(movie.findtext("actor/name"), "author")
+        self.assertEqual(movie.findtext("premiered"), "2026-06-01")
+
+    def test_filename_nfo_symlink_video_is_not_generated(self):
+        self.task["filename_nfo_enabled"] = True
+        target = self.dst / "title-author-20260601.mp4"
+        target.write_bytes(b"video")
+        (self.src / target.name).symlink_to(target)
+        self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 0)
+        self.assertFalse((self.src / "title-author-20260601.nfo").exists())
+
+    def test_filename_nfo_task_setting_is_persisted_and_defaults_off(self):
+        task_id = db.create_task(dict(self.task, name="test"))
+        self.assertEqual(db.get_task(task_id)["filename_nfo_enabled"], 0)
+        db.update_task(task_id, {"filename_nfo_enabled": True})
+        self.assertEqual(db.get_task(task_id)["filename_nfo_enabled"], 1)
+        from app.main import TaskIn
+        self.assertFalse(TaskIn(name="test", src_dir=str(self.src),
+                                dst_dir=str(self.dst)).filename_nfo_enabled)
 
     def test_same_and_nested_task_directories_are_rejected_before_scan_or_transfer(self):
         cases = (

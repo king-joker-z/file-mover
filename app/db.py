@@ -41,6 +41,7 @@ def _init_schema(conn: sqlite3.Connection):
             after_action TEXT NOT NULL DEFAULT 'delete',
             run_windows TEXT NOT NULL DEFAULT '',
             symlink_enabled INTEGER NOT NULL DEFAULT 0,
+            filename_nfo_enabled INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -97,7 +98,9 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.commit()
     if "symlink_enabled" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN symlink_enabled INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
+    if "filename_nfo_enabled" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN filename_nfo_enabled INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
     # migrated_files 表（老库升级）
     conn.execute("""CREATE TABLE IF NOT EXISTS migrated_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,13 +141,14 @@ def create_task(data: dict) -> int:
         cur = conn.execute(
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
-               run_windows, symlink_enabled, enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               run_windows, symlink_enabled, filename_nfo_enabled, enabled, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
              data.get("path_rule", "keep_structure"), data.get("after_action", "delete"),
              data.get("run_windows", ""), 1 if data.get("symlink_enabled") else 0,
+             1 if data.get("filename_nfo_enabled") else 0,
              1 if data.get("enabled", True) else 0, now_str(), now_str()))
         return cur.lastrowid
 
@@ -154,7 +158,8 @@ def update_task(task_id: int, data: dict):
     fields, vals = [], []
     for k in ("name", "src_dir", "dst_dir", "interval_seconds", "scan_interval",
               "include_patterns", "exclude_patterns", "conflict_policy",
-              "path_rule", "after_action", "run_windows", "symlink_enabled", "enabled"):
+              "path_rule", "after_action", "run_windows", "symlink_enabled",
+              "filename_nfo_enabled", "enabled"):
         if k in data:
             fields.append(f"{k}=?")
             vals.append(data[k])

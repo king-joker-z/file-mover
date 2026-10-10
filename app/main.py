@@ -46,6 +46,7 @@ class TaskIn(BaseModel):
     # 运行周期：空 = 全天运行；否则窗口内运行，如 "01:00-07:00"，可多段逗号分隔
     run_windows: str = ""
     symlink_enabled: bool = False
+    filename_nfo_enabled: bool = False
 
     @field_validator("run_windows")
     @classmethod
