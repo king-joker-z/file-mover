@@ -631,6 +631,18 @@ class NfoSafetyTests(unittest.TestCase):
         db.update_task(task_id, {"dst_dir": str(self.root / "other")})
         self.assertFalse(db.list_queue())
 
+    def test_health_probe_is_public_and_independent_of_dashboard(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            with patch.object(scheduler.scheduler, "stats", side_effect=RuntimeError("db unavailable")):
+                client = TestClient(app)
+                response = client.get("/healthz")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {"status": "ok"})
+                self.assertEqual(client.get("/api/dashboard").status_code, 401)
+
     def test_run_window_ends_at_midnight(self):
         import time
         from app.main import TaskIn

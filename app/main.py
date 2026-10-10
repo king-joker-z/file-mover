@@ -27,6 +27,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="File Mover", lifespan=lifespan)
 
 
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    """仅供容器探针确认 HTTP 服务可响应，不访问配置或数据库。"""
+    return {"status": "ok"}
+
+
 # ---------- schemas ----------
 
 class TaskIn(BaseModel):

@@ -18,12 +18,7 @@ services:
       # 可选：文件权限映射（跨挂载 chown 报错时再启用）
       # - PUID=1000
       # - PGID=1000
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os, urllib.request; req=urllib.request.Request('http://127.0.0.1:8787/api/dashboard', headers={'Authorization': 'Bearer ' + os.environ['FILEMOVER_API_TOKEN']}); urllib.request.urlopen(req, timeout=5)"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
+    # 沿用镜像内置 /healthz 健康检查，不请求需要鉴权的业务接口。
 
 # 极空间注意事项：
 # 1. 三个 volume 路径改为极空间里实际存在的目录；
