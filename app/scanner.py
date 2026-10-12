@@ -1,6 +1,7 @@
 """扫描源目录 → 稳定性检测 → 入队"""
 import os
 import time
+from contextvars import ContextVar
 from typing import Optional, Tuple, List
 import fnmatch
 from . import db, config, nfo_fix, transfer
@@ -19,18 +20,41 @@ def _match_any(rel_path: str, name: str, patterns: List[str]) -> bool:
     return False
 
 
+# 每次扫描独立保存首轮采样；即使测试/调用方并发扫描也不会串用样本。
+_scan_samples = ContextVar("scan_samples", default=None)
+
+
+def _signature(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
 def _stable(path: str, wait: int) -> bool:
-    """两次采样大小一致视为写入完成"""
+    """校验本轮首采样与当前 size/mtime/inode，且写入结束已达到静默期。"""
+    context = _scan_samples.get()
+    if context is None:
+        # 未经 scan_task 首采样/静默期初始化的调用不能宣称下载完成。
+        return False
+    samples, quiet, generated = context
     try:
-        s1 = os.path.getsize(path)
+        if os.path.islink(path):
+            return False
+        current = os.stat(path)
     except OSError:
         return False
-    time.sleep(wait)
-    try:
-        s2 = os.path.getsize(path)
-    except OSError:
+    first = samples.get(path)
+    if first is None:
         return False
-    return s1 == s2
+    return (first == _signature(current)
+            and (path in generated or time.time() - current.st_mtime >= quiet))
+
+
+def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None, on_dir=None) -> dict:
+    """扫描入口。兼容旧调用参数，但立即同步不能绕过完整性判定。"""
+    token = _scan_samples.set(None)
+    try:
+        return _scan_task(task, progress=progress, on_dir=on_dir)
+    finally:
+        _scan_samples.reset(token)
 
 
 def compute_dst(dst_dir: str, rel_path: str, path_rule: str, date_str: str) -> str:
@@ -48,10 +72,19 @@ def _within_destination(path: str, destination: str) -> bool:
     return os.path.commonpath((base, os.path.realpath(os.path.dirname(path)))) == base
 
 
-def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None, on_dir=None) -> dict:
-    """扫描一个任务的源目录并入队新文件。
-    skip_stable_check=True 时跳过稳定性检测（立即同步用，用户确认文件已就绪）。
-    返回统计: {enqueued, dedup_deleted, dedup_skipped, skipped_symlink}"""
+def _trusted_link_target(task: dict, rel: str, link: str) -> bool:
+    """只接受确实指向本任务该相对路径迁移目标的占位链接。"""
+    target = os.path.realpath(link)
+    recorded = db.get_migrated_dst(task["id"], rel)
+    # 仅匹配目录结构不够：必须有该任务该文件的已迁移目标记录。
+    return (bool(recorded)
+            and _within_destination(target, task["dst_dir"])
+            and _within_destination(recorded, task["dst_dir"])
+            and target == os.path.realpath(recorded))
+
+
+def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict:
+    """扫描一个任务的源目录并入队已静默文件。"""
     src = task["src_dir"]
     cfg = config.get()
     if not os.path.isabs(src) or not os.path.isabs(task["dst_dir"]):
@@ -78,8 +111,31 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
     douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False) and not filename_nfo_enabled
     re_download_action = cfg.get("re_download_action", "delete")  # delete/skip/keep
     date_str = time.strftime("%Y-%m-%d")
-
+    quiet = max(0, float(cfg.get("stable_quiet_seconds", 60)))
+    wait = cfg.get("stable_check_seconds", 2) if cfg.get("stable_check") else 0
+    # 先收集整轮目录和首采样，统一等待一次；不对每个文件或每层目录 sleep。
+    directories = []
+    samples = {}
     for root, _dirs, files in os.walk(src):
+        directories.append((root, files))
+        for name in files:
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, src)
+            if (name.startswith(".") or name.endswith(".moving")
+                    or any(name.endswith(s) for s in ignores)
+                    or (excludes and _match_any(rel, name, excludes))
+                    or os.path.islink(path)):
+                continue
+            try:
+                samples[path] = _signature(os.stat(path))
+            except OSError:
+                pass
+    if samples and wait:
+        time.sleep(wait)
+    generated = set()
+    _scan_samples.set((samples, quiet, generated))
+
+    for root, files in directories:
         # 每层目录回调: 更新进度 (sync_now 传入)
         if on_dir:
             try:
@@ -107,8 +163,7 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                         or any(fn.endswith(s) for s in ignores)
                         or (includes and not _match_any(rel_video, fn, includes))
                         or (excludes and _match_any(rel_video, fn, excludes))
-                        or (not skip_stable_check and cfg.get("stable_check")
-                            and not _stable(full_p, cfg.get("stable_check_seconds", 2)))):
+                        or not _stable(full_p, wait)):
                     continue
                 base, ext = os.path.splitext(fn)
                 if ext.lower() in VIDEO_EXTS:
@@ -118,9 +173,16 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                         else:
                             created, _ = ensure_nfo(full_p)
                         if created:
+                            nfo_path = os.path.join(root, base + ".nfo")
+                            # 由本进程原子发布的 NFO 已完整写入；仍校验 inode/size/mtime。
+                            samples[nfo_path] = _signature(os.stat(nfo_path))
+                            generated.add(nfo_path)
                             files.append(base + ".nfo")
-                    except OSError:
-                        pass  # 生成失败不影响视频迁移
+                    except OSError as exc:
+                        db.add_log(task["id"], None, full_p,
+                                   os.path.join(root, base + ".nfo"), 0, 0,
+                                   "failed", f"源目录 NFO 生成失败: {exc}")
+                        # 生成失败不影响视频迁移。
         # 重复下载检测：下载器把已迁移的文件重新下载回来 → 直接处置，不再入队
         # 注意：源路径的符号链接本身也会被 os.walk 枚举到，此处跳过软链
         # （软链是迁移成功后特意留下的占位，不是重复下载的文件）
@@ -134,14 +196,13 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                         or (includes and not _match_any(rel, fn, includes))
                         or (excludes and _match_any(rel, fn, excludes))):
                     continue
-                if not skip_stable_check and cfg.get("stable_check") and not _stable(
-                        full, cfg.get("stable_check_seconds", 2)):
+                if rel not in migrated_rels or not _stable(full, wait):
                     continue
                 try:
                     size = os.path.getsize(full)
                 except OSError:
                     continue
-                if size <= 0 or rel not in migrated_rels:
+                if size <= 0:
                     continue
                 target_chk = db.get_migrated_dst(task["id"], rel)
                 try:
@@ -183,7 +244,7 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                 continue
             if os.path.islink(full):
                 # 只信任指向当前任务目标内的软链，其他软链绝不写入或补齐。
-                if not _within_destination(os.path.realpath(full), task["dst_dir"]):
+                if not _trusted_link_target(task, rel, full):
                     _bump("skipped_symlink")
                     continue
                 # 软链占位：检查目标是否被穿透写污染（nfo 修正版被覆盖）
@@ -195,18 +256,18 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                             raw = f.read()
                         fixed, _ = nfo_fix.prepare_nfo(raw, cfg.get("nfo_fix_enabled"))
                         if expected >= 0 and (actual != expected or raw != fixed):
-                            # 已污染：大小变化或同大小内容可修正，重新入队
-                            # 注意：不能先删目标 —— 污染内容就存在于目标上，
-                            # 源软链也指向它，删了内容就丢了（会导致 nfo 丢失）
+                            # 已污染：保留网盘目标，入队供后续核查；不得在扫描时
+                            # 记为成功或自动覆盖外部改写的内容。
                             dst_p = db.get_migrated_dst(task["id"], rel) or os.path.realpath(full)
                             if not _within_destination(dst_p, task["dst_dir"]):
                                 dst_p = os.path.realpath(full)
                             if db.enqueue(task["id"], full, rel, dst_p, actual):
                                 _bump("enqueued")
                                 db.add_log(task["id"], None, full, dst_p, actual,
-                                           0, "success", "软链穿透写污染，重新入队修正")
-                    except OSError:
-                        pass
+                                           0, "conflict", "NFO 软链目标已被改写，已入队供核查；不自动覆盖")
+                    except (OSError, ValueError) as exc:
+                        db.add_log(task["id"], None, full, os.path.realpath(full),
+                                   0, 0, "failed", f"NFO 软链污染检查失败: {exc}")
                 else:
                     _bump("skipped_symlink")
                 # nfo 补齐：dysync 重下/时序竞态可能跳过刮削，导致网盘有视频没 nfo。
@@ -214,16 +275,27 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                 if douyin_nfo_enabled and task.get("symlink_enabled"):
                     base, ext = os.path.splitext(fn)
                     if ext.lower() in VIDEO_EXTS:
+                        target = os.path.realpath(full)
+                        nfo_target = os.path.splitext(target)[0] + ".nfo"
                         try:
-                            target = os.path.realpath(full)
+                            # 此路径直接写云盘而不经迁移流程，写入前必须重查挂载身份。
+                            if transfer._mount_identity(task["dst_dir"]) != initial_device:
+                                raise OSError("目标文件系统已切换，停止 NFO 补齐")
                             if os.path.isfile(target):
                                 ok, info = backfill_nfo_for_link(full, target)
                                 if ok:
                                     db.add_log(task["id"], None, full, info,
                                                os.path.getsize(info), 0,
                                                "success", "网盘缺 nfo，已按抖音规则补齐生成")
-                        except OSError:
-                            pass
+                                elif info != "已存在 nfo":
+                                    db.add_log(task["id"], None, full, nfo_target,
+                                               0, 0, "failed", f"网盘 NFO 补齐失败: {info}")
+                            else:
+                                db.add_log(task["id"], None, full, target,
+                                           0, 0, "skipped", "软链视频目标不是普通文件，未补齐 NFO")
+                        except (OSError, ValueError) as exc:
+                            db.add_log(task["id"], None, full, nfo_target,
+                                       0, 0, "failed", f"网盘 NFO 补齐路径或挂载检查失败: {exc}")
                 continue  # 软链占位跳过（已迁移留的软链不是迁移对象）
             if fn.endswith(".moving") or any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue
@@ -238,7 +310,10 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                 companion_included = any(
                     os.path.splitext(name)[0].casefold() == video_stem.casefold()
                     and os.path.splitext(name)[1].lower() in VIDEO_EXTS
-                    and not os.path.islink(os.path.join(root, name))
+                    and (not os.path.islink(os.path.join(root, name))
+                         or _trusted_link_target(
+                             task, os.path.relpath(os.path.join(root, name), src),
+                             os.path.join(root, name)))
                     and not any(name.endswith(s) for s in ignores)
                     and not (excludes and _match_any(
                         os.path.relpath(os.path.join(root, name), src), name, excludes))
@@ -248,13 +323,17 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                 continue
             if excludes and _match_any(rel, fn, excludes):
                 continue
-            # 稳定性检测（立即同步时跳过：用户确认文件已就绪）
-            if not skip_stable_check and cfg.get("stable_check") and not _stable(full, cfg.get("stable_check_seconds", 2)):
+            # 两种扫描入口都必须经过相同的静默与采样校验。
+            if not _stable(full, wait):
                 continue
             try:
-                size = os.path.getsize(full)
+                current_signature = _signature(os.stat(full))
             except OSError:
                 continue
+            # 入队所记身份必须是本轮首采样且经过末次静默校验的同一文件。
+            if samples.get(full) != current_signature:
+                continue
+            size = current_signature[2]
             prior_dst = db.get_migrated_dst(task["id"], rel) if fn.lower().endswith(".nfo") else None
             if (fn.lower().endswith(".nfo") and rel in migrated_rels and not prior_dst
                     and task.get("path_rule") == "by_date"
@@ -274,7 +353,8 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
                             continue
                 except OSError:
                     pass  # 目标缺失或不可读时必须入队，不得删除源文件
-            if db.enqueue(task["id"], full, rel, dst, size):
+            if db.enqueue(task["id"], full, rel, dst, size,
+                          source_snapshot=current_signature if not fn.lower().endswith(".nfo") else None):
                 _bump("enqueued")
 
     return stats

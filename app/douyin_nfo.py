@@ -4,6 +4,9 @@
 import os
 import json
 import re
+import errno
+import hashlib
+import tempfile
 from xml.sax.saxutils import escape
 from typing import Optional
 from datetime import datetime
@@ -17,6 +20,30 @@ _SPLIT_RE = re.compile(r"\s*[-—_ ]\s*")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".flv", ".webm"}
 POSTER_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _publish_date(value) -> Optional[str]:
+    """接受合理的秒/毫秒时间戳和原有 ISO 日期格式。"""
+    if not value or isinstance(value, bool):
+        return None
+    try:
+        numeric = (isinstance(value, (int, float)) or
+                   isinstance(value, str) and re.fullmatch(r"\d{10}|\d{13}", value.strip()))
+        if numeric:
+            timestamp = float(value)
+            if timestamp >= 1e12:
+                timestamp /= 1000
+            date = datetime.fromtimestamp(timestamp)
+            return date.strftime("%Y-%m-%d") if 2000 <= date.year <= 2100 else None
+        s = str(value).replace("T", " ").split(".")[0].split("+")[0]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s.strip(), fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    except (OSError, ValueError, OverflowError):
+        pass
+    return None
 
 
 def _meta_from_metajson(video_path: str) -> Optional[dict]:
@@ -42,22 +69,7 @@ def _meta_from_metajson(video_path: str) -> Optional[dict]:
     title = post.get("title") or post.get("description") or ""
     desc = post.get("description") or title
     pub = post.get("publish_time") or ""
-    # publish_time 可能是 iso 字符串或时间戳
-    date_str = None
-    if pub:
-        try:
-            if isinstance(pub, (int, float)):
-                date_str = datetime.fromtimestamp(pub).strftime("%Y-%m-%d")
-            else:
-                s = str(pub).replace("T", " ").split(".")[0].split("+")[0]
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                    try:
-                        date_str = datetime.strptime(s.strip(), fmt).strftime("%Y-%m-%d")
-                        break
-                    except ValueError:
-                        continue
-        except (OSError, ValueError, OverflowError):
-            pass
+    date_str = _publish_date(pub)
     nickname = (author.get("nickname") or author.get("name")
                 or mj.get("author_nickname") or "")
     return {
@@ -124,7 +136,7 @@ def build_nfo(meta: dict, nickname_fallback: str = "未知博主") -> str:
     nickname = meta.get("nickname") or nickname_fallback
     uid = meta.get("aweme_id")
 
-    esc = lambda x: (x or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    esc = lambda x: _xml_text(str(x))
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<movie>",
              f"  <title>{esc(title)}</title>",
              f"  <plot>{esc(plot)}</plot>",
@@ -146,22 +158,79 @@ def build_nfo(meta: dict, nickname_fallback: str = "未知博主") -> str:
     return "\n".join(lines) + "\n"
 
 
-def _create_nfo(path: str, content: str) -> bool:
-    """排他创建，已存在文件或软链绝不截断；写入失败保留残留供核查。"""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+def _copy_nfo_exclusive(tmp: str, path: str) -> bool:
+    """不支持 hardlink 的挂载上的回退；写入期间目标可能被其他进程看到。"""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
         fd = os.open(path, flags, 0o644)
     except FileExistsError:
         return False
+    identity = os.fstat(fd)
+    try:
+        with os.fdopen(fd, "w+b") as target, open(tmp, "rb") as source:
+            expected = hashlib.sha256()
+            while chunk := source.read(64 * 1024):
+                expected.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+            target.seek(0)
+            actual = hashlib.sha256()
+            while chunk := target.read(64 * 1024):
+                actual.update(chunk)
+            if actual.digest() != expected.digest():
+                raise OSError(errno.EIO, "NFO 写入后校验失败", path)
+            published = os.lstat(path)
+            if (published.st_dev, published.st_ino) != (identity.st_dev, identity.st_ino):
+                raise OSError(errno.EAGAIN, "NFO 目标在写入期间被替换", path)
+        return True
+    except BaseException:
+        # 只清理由本次排他创建的 inode；不要删除竞争者替换后的文件/软链。
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
+                os.unlink(path)
+        raise
+
+
+def _create_nfo(path: str, content: str) -> bool:
+    """先完整写入同目录临时文件，再尽可能原子地排他发布。"""
+    fd, tmp = tempfile.mkstemp(prefix=".fm-nfo-", suffix=".moving",
+                                dir=os.path.dirname(path) or ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-    except OSError:
-        # 写入失败的残留也属于用户数据，交给人工核查而非竞态中误删新文件。
-        raise
-    return True
+            os.fchmod(stream.fileno(), 0o644)
+        try:
+            if _has_nfo(path):
+                return False
+            os.link(tmp, path, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        except OSError as error:
+            if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+                raise
+            # 重新检查同名 NFO；O_EXCL 是最后一道防线，不依赖预检查防竞态。
+            if _has_nfo(path):
+                return False
+            return _copy_nfo_exclusive(tmp, path)
+        return True
+    finally:
+        os.unlink(tmp)
+
+
+def _has_nfo(video_path: str) -> bool:
+    """从实际目录检查大小写不敏感的同名 NFO（包括软链）。"""
+    directory = os.path.dirname(video_path) or "."
+    stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
+    return any(os.path.splitext(name)[0].casefold() == stem
+               and os.path.splitext(name)[1].casefold() == ".nfo"
+               for name in os.listdir(directory))
 
 
 def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") -> tuple[bool, str]:
@@ -171,7 +240,7 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
     nfo_path = base + ".nfo"
-    if os.path.lexists(nfo_path):
+    if _has_nfo(video_path) or os.path.lexists(nfo_path):
         return False, "已存在 nfo"
     filename = os.path.basename(video_path)
     parent = os.path.basename(os.path.dirname(video_path))
@@ -231,7 +300,11 @@ def ensure_filename_nfo(video_path: str, filenames: list[str],
         stat = os.stat(video_path)
         # macOS 等系统可提供出生时间；否则用修改时间，避免将 inode 变更时间误作创建时间。
         created_at = getattr(stat, "st_birthtime", None) or stat.st_mtime
-        date = datetime.fromtimestamp(created_at).strftime("%Y-%m-%d")
+        try:
+            date = datetime.fromtimestamp(created_at).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            # 异常 mtime 不应生成错误日期或发布不完整的 NFO。
+            return False, "视频时间无效"
     else:
         title, author = parts[0].strip(), parts[1].strip()
     title, author = _xml_text(title), _xml_text(author)
@@ -260,7 +333,7 @@ def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
     nfo_path = base + ".nfo"
-    if os.path.lexists(nfo_path):
+    if _has_nfo(cloud_video) or os.path.lexists(nfo_path):
         return False, "已存在 nfo"
     filename = os.path.basename(link_path)
     parent = os.path.basename(os.path.dirname(link_path))

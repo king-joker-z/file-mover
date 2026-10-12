@@ -56,6 +56,9 @@ input:checked+.slider:before{transform:translateX(16px)}
 .dir-item{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px}
 .dir-item:hover{background:#f4f6fb}
 .dir-item.sel{background:#e3ecff}
+.sync-error:not(:empty){display:block;color:var(--err);font-size:12px;margin-top:4px;max-width:220px;white-space:normal;word-break:break-word}
+.status-warnings{color:var(--warn);font-size:12px;line-height:1.6;white-space:pre-line;word-break:break-word;margin-top:6px}
+.status-warnings:empty{display:none}
 </style>
 </head>
 <body>
@@ -79,7 +82,7 @@ input:checked+.slider:before{transform:translateX(16px)}
       <div class="stat orange"><div class="num" id="s-conflict">0</div><div class="lbl">冲突</div></div>
       <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">累计完成</div></div>
     </div>
-    <div class="panel"><h2>当前状态</h2><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div></div>
+    <div class="panel"><h2>当前状态</h2><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div></div>
   </div>
 
   <!-- 任务管理 -->
@@ -109,8 +112,8 @@ input:checked+.slider:before{transform:translateX(16px)}
             <button type="button" class="btn" onclick="openPicker('dst')">选择</button></div></div>
         </div>
         <div class="row">
-          <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" value="5"></div>
-          <div class="field small"><label>扫描间隔（秒，0=全局）</label><input id="f-scan" type="number" min="0" value="0"></div>
+          <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" max="86400" value="5"></div>
+          <div class="field small"><label>扫描间隔（秒，0=全局）</label><input id="f-scan" type="number" min="0" max="86400" value="0"></div>
           <div class="field"><label>包含（通配，逗号分隔，空=全部）</label><input id="f-inc" placeholder="*.mp4, *.jpg"></div>
           <div class="field"><label>排除（通配）</label><input id="f-exc" placeholder="*.tmp"></div>
         </div>
@@ -179,13 +182,13 @@ input:checked+.slider:before{transform:translateX(16px)}
       <form id="settings-form">
         <div class="row">
           <div class="field small"><label>全局扫描间隔（秒）</label><input id="g-scan" type="number" min="1"></div>
-          <div class="field small"><label>稳定检测间隔（秒）</label><input id="g-stable-s" type="number" min="0"></div>
+          <div class="field small"><label>采样间隔（秒）</label><input id="g-stable-s" type="number" min="0" max="3600"></div>
+<div class="field small"><label>文件静默期（秒，立即同步也生效）</label><input id="g-quiet-s" type="number" min="0" max="86400"></div>
           <div class="field small"><label>最大重试次数</label><input id="g-retries" type="number" min="0"></div>
         </div>
         <div class="row" style="gap:24px">
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-stable"> 文件稳定性检测（防止迁移半截文件）</label>
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-safe"> 安全模式（copy+校验+删源，适合不稳定挂载）</label>
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-verify"> 迁移后校验大小</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-stable"> 双采样检测（静默期保护始终启用）</label>
+          <span class="log-detail">安全迁移与完整性校验：始终启用（复制后进行 hash/读回校验；源文件按任务策略处理）</span>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-empty"> 清理迁移后的空目录</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-nfo"> nfo 预处理（迁移前修正：actor 数字UID name→role）</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-douyin"> 抖音 nfo 自动生成（无 nfo 的视频按文件名生成简易 nfo）</label>
@@ -204,7 +207,7 @@ input:checked+.slider:before{transform:translateX(16px)}
 </div>
 
 <script>
-window.syncUI = window.syncUI || {};
+const syncUI = window.syncUI = window.syncUI || {};
 const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
 let curQueueFilter="";
 
@@ -255,7 +258,13 @@ async function loadDash(){
     $("#current-file").textContent=d.current_file?("迁移中: "+d.current_file):"空闲";
     const h=Math.floor(d.uptime_seconds/3600),m=Math.floor(d.uptime_seconds%3600/60);
     $("#uptime").textContent=`已运行 ${h}小时${m}分钟 · 扫描间隔 ${d.settings.scan_interval}s`;
-  }catch(e){$("#current-file").textContent=e.message;}
+    const warnings=[];
+    if(d.scanner_alive===false)warnings.push("扫描线程已停止，请重启服务");
+    if(d.worker_alive===false)warnings.push("迁移线程已停止，请重启服务");
+    if(d.last_scan_error)warnings.push("最近扫描异常: "+d.last_scan_error);
+    if(d.accounting_pending>0)warnings.push(`待补偿记账: ${d.accounting_pending} 项`);
+    $("#status-warnings").textContent=warnings.join("\n");
+  }catch(e){$("#current-file").textContent=e.message;$("#status-warnings").textContent="";}
 }
 
 let editingTaskId = null;  // 非 null = 编辑模式
@@ -270,8 +279,10 @@ async function loadTasks(){
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.filename_nfo_enabled?" · NFO补全":""}</td>
         <td><label class="switch"><input type="checkbox" ${t.enabled?"checked":""} onchange="toggleTask(${t.id})"><span class="slider"></span></label></td>
         <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
-        <button class="btn small green" onclick="syncNow(${t.id}, this)">立即同步</button>
+        <button class="btn small green" data-sync-id="${t.id}" onclick="syncNow(${t.id})">立即同步</button>
+        <span class="sync-error" data-sync-error="${t.id}" role="alert"></span>
         <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
+    tasks.forEach(t=>updateSyncBtn(t.id));
   }catch(e){}
 }
 
@@ -402,45 +413,75 @@ $("#task-form").onsubmit=async e=>{
   e.target.reset(); resetFormMode(); loadTasks();
 };
 async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
-async function syncNow(id, btn){
-  // 全局同步进度状态（按 task_id），跨页签/重绘保持
-  window.syncUI = window.syncUI || {};
-  window.syncUI = window.syncUI || {}; syncUI_ref = window.syncUI; syncUI_ref[id] = {running:true, scanned:0, enqueued:0, error:null};
-  btn.textContent="扫描中…"; btn.disabled=true;
+async function syncNow(id){
+  if(syncUI[id]?.running) return;
+  const st=syncUI[id]={running:true, starting:true, scanned:0, enqueued:0, error:null, finished:false};
+  updateSyncBtn(id);
   try{
     await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
+    if(syncUI[id]!==st) return;
+    st.starting=false;
+    pollSyncProgress();
   }catch(e){
-    btn.textContent="失败"; alert("触发失败: "+e.message);
-    btn.disabled=false; delete syncUI[id]; return;
+    if(syncUI[id]!==st) return;
+    st.running=false; st.starting=false; st.error="触发失败: "+e.message;
+    updateSyncBtn(id);
+    alert(st.error);
   }
-  pollSyncProgress();
 }
 function updateSyncBtn(id){
-  const st = syncUI[id]; if(!st) return;
-  const btn = document.querySelector(`button[onclick*="syncNow(${id},"]`);
-  if(!btn) return;
-  if(st.error){ btn.textContent="失败"; btn.disabled=false; return; }
-  if(st.running){ btn.textContent=`扫描 ${st.scanned} | 新${st.enqueued}`; }
-  else{ btn.textContent=`✓ 新入队${st.enqueued}`; btn.disabled=false;
-        setTimeout(()=>{ if(!syncUI[id] || !syncUI[id].running){ btn.textContent="立即同步"; } }, 4000); }
+  const st=syncUI[id];
+  const btn=document.querySelector(`button[data-sync-id="${id}"]`);
+  const error=document.querySelector(`[data-sync-error="${id}"]`);
+  if(!btn || !st) return;
+  if(error)error.textContent=st.error||"";
+  btn.title=st.error||"";
+  if(st.error){btn.textContent="重试同步";btn.disabled=st.running;}
+  else if(st.running){btn.textContent=st.starting?"扫描中…":`扫描 ${st.scanned} | 新${st.enqueued}`;btn.disabled=true;}
+  else if(st.finished){
+    btn.textContent=`✓ 新入队${st.enqueued}`;btn.disabled=false;
+    if(!st.resetTimer)st.resetTimer=setTimeout(()=>{
+      if(syncUI[id]!==st || st.running || st.error)return;
+      st.finished=false;
+      const current=document.querySelector(`button[data-sync-id="${id}"]`);
+      if(current)current.textContent="立即同步";
+    },4000);
+  }
 }
-let pollTimer = null;
+let pollTimer=null, pollBusy=false;
 function pollSyncProgress(){
-  if(pollTimer) return;
-  pollTimer = setInterval(async()=>{
-    const running = Object.keys(syncUI).filter(id=>syncUI[id].running);
-    if(!running.length){ clearInterval(pollTimer); pollTimer=null; return; }
-    for(const id of running){
-      try{
-        const p = await api(`/api/tasks/${id}/sync-progress`);
-        const st = syncUI[id]; if(!st) continue;
-        st.scanned=p.scanned||0; st.enqueued=p.enqueued||0;
-        if(!p.running){ st.running=false; loadQueue(); loadDash(); }
-        updateSyncBtn(parseInt(id));
-      }catch(e){}
+  if(pollTimer)return;
+  pollTimer=setInterval(async()=>{
+    if(pollBusy)return;
+    pollBusy=true;
+    try{
+      for(const id of Object.keys(syncUI)){
+        const st=syncUI[id];
+        if(!st.running || st.starting)continue;
+        try{
+          const p=await api(`/api/tasks/${id}/sync-progress`);
+          if(syncUI[id]!==st)continue;
+          st.scanned=p.scanned||0;st.enqueued=p.enqueued||0;
+          st.error=p.error||null;
+          st.running=!!p.running;
+          st.finished=!st.running && !st.error;
+          updateSyncBtn(id);
+          if(!st.running){loadQueue();loadDash();}
+        }catch(e){
+          if(syncUI[id]!==st)continue;
+          st.running=false;st.error="获取同步进度失败: "+e.message;
+          updateSyncBtn(id);
+        }
+      }
+    }finally{
+      pollBusy=false;
+      if(!Object.values(syncUI).some(st=>st.running)){
+        clearInterval(pollTimer);pollTimer=null;
+      }
     }
-  }, 500);
-}async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});loadTasks();}}
+  },500);
+}
+async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});delete syncUI[id];loadTasks();}}
 
 async function loadQueue(){
   try{
@@ -487,10 +528,9 @@ async function loadLogs(){
 async function loadSettings(){
   try{
     const s=await api("/api/settings");
-    $("#g-scan").value=s.scan_interval;$("#g-stable-s").value=s.stable_check_seconds;
+    $("#g-scan").value=s.scan_interval;$("#g-stable-s").value=s.stable_check_seconds;$("#g-quiet-s").value=s.stable_quiet_seconds;
     $("#g-retries").value=s.max_retries;
-    $("#g-stable").checked=s.stable_check;$("#g-safe").checked=s.safe_mode;
-    $("#g-verify").checked=s.verify_size;$("#g-empty").checked=s.remove_empty_dirs;
+    $("#g-stable").checked=s.stable_check;$("#g-empty").checked=s.remove_empty_dirs;
     $("#g-nfo").checked=s.nfo_fix_enabled!==false;$("#g-douyin").checked=!!s.douyin_nfo_enabled;
     $("#g-redownload").value=s.re_download_action||"delete";
   }catch(e){}
@@ -498,9 +538,9 @@ async function loadSettings(){
 $("#settings-form").onsubmit=async e=>{
   e.preventDefault();
   try{await api("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({
-    scan_interval:+$("#g-scan").value,stable_check_seconds:+$("#g-stable-s").value,
+    scan_interval:+$("#g-scan").value,stable_check_seconds:+$("#g-stable-s").value,stable_quiet_seconds:+$("#g-quiet-s").value,
     max_retries:+$("#g-retries").value,stable_check:$("#g-stable").checked,
-    safe_mode:$("#g-safe").checked,verify_size:$("#g-verify").checked,remove_empty_dirs:$("#g-empty").checked,
+    remove_empty_dirs:$("#g-empty").checked,
     nfo_fix_enabled:$("#g-nfo").checked,
     douyin_nfo_enabled:$("#g-douyin").checked,
     re_download_action:$("#g-redownload").value})});

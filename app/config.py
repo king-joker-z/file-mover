@@ -9,11 +9,12 @@ CONFIG_PATH = os.environ.get("FILEMOVER_CONFIG", "/app/config/settings.json")
 DEFAULTS = {
     "scan_interval": 30,          # 全局默认扫描间隔（秒）
     "stable_check": True,         # 稳定性检测开关
-    "stable_check_seconds": 2,    # 两次采样间隔
+    "stable_check_seconds": 2,    # 整轮扫描两次采样的间隔
+    "stable_quiet_seconds": 60,   # 文件修改后至少静默的秒数，立即扫描也生效
     "max_retries": 3,
     "retry_backoff_seconds": [10, 60, 300],
-    "safe_mode": False,           # copy+校验+删源
-    "verify_size": True,
+    "safe_mode": True,            # 兼容旧配置；迁移始终 copy + hash/读回校验
+    "verify_size": True,          # 兼容旧配置；校验始终启用
     "remove_empty_dirs": True,
     "ignore_suffixes": [".tmp", ".part", ".partial", ".downloading", ".!ut", ".crdownload", ".moving"],
     "default_interval_seconds": 5,
@@ -31,6 +32,7 @@ def _validate(data: dict) -> None:
     if not isinstance(data, dict):
         raise ValueError("配置文件必须是 JSON 对象")
     bounds = {"scan_interval": (1, 86400), "stable_check_seconds": (0, 3600),
+              "stable_quiet_seconds": (0, 86400),
               "max_retries": (0, 100), "default_interval_seconds": (0, 86400)}
     for key, (minimum, maximum) in bounds.items():
         if key in data:

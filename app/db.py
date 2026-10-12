@@ -10,17 +10,70 @@ DB_PATH = os.environ.get("FILEMOVER_DB", "/app/config/app.db")
 
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
+_init_lock = threading.Lock()
+
+
+def _source_suffixes(src_path: str):
+    """枚举路径分隔符后的后缀，保留旧版 endswith 匹配语义。"""
+    start = 0
+    while True:
+        separator = src_path.find(os.sep, start)
+        if separator < 0:
+            return
+        yield src_path[separator + len(os.sep):]
+        start = separator + len(os.sep)
+
+
+def _same_file_type(src_path: str, dst_path: str) -> bool:
+    """成功日志仅能证明同类型文件的迁移，不能用视频→NFO 补齐日志授权视频目标。"""
+    return (bool(src_path and dst_path)
+            and os.path.splitext(src_path)[1].lower() == os.path.splitext(dst_path)[1].lower())
+
+
+def _index_success_log(conn: sqlite3.Connection, log_id: int, task_id: int,
+                       src_path: str, dst_path: str):
+    if task_id is not None and _same_file_type(src_path, dst_path):
+        conn.executemany(
+            "INSERT OR IGNORE INTO log_destinations (task_id, rel_path, log_id) VALUES (?,?,?)",
+            ((task_id, suffix, log_id) for suffix in _source_suffixes(src_path)))
+
+
+def _init_log_destinations(conn: sqlite3.Connection):
+    """一次性索引旧库成功日志；正常启动不重复扫描。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS log_destinations (
+        task_id INTEGER NOT NULL, rel_path TEXT NOT NULL, log_id INTEGER NOT NULL,
+        PRIMARY KEY (task_id, rel_path, log_id))""")
+    conn.execute("CREATE TABLE IF NOT EXISTS log_destinations_state (id INTEGER PRIMARY KEY)")
+    # 标记与回填在同一事务内；空日志库也只需检查一次。
+    if conn.execute("SELECT 1 FROM log_destinations_state WHERE id=1").fetchone() is None:
+        for row in conn.execute("SELECT id, task_id, src_path, dst_path FROM logs"
+                                " WHERE result='success' AND src_path IS NOT NULL"
+                                " AND dst_path IS NOT NULL AND dst_path!=''"):
+            _index_success_log(conn, row[0], row[1], row[2], row[3])
+        conn.execute("INSERT INTO log_destinations_state (id) VALUES (1)")
 
 
 def get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _init_schema(_conn)
-        _migrate_schema(_conn)
+        with _init_lock:
+            if _conn is None:
+                directory = os.path.dirname(DB_PATH)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+                try:
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA busy_timeout=30000")
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    _init_schema(conn)
+                    _migrate_schema(conn)
+                    with conn:
+                        _init_log_destinations(conn)
+                except BaseException:
+                    conn.close()
+                    raise
+                _conn = conn
     return _conn
 
 
@@ -56,6 +109,14 @@ def _init_schema(conn: sqlite3.Connection):
             status TEXT NOT NULL DEFAULT 'pending',
             retries INTEGER NOT NULL DEFAULT 0,
             next_retry_at REAL,
+            verified_size INTEGER,
+            verified_sha256 TEXT,
+            verified_trusted INTEGER NOT NULL DEFAULT 0,
+            source_size INTEGER,
+            source_sha256 TEXT,
+            source_dev INTEGER,
+            source_inode INTEGER,
+            source_mtime_ns INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(task_id, rel_path)
@@ -73,6 +134,9 @@ def _init_schema(conn: sqlite3.Connection):
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
+        CREATE INDEX IF NOT EXISTS idx_queue_pending_id ON queue(id) WHERE status='pending';
+        CREATE INDEX IF NOT EXISTS idx_queue_retry_due ON queue(next_retry_at, id)
+            WHERE status='failed' AND next_retry_at IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
         CREATE TABLE IF NOT EXISTS migrated_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +179,15 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE migrated_files ADD COLUMN dst_path TEXT")
     if "dst_sha256" not in migrated_cols:
         conn.execute("ALTER TABLE migrated_files ADD COLUMN dst_sha256 TEXT")
+    queue_cols = {r[1] for r in conn.execute("PRAGMA table_info(queue)")}
+    for column, definition in (("verified_size", "INTEGER"),
+                               ("verified_sha256", "TEXT"),
+                               ("verified_trusted", "INTEGER NOT NULL DEFAULT 0"),
+                               ("source_size", "INTEGER"), ("source_sha256", "TEXT"),
+                               ("source_dev", "INTEGER"), ("source_inode", "INTEGER"),
+                               ("source_mtime_ns", "INTEGER")):
+        if column not in queue_cols:
+            conn.execute(f"ALTER TABLE queue ADD COLUMN {column} {definition}")
     conn.commit()
 
 
@@ -175,13 +248,14 @@ def update_task(task_id: int, data: dict):
         path_keys = ("src_dir", "dst_dir", "path_rule", "include_patterns",
                      "exclude_patterns", "conflict_policy")
         changed = any(key in data and data[key] != old[key] for key in path_keys)
-        if changed and conn.execute("SELECT 1 FROM queue WHERE task_id=? AND status='transferring'",
+        if changed and conn.execute("SELECT 1 FROM queue WHERE task_id=?"
+                                    " AND status IN ('transferring','accounting_pending')",
                                     (task_id,)).fetchone():
             raise ValueError("任务正在迁移，修改路径或规则前请等待当前文件完成")
         conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
         if changed:
             # 仅在路径/规则真正变化时丢弃旧快照，下一轮扫描将按新配置入队。
-            conn.execute("DELETE FROM queue WHERE task_id=? AND status!='transferring'",
+            conn.execute("DELETE FROM queue WHERE task_id=? AND status NOT IN ('transferring','accounting_pending')",
                          (task_id,))
 
 
@@ -195,30 +269,44 @@ def delete_task(task_id: int):
 
 # ---------- queue ----------
 
-def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int) -> bool:
-    """入队。已存在记录时：
-    - done 状态：重新出现则重置为 pending
-    - failed/conflict：仅路径或大小变化时重置；否则保持重试上限
-    - pending/transferring：不重复入队
-    返回是否实际入队。
+def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int,
+            source_snapshot=None) -> bool:
+    """入队；done 且源快照完整、路径/大小/身份均未变时跳过。
+
+    未提供快照（旧调用或 NFO 内容复核）及旧库缺失快照时保守入队。
+    failed/conflict 仅在路径或大小变化时重置，避免耗尽重试后循环调度。
     """
+    dev, inode, mtime_ns = ((source_snapshot[0], source_snapshot[1], source_snapshot[3])
+                            if source_snapshot is not None else (None, None, None))
     conn = get_conn()
     with _lock, conn:
-        row = conn.execute("SELECT id, status, src_path, dst_path, size FROM queue"
+        row = conn.execute("SELECT id, status, src_path, dst_path, size,"
+                           " source_dev, source_inode, source_mtime_ns FROM queue"
                            " WHERE task_id=? AND rel_path=?", (task_id, rel_path)).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO queue (task_id, src_path, rel_path, dst_path, size, status, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,'pending',?,?)",
-                (task_id, src_path, rel_path, dst_path, size, now_str(), now_str()))
+                "INSERT INTO queue (task_id, src_path, rel_path, dst_path, size,"
+                " source_dev, source_inode, source_mtime_ns, status, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,'pending',?,?)",
+                (task_id, src_path, rel_path, dst_path, size, dev, inode, mtime_ns,
+                 now_str(), now_str()))
             return True
-        changed = (row["src_path"] != src_path or row["dst_path"] != dst_path
-                   or row["size"] != size)
-        if row["status"] == "done" or (changed and row["status"] in ("conflict", "failed")):
+        source_changed = row["src_path"] != src_path or row["size"] != size
+        changed = source_changed or row["dst_path"] != dst_path
+        same_source = (source_snapshot is not None and source_snapshot[2] == size
+                       and row["source_dev"] is not None and row["source_inode"] is not None
+                       and row["source_mtime_ns"] is not None
+                       and (row["source_dev"], row["source_inode"], row["source_mtime_ns"])
+                       == (dev, inode, mtime_ns))
+        if (row["status"] == "done" and (source_changed or not same_source)
+                or row["status"] in ("conflict", "failed")
+                and (changed or source_snapshot is not None and not same_source)):
             conn.execute(
-                "UPDATE queue SET src_path=?, dst_path=?, size=?, status='pending',"
-                " retries=0, next_retry_at=NULL, updated_at=? WHERE id=?",
-                (src_path, dst_path, size, now_str(), row["id"]))
+                "UPDATE queue SET src_path=?, dst_path=?, size=?, source_dev=?,"
+                " source_inode=?, source_mtime_ns=?, status='pending',"
+                " retries=0, next_retry_at=NULL, verified_size=NULL, verified_sha256=NULL,"
+                " verified_trusted=0, source_size=NULL, source_sha256=NULL, updated_at=? WHERE id=?",
+                (src_path, dst_path, size, dev, inode, mtime_ns, now_str(), row["id"]))
             return True
         return False
 
@@ -235,9 +323,16 @@ def take_next_pending(eligible_task_ids=None, claim=True):
                 return None
             condition = " AND task_id IN (" + ",".join("?" for _ in ids) + ")"
             params = ids
-        row = conn.execute("SELECT * FROM queue WHERE (status='pending' OR "
-                           "(status='failed' AND next_retry_at IS NOT NULL AND next_retry_at<=?))"
-                           + condition + " ORDER BY id LIMIT 1", [time.time(), *params]).fetchone()
+        # 两类候选各走自己的索引，再按全局 id 排序；仍只查询一次。
+        sql = ("SELECT * FROM queue WHERE id=("
+               "SELECT id FROM ("
+               "SELECT id FROM queue WHERE status='pending'" + condition +
+               " ORDER BY id LIMIT 1)"
+               " UNION ALL SELECT id FROM ("
+               "SELECT id FROM queue WHERE status='failed' AND next_retry_at<=?" +
+               condition + " ORDER BY id LIMIT 1)"
+               " ORDER BY id LIMIT 1)")
+        row = conn.execute(sql, [*params, time.time(), *params]).fetchone()
         if row and claim:
             conn.execute("UPDATE queue SET status='transferring', next_retry_at=NULL, updated_at=?"
                          " WHERE id=?", (now_str(), row["id"]))
@@ -252,6 +347,63 @@ def set_status(queue_id: int, status: str, retries=None,
                      " next_retry_at=?, updated_at=? WHERE id=?",
                      (status, retries, next_retry_at, now_str(), queue_id))
 
+def persist_accounting_pending(queue_id: int, item: dict, credential: tuple):
+    """只有在途且任务仍存在时，落盘读回凭证；失败时保持 transferring。"""
+    size, digest, trusted, source_size, source_digest = credential
+    if size < 0 or len(digest) != 64:
+        raise ValueError("缺少已校验目标凭证")
+    conn = get_conn()
+    with _lock, conn:
+        cur = conn.execute(
+            "UPDATE queue SET status='accounting_pending', dst_path=?, verified_size=?,"
+            " verified_sha256=?, verified_trusted=?, source_size=?, source_sha256=?, updated_at=?"
+            " WHERE id=? AND task_id=? AND src_path=? AND rel_path=? AND status='transferring'"
+            " AND task_id IN (SELECT id FROM tasks)",
+            (item['dst_path'], size, digest, int(trusted), source_size, source_digest,
+             now_str(), queue_id, item['task_id'], item['src_path'], item['rel_path']))
+        if cur.rowcount != 1:
+            raise ValueError("任务或在途队列已变化，需人工核查")
+
+
+def list_accounting_pending():
+    with _lock:
+        return [dict(r) for r in get_conn().execute(
+            "SELECT * FROM queue WHERE status='accounting_pending' ORDER BY id")]
+
+
+def get_accounting_pending(queue_id: int):
+    with _lock:
+        row = get_conn().execute("SELECT * FROM queue WHERE id=? AND status='accounting_pending'",
+                                 (queue_id,)).fetchone()
+        if row is None:
+            raise ValueError("待记账凭证不存在，需人工核查")
+        return dict(row)
+
+
+def complete_accounting(item: dict):
+    """已由调用者重新校验后，同事务写迁移记录与完成状态。"""
+    conn = get_conn()
+    with _lock, conn:
+        row = conn.execute("SELECT * FROM queue WHERE id=? AND status='accounting_pending'",
+                           (item['id'],)).fetchone()
+        if (row is None or any(row[key] != item[key] for key in
+                               ('task_id', 'src_path', 'rel_path', 'dst_path',
+                                'verified_size', 'verified_sha256', 'verified_trusted',
+                                'source_size', 'source_sha256')) or
+                conn.execute("SELECT 1 FROM tasks WHERE id=?", (item['task_id'],)).fetchone() is None):
+            raise ValueError("记账凭证或任务已变化，需人工核查")
+        # 新凭证取代该相对路径的旧授权，避免旧 size 的哈希授权未写目标。
+        conn.execute("DELETE FROM migrated_files WHERE task_id=? AND rel_path=?",
+                     (item['task_id'], item['rel_path']))
+        conn.execute("INSERT INTO migrated_files"
+                     " (task_id, rel_path, size, migrated_at, dst_path, dst_sha256)"
+                     " VALUES (?,?,?,?,?,?)",
+                     (item['task_id'], item['rel_path'], item['verified_size'], now_str(),
+                      item['dst_path'], item['verified_sha256'] if item['verified_trusted'] else None))
+        conn.execute("UPDATE queue SET status='done', updated_at=? WHERE id=?",
+                     (now_str(), item['id']))
+
+
 def cleanup_orphan_queue(queue_id: int):
     """删除任务已移除的在途队列；保留日志用于排查。"""
     conn = get_conn()
@@ -265,6 +417,7 @@ def reset_stuck_transferring():
     conn = get_conn()
     with _lock, conn:
         conn.execute("DELETE FROM queue WHERE task_id NOT IN (SELECT id FROM tasks)")
+        # 无凭证的中断转存不能据目标存在自动补记；仍按源身份检查路径执行。
         conn.execute("UPDATE queue SET status='pending', updated_at=? WHERE status='transferring'",
                      (now_str(),))
 
@@ -294,7 +447,7 @@ def retry_queue(ids):
     with _lock, conn:
         conn.executemany(
             "UPDATE queue SET status='pending', next_retry_at=NULL, retries=0, updated_at=?"
-            " WHERE id=? AND status!='transferring'",
+            " WHERE id=? AND status NOT IN ('transferring','accounting_pending')",
             [(now_str(), i) for i in ids])
 
 
@@ -303,9 +456,9 @@ def clear_queue(status=None) -> int:
     conn = get_conn()
     with _lock, conn:
         if status == "all":
-            cur = conn.execute("DELETE FROM queue WHERE status!='transferring'")
+            cur = conn.execute("DELETE FROM queue WHERE status NOT IN ('transferring','accounting_pending')")
         elif status:
-            cur = conn.execute("DELETE FROM queue WHERE status=? AND status!='transferring'", (status,))
+            cur = conn.execute("DELETE FROM queue WHERE status=? AND status NOT IN ('transferring','accounting_pending')", (status,))
         else:
             cur = conn.execute("DELETE FROM queue WHERE status='done'")
         return cur.rowcount
@@ -314,6 +467,7 @@ def clear_queue(status=None) -> int:
 def clear_logs() -> int:
     conn = get_conn()
     with _lock, conn:
+        conn.execute("DELETE FROM log_destinations")
         cur = conn.execute("DELETE FROM logs")
         return cur.rowcount
 
@@ -337,7 +491,8 @@ def record_migrated(task_id: int, rel_path: str, size: int, dst_path: str = None
             "(task_id, rel_path, size, migrated_at, dst_path, dst_sha256)"
             " VALUES (?,?,?,?,?,?)",
             (task_id, rel_path, size, now_str(), dst_path, digest))
-        # 清理 done 的 queue 条目: 防 queue 表无限增长, 保持 UNIQUE 检查快速
+        # 仅清除先前已完成的快照；在途条目必须由调用者自行标记完成。
+        # 与迁移记账保持同一事务，不能提前删除 transferring 行。
         conn.execute(
             "DELETE FROM queue WHERE task_id=? AND rel_path=? AND status='done'",
             (task_id, rel_path))
@@ -376,10 +531,18 @@ def get_migrated_dst(task_id: int, rel_path: str) -> Optional[str]:
             return row["dst_path"]
         # 老库只有 rel_path/size 时，优先从尚存的成功日志找当时的真实目标。
         logs = conn.execute(
-            "SELECT src_path, dst_path FROM logs WHERE task_id=? AND result='success'"
-            " AND dst_path != '' ORDER BY id DESC", (task_id,)).fetchall()
+            "SELECT logs.src_path, logs.dst_path FROM log_destinations AS d"
+            " JOIN logs ON logs.id=d.log_id"
+            " WHERE d.task_id=? AND d.rel_path=? AND logs.task_id=?"
+            " AND logs.result='success'"
+            " ORDER BY d.log_id DESC", (task_id, rel_path, task_id))
         for log in logs:
-            if log["src_path"] and log["src_path"].endswith(os.sep + rel_path):
+            # 旧库可能已经索引了软链视频→补齐 NFO 的成功日志，逐条校验，
+            # 不让最新的脏记录遮住较早的真实迁移记录。
+            if (log["src_path"] and log["src_path"].endswith(os.sep + rel_path)
+                    and _same_file_type(log["src_path"], log["dst_path"])
+                    and os.path.splitext(rel_path)[1].lower()
+                    == os.path.splitext(log["dst_path"])[1].lower()):
                 return log["dst_path"]
         return None
 
@@ -437,10 +600,12 @@ def is_re_migrated(task_id: int, rel_path: str, size: int) -> bool:
 def add_log(task_id, queue_id, src_path, dst_path, size, duration_ms, result, detail=""):
     conn = get_conn()
     with _lock, conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO logs (task_id, queue_id, src_path, dst_path, size, duration_ms, result, detail, created_at)"
             " VALUES (?,?,?,?,?,?,?,?,?)",
             (task_id, queue_id, src_path, dst_path, size, duration_ms, result, detail, now_str()))
+        if result == "success":
+            _index_success_log(conn, cur.lastrowid, task_id, src_path, dst_path)
 
 
 def list_logs(task_id=None, status=None, limit=100, offset=0):

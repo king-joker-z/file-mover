@@ -1,17 +1,22 @@
 """douyin_nfo 边界情况测试套件"""
-import os, sys, stat, tempfile
+import errno, json, os, sys, stat, tempfile
+from datetime import datetime
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.douyin_nfo import parse_filename, build_nfo, ensure_nfo
+from app.douyin_nfo import (parse_filename, build_nfo, ensure_nfo,
+                            backfill_nfo_for_link, ensure_filename_nfo, _create_nfo)
+from app.nfo_fix import fix_nfo, prepare_nfo
 import xml.etree.ElementTree as ET
 
-results = []
+class DouyinNfoTests(unittest.TestCase):
+    """保留 B1–B22 的独立用例，供 unittest discover 收集。"""
+
+
 def check(name, fn):
-    try:
-        fn(); results.append((name, "PASS", ""))
-    except AssertionError as e:
-        results.append((name, "FAIL", str(e)))
-    except Exception as e:
-        results.append((name, "ERROR", repr(e)))
+    fn.__doc__ = name
+    setattr(DouyinNfoTests, f"test_{fn.__name__}", staticmethod(fn))
 
 def b1():
     m = parse_filename("2026-05-11-7638661243377142373.mp4", parent_dir="up")
@@ -137,10 +142,210 @@ def b16():
         os.chmod(d, stat.S_IRWXU)
 check("B16 只读目录写入失败可捕获", b16)
 
-import stat
-allpass = all(r[1] == "PASS" for r in results)
-for name, status, detail in results:
-    print(f"{status:5} {name} {detail[:90]}")
-print()
-print("=== 16/16 全部通过 ===" if allpass else "!!! 有失败 !!!")
-sys.exit(0 if allpass else 1)
+def b17():
+    meta = {"title": "标题\x00\x1f\ufffe<&", "desc": "内容\x0b\ud800",
+            "nickname": "作者\x01", "date": "2026-01-01\x02", "aweme_id": "123\x03"}
+    movie = ET.fromstring(build_nfo(meta))
+    assert movie.findtext("title") == "标题<&"
+    assert movie.findtext("plot") == "内容"
+    assert movie.findtext("studio") == "作者"
+    assert movie.findtext("uniqueid") == "123"
+check("B17 build_nfo 清除 XML 禁止字符", b17)
+
+def b18():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "clip.nfo")
+        with patch("app.douyin_nfo.os.fsync", side_effect=OSError("磁盘写入失败")):
+            try:
+                _create_nfo(path, "半截")
+                assert False, "应抛出写入异常"
+            except OSError:
+                pass
+        assert not os.path.lexists(path)
+        assert os.listdir(d) == [], os.listdir(d)
+        assert _create_nfo(path, "完整")
+        assert not _create_nfo(path, "不应覆盖")
+        assert open(path, encoding="utf-8").read() == "完整"
+check("B18 写入失败不留半截目标且可以重试", b18)
+
+def b19():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "clip.nfo")
+        protected = os.path.join(d, "protected")
+        with open(protected, "w") as f:
+            f.write("原始")
+        original_link = os.link
+        def concurrent_link(src, dst, **kwargs):
+            os.symlink(protected, dst)
+            return original_link(src, dst, **kwargs)
+        with patch("app.douyin_nfo.os.link", side_effect=concurrent_link):
+            assert not _create_nfo(path, "新内容")
+        assert os.path.islink(path)
+        assert open(protected).read() == "原始"
+        assert sorted(os.listdir(d)) == ["clip.nfo", "protected"]
+check("B19 并发创建软链不覆盖", b19)
+
+def b20():
+    with tempfile.TemporaryDirectory() as d:
+        source = os.path.join(d, "source")
+        cloud = os.path.join(d, "cloud")
+        os.mkdir(source)
+        os.mkdir(cloud)
+        video = os.path.join(source, "clip.mp4")
+        target = os.path.join(cloud, "clip.mp4")
+        open(video, "wb").close()
+        open(target, "wb").close()
+        for existing in ("CLIP.NFO", "clip.NFO"):
+            nfo = os.path.join(cloud, existing)
+            with open(nfo, "w") as f:
+                f.write("keep")
+            assert backfill_nfo_for_link(video, target) == (False, "已存在 nfo")
+            assert open(nfo).read() == "keep"
+            os.unlink(nfo)
+        upper = os.path.join(source, "CLIP.NFO")
+        os.symlink("missing", upper)
+        assert ensure_nfo(video) == (False, "已存在 nfo")
+        os.unlink(upper)
+        assert backfill_nfo_for_link(video, target)[0]
+        assert ET.parse(os.path.join(cloud, "clip.nfo")).getroot().tag == "movie"
+check("B20 全局生成和补齐检测大小写 NFO 与软链", b20)
+
+def b21():
+    with tempfile.TemporaryDirectory() as d:
+        video = os.path.join(d, "clip.mp4")
+        open(video, "wb").close()
+        for timestamp in ("1767225600", "1767225600000", 1767225600, 1767225600000):
+            with open(os.path.join(d, "meta.json"), "w") as f:
+                json.dump({"title": "clip", "publish_time": timestamp}, f)
+            generated, path = ensure_nfo(video)
+            assert generated, path
+            expected = datetime.fromtimestamp(1767225600).strftime("%Y-%m-%d")
+            assert ET.parse(path).getroot().findtext("premiered") == expected
+            os.unlink(path)
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            json.dump({"publish_time": "9999999999999"}, f)
+        generated, path = ensure_nfo(video)
+        assert generated and ET.parse(path).getroot().find("premiered") is None
+check("B21 meta 时间戳秒毫秒与不合理值", b21)
+
+def b22():
+    raw = b"<actor><name>12345</name><role>  </role></actor>"
+    assert prepare_nfo(raw, True) == (raw, [])
+    assert fix_nfo(raw.decode())[1] == []
+    fixed, applied = fix_nfo(raw.decode() + "<actor><name>67890</name><role>Alice</role></actor>")
+    assert "<name>12345</name>" in fixed and "<name>Alice</name>" in fixed
+    assert applied == ["actor-uid-name→role x1"]
+check("B22 空 role 不替换 UID 与计数", b22)
+
+def b23():
+    for code in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "clip.nfo")
+            with patch("app.douyin_nfo.os.link", side_effect=OSError(code, "unsupported")):
+                assert _create_nfo(path, "完整内容")
+            with open(path, encoding="utf-8") as f:
+                assert f.read() == "完整内容"
+            assert os.listdir(d) == ["clip.nfo"]
+check("B23 不支持 hardlink 时排他复制发布", b23)
+
+def b24():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "clip.nfo")
+        protected = os.path.join(d, "protected")
+        with open(protected, "w") as f:
+            f.write("不可覆盖")
+        def lose_race(src, dst, **kwargs):
+            os.symlink(protected, dst)
+            raise OSError(errno.EPERM, "hardlink unsupported")
+        with patch("app.douyin_nfo.os.link", side_effect=lose_race):
+            assert not _create_nfo(path, "new")
+        assert os.path.islink(path)
+        with open(protected) as f:
+            assert f.read() == "不可覆盖"
+        os.unlink(path)
+        def create_before_open(src, dst, **kwargs):
+            with open(dst, "w") as f:
+                f.write("竞争者")
+            raise OSError(errno.EXDEV, "hardlink unsupported")
+        with patch("app.douyin_nfo.os.link", side_effect=create_before_open):
+            assert not _create_nfo(path, "new")
+        with open(path) as f:
+            assert f.read() == "竞争者"
+        os.unlink(path)
+        real_open = os.open
+        def race_at_exclusive_open(name, flags, *args, **kwargs):
+            if name == path:
+                os.symlink(protected, path)
+            return real_open(name, flags, *args, **kwargs)
+        with patch("app.douyin_nfo.os.link", side_effect=OSError(errno.EPERM, "unsupported")), \
+                patch("app.douyin_nfo.os.open", side_effect=race_at_exclusive_open):
+            assert not _create_nfo(path, "new")
+        assert os.path.islink(path)
+        os.unlink(path)
+        with patch("app.douyin_nfo.os.link", side_effect=OSError(errno.EIO, "real failure")):
+            try:
+                _create_nfo(path, "new")
+                assert False, "非不支持错误不能回退"
+            except OSError as e:
+                assert e.errno == errno.EIO
+        assert os.listdir(d) == ["protected"]
+check("B24 竞争软链/文件不覆盖且其它错误不回退", b24)
+
+def b25():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "clip.nfo")
+        real_fsync = os.fsync
+        for mode in ("write_failure", "hash_mismatch", "replaced"):
+            calls = 0
+            protected = os.path.join(d, "protected")
+            if mode == "replaced":
+                with open(protected, "w") as f:
+                    f.write("保留")
+            def inject(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    if mode == "write_failure":
+                        raise OSError(errno.EIO, "target fsync failed")
+                    if mode == "hash_mismatch":
+                        with open(path, "r+b") as f:
+                            f.write(b"bad")
+                    if mode == "replaced":
+                        os.unlink(path)
+                        os.symlink(protected, path)
+                return real_fsync(fd)
+            with patch("app.douyin_nfo.os.link", side_effect=OSError(errno.EPERM, "unsupported")), \
+                    patch("app.douyin_nfo.os.fsync", side_effect=inject):
+                try:
+                    _create_nfo(path, "原内容")
+                    assert False, mode
+                except OSError:
+                    pass
+            if mode == "replaced":
+                assert os.path.islink(path)
+                with open(protected) as f:
+                    assert f.read() == "保留"
+                os.unlink(path)
+                os.unlink(protected)
+            else:
+                assert not os.path.lexists(path), mode
+            assert os.listdir(d) == [], (mode, os.listdir(d))
+check("B25 复制失败/读回不一致清理自己的目标且不删竞争者", b25)
+
+def b26():
+    with tempfile.TemporaryDirectory() as d:
+        video = os.path.join(d, "clip.mp4")
+        open(video, "wb").close()
+        real_stat = os.stat
+        def invalid_time(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == video:
+                return SimpleNamespace(st_mode=result.st_mode, st_mtime=1e100)
+            return result
+        with patch("app.douyin_nfo.os.stat", side_effect=invalid_time):
+            assert ensure_filename_nfo(video, ["clip.mp4"]) == (False, "视频时间无效")
+        assert os.listdir(d) == ["clip.mp4"]
+check("B26 畸形 mtime 溢出保守跳过", b26)
+
+if __name__ == "__main__":
+    unittest.main()

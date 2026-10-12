@@ -33,6 +33,26 @@ def healthz():
     return {"status": "ok"}
 
 
+@app.get("/readyz", include_in_schema=False)
+def readyz():
+    """公开最少就绪状态；详细错误只留在受保护的 dashboard 中。"""
+    scanner_alive = any(t.name == "fm-scanner" and t.is_alive() for t in scheduler._threads)
+    worker_alive = any(t.name == "fm-worker" and t.is_alive() for t in scheduler._threads)
+    try:
+        config.get()
+    except Exception:
+        return JSONResponse({"status": "not_ready", "reason": "config_unavailable"}, status_code=503)
+    try:
+        db.queue_stats()
+    except Exception:
+        return JSONResponse({"status": "not_ready", "reason": "database_unavailable"}, status_code=503)
+    if not scanner_alive:
+        return JSONResponse({"status": "not_ready", "reason": "scanner_unavailable"}, status_code=503)
+    if not worker_alive:
+        return JSONResponse({"status": "not_ready", "reason": "worker_unavailable"}, status_code=503)
+    return {"status": "ok"}
+
+
 # ---------- schemas ----------
 
 class TaskIn(BaseModel):
@@ -41,8 +61,8 @@ class TaskIn(BaseModel):
     name: str = Field(min_length=1)
     src_dir: str
     dst_dir: str
-    interval_seconds: float = Field(default=5, ge=0, allow_inf_nan=False)
-    scan_interval: int = Field(default=0, ge=0)  # 0=用全局
+    interval_seconds: float = Field(default=5, ge=0, le=86400, allow_inf_nan=False)
+    scan_interval: int = Field(default=0, ge=0, le=86400)  # 0=用全局
     include_patterns: str = ""
     exclude_patterns: str = ""
     conflict_policy: Literal["skip", "overwrite", "rename"] = "skip"
@@ -84,7 +104,9 @@ class SettingsIn(BaseModel):
     scan_interval: Optional[int] = Field(default=None, ge=1, le=86400)
     stable_check: Optional[bool] = None
     stable_check_seconds: Optional[int] = Field(default=None, ge=0, le=3600)
+    stable_quiet_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
     max_retries: Optional[int] = Field(default=None, ge=0, le=100)
+    # 兼容旧客户端的设置字段；迁移流程始终复制并进行 hash/读回校验。
     safe_mode: Optional[bool] = None
     verify_size: Optional[bool] = None
     remove_empty_dirs: Optional[bool] = None
@@ -319,13 +341,18 @@ def api_sync_now(task_id: int):
     if not scheduler._task_paths_safe(task):
         raise HTTPException(400, "任务路径不安全，已拒绝扫描")
     result = scheduler.sync_now(task_id)
+    if not result["ok"]:
+        raise HTTPException(503, result["message"])
     return {"ok": True, "message": result.get("message", "全量扫描已触发")}
 
 
 # ---------- queue ----------
 
 @app.get("/api/queue")
-def api_queue(status: Optional[str] = None, limit: int = 200, offset: int = 0):
+def api_queue(status: Optional[str] = None, limit: int = 200,
+              offset: int = 0):
+    if not 1 <= limit <= 1000 or offset < 0:
+        raise HTTPException(422, "limit 必须在 1-1000，offset 不得为负数")
     return db.list_queue(status, limit, offset)
 
 
@@ -353,6 +380,8 @@ def api_clear_queue(status: Optional[str] = None):
 @app.get("/api/logs")
 def api_logs(task_id: Optional[int] = None, status: Optional[str] = None,
              limit: int = 100, offset: int = 0):
+    if not 1 <= limit <= 1000 or offset < 0:
+        raise HTTPException(422, "limit 必须在 1-1000，offset 不得为负数")
     return db.list_logs(task_id, status, limit, offset)
 
 
