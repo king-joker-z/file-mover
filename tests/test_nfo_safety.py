@@ -230,18 +230,57 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual({item["rel_path"] for item in db.list_queue()},
                          {"title-author-20260601.mp4", "title-author-20260601.nfo"})
 
-    def test_filename_nfo_rejects_invalid_names_and_escapes_xml(self):
+    def test_filename_nfo_falls_back_for_invalid_names_and_escapes_xml(self):
         self.task["filename_nfo_enabled"] = True
         self.source("title-author-20260230.mp4", b"video")
         self.source("title-author.mp4", b"video")
         self.source("A&B <C>-D&E-20260228.mp4", b"video")
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual(stats["enqueued"], 4)
-        self.assertFalse((self.src / "title-author-20260230.nfo").exists())
-        self.assertFalse((self.src / "title-author.nfo").exists())
+        self.assertEqual(stats["enqueued"], 6)
+        for stem in ("title-author-20260230", "title-author"):
+            movie = ET.parse(self.src / (stem + ".nfo")).getroot()
+            self.assertEqual(movie.findtext("title"), self.src.name)
+            self.assertEqual(movie.findtext("actor/name"), self.root.name)
+            self.assertEqual(movie.findtext("releasedate"), movie.findtext("premiered"))
         movie = ET.parse(self.src / "A&B <C>-D&E-20260228.nfo").getroot()
         self.assertEqual(movie.findtext("title"), "A&B <C>")
         self.assertEqual(movie.findtext("actor/name"), "D&E")
+
+    def test_filename_nfo_fallback_uses_folders_file_date_and_matching_poster(self):
+        self.task.update(filename_nfo_enabled=True, include_patterns="*.mp4")
+        folder = "标题&A <穿搭>"
+        author = "博主&B"
+        stems = ("7496081324157324601",
+                 "新宝们我什么风格都会走的你们喜欢的不喜欢的都有nctdreamnevergoodbye-AAA小瓜子百万粉去蹦极-202")
+        videos = [self.source(f"{author}/{folder}/{stem}.mp4", b"video") for stem in stems]
+        poster = self.source(f"{author}/{folder}/{stems[0]}-poster.jpg", b"poster")
+        expected_dates = []
+        for video in videos:
+            info = video.stat()
+            expected_dates.append(douyin_nfo.datetime.fromtimestamp(
+                getattr(info, "st_birthtime", None) or info.st_mtime).strftime("%Y-%m-%d"))
+        stats = scanner.scan_task(self.task, skip_stable_check=True)
+        self.assertEqual(stats["enqueued"], 5)  # 两个视频、两个 NFO 及其伴生封面
+        for video, date in zip(videos, expected_dates):
+            movie = ET.parse(video.with_suffix(".nfo")).getroot()
+            self.assertEqual(movie.findtext("title"), folder)
+            self.assertEqual(movie.findtext("actor/name"), author)
+            self.assertEqual(movie.findtext("releasedate"), date)
+            self.assertEqual(movie.findtext("premiered"), date)
+            self.assertEqual(movie.findtext("actor/role"), "主演")
+        self.assertIn(str(poster.relative_to(self.src)),
+                      {item["rel_path"] for item in db.list_queue()})
+        self.assertEqual(ET.parse(videos[0].with_suffix(".nfo")).getroot().findtext("thumb"),
+                         poster.name)
+        self.assertIsNone(ET.parse(videos[1].with_suffix(".nfo")).getroot().find("thumb"))
+
+    def test_filename_nfo_fallback_preserves_existing_nfo(self):
+        self.task.update(filename_nfo_enabled=True, exclude_patterns="*.NFO")
+        self.source("博主/标题/7496081324157324601.mp4", b"video")
+        existing = self.source("博主/标题/7496081324157324601.NFO", b"downloaded")
+        self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 1)
+        self.assertEqual(existing.read_bytes(), b"downloaded")
+        self.assertNotIn("7496081324157324601.nfo", os.listdir(existing.parent))
 
     def test_filename_nfo_exclusive_creation_under_concurrent_scan(self):
         video = self.source("title-author-20260601.mp4", b"video")

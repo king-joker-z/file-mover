@@ -198,21 +198,20 @@ def _xml_text(value: str) -> str:
 
 def ensure_filename_nfo(video_path: str, filenames: list[str],
                         poster_filenames: list[str] | None = None) -> tuple[bool, str]:
-    """按 标题-作者-YYYYMMDD 生成独立 NFO；不覆盖任何已有同名文件。"""
+    """按 标题-作者-YYYYMMDD 生成 NFO；不完整时从目录和视频时间回退。"""
     stem, ext = os.path.splitext(os.path.basename(video_path))
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
     if os.path.islink(video_path) or not os.path.isfile(video_path):
         return False, "源视频不存在或是软链"
     parts = stem.rsplit("-", 2)
-    if len(parts) != 3 or not parts[0].strip() or not parts[1].strip():
-        return False, "文件名不符合 标题-作者-YYYYMMDD"
-    try:
-        if not re.fullmatch(r"[0-9]{8}", parts[2]):
-            raise ValueError("日期格式错误")
-        date = datetime.strptime(parts[2], "%Y%m%d").strftime("%Y-%m-%d")
-    except ValueError:
-        return False, "文件名日期无效"
+    date = None
+    if (len(parts) == 3 and parts[0].strip() and parts[1].strip()
+            and re.fullmatch(r"[0-9]{8}", parts[2])):
+        try:
+            date = datetime.strptime(parts[2], "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
     # 同目录已有同名 NFO（包含大写扩展名/软链）时绝不抢占下载器的内容。
     if any(os.path.splitext(name)[0].casefold() == stem.casefold()
            and os.path.splitext(name)[1].lower() == ".nfo" for name in filenames):
@@ -225,7 +224,17 @@ def ensure_filename_nfo(video_path: str, filenames: list[str],
                    and os.path.splitext(name)[1].lower() in POSTER_EXTS
                    and os.path.isfile(os.path.join(os.path.dirname(video_path), name))
                    and not os.path.islink(os.path.join(os.path.dirname(video_path), name))), None)
-    title, author = _xml_text(parts[0].strip()), _xml_text(parts[1].strip())
+    if date is None:
+        video_dir = os.path.dirname(video_path)
+        title = os.path.basename(video_dir.rstrip(os.sep)) or stem
+        author = os.path.basename(os.path.dirname(video_dir.rstrip(os.sep)).rstrip(os.sep)) or "未知博主"
+        stat = os.stat(video_path)
+        # macOS 等系统可提供出生时间；否则用修改时间，避免将 inode 变更时间误作创建时间。
+        created_at = getattr(stat, "st_birthtime", None) or stat.st_mtime
+        date = datetime.fromtimestamp(created_at).strftime("%Y-%m-%d")
+    else:
+        title, author = parts[0].strip(), parts[1].strip()
+    title, author = _xml_text(title), _xml_text(author)
     lines = ['<?xml version="1.0" encoding="utf-8" standalone="yes"?>', '<movie>',
              '  <lockdata>true</lockdata>', f'  <title>{title}</title>',
              f'  <releasedate>{date}</releasedate>', f'  <premiered>{date}</premiered>',
