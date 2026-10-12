@@ -9,6 +9,8 @@ from . import db, config, scanner, transfer
 
 
 class Scheduler:
+    FULL_SCAN_INTERVAL = 24 * 60 * 60  # 按墙上时间兜底：挂载不可靠、停机期变更及软链 NFO 巡检
+
     def __init__(self):
         self._stop = threading.Event()
         self._threads = []
@@ -18,6 +20,8 @@ class Scheduler:
         self._scan_lock = threading.Lock()
         self._requests_lock = threading.Lock()
         self.last_scan_ts = {1: time.time()}  # 防启动即触发; 各任务扫描时自动覆盖
+        self._directory_caches = {}  # task_id -> 最近成功扫描的目录快照（不存文件/软链名）
+        self._last_full_scan = {}
         self.sync_progress = {}  # task_id -> 扫描进度
         self.current_file = None
         self.moved_today = 0
@@ -38,6 +42,8 @@ class Scheduler:
         db.reset_stuck_transferring()
         self._stop.clear()
         self.last_scan_success_at = None
+        self._directory_caches.clear()
+        self._last_full_scan.clear()
         now = time.time()
         for task in db.list_tasks():
             self.last_scan_ts[task["id"]] = now
@@ -97,7 +103,10 @@ class Scheduler:
                         scanner.scan_task(task, skip_stable_check=True,
                                           progress=prog,
                                           on_dir=lambda root, n: prog.__setitem__(
-                                              "scanned", prog.get("scanned", 0) + n))
+                                              "scanned", prog.get("scanned", 0) + n),
+                                          directory_cache=self._directory_caches.setdefault(task_id, {}),
+                                          force_full=True)
+                        self._last_full_scan[task_id] = time.time()
                         self.last_scan_success_at = time.time()
                 else:
                     prog["error"] = "任务不存在或已停用"
@@ -165,7 +174,12 @@ class Scheduler:
                         if self._sync_requests or not self._scan_lock.acquire(timeout=0.1):
                             break
                         try:
-                            scanner.scan_task(task)
+                            cache = self._directory_caches.setdefault(task["id"], {})
+                            full = (time.time() - self._last_full_scan.get(task["id"], 0)
+                                    >= self.FULL_SCAN_INTERVAL)
+                            scanner.scan_task(task, directory_cache=cache, force_full=full)
+                            if full:
+                                self._last_full_scan[task["id"]] = time.time()
                             self.last_scan_success_at = time.time()
                         except Exception as exc:
                             self._scan_failed(exc)

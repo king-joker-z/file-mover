@@ -2,7 +2,7 @@ version: "3"
 
 services:
   file-mover:
-    image: king-joker-z/file-mover:latest   # GitHub Actions 自动构建，amd64 + arm64
+    image: king-joker-z/file-mover:1.0.0   # v1.0.0，amd64 + arm64
     container_name: file-mover
     restart: unless-stopped
     ports:
@@ -18,7 +18,13 @@ services:
       # 可选：文件权限映射（跨挂载 chown 报错时再启用）
       # - PUID=1000
       # - PGID=1000
-    # 沿用镜像内置 /healthz 健康检查，不请求需要鉴权的业务接口。
+    # 显式覆盖旧项目可能保留的 /api/dashboard 探针；无需 API Token 或数据库。
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=5).close()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 # 极空间注意事项：
 # 1. 三个 volume 路径改为极空间里实际存在的目录；

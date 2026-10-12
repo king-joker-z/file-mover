@@ -519,6 +519,14 @@ def get_migrated_rels(task_id: int) -> set:
         return {r["rel_path"] for r in rows}
 
 
+def has_migrated_rel(task_id: int, rel_path: str) -> bool:
+    """按索引检查某相对路径是否有迁移记录，不读取整任务历史。"""
+    with _lock:
+        return get_conn().execute(
+            "SELECT 1 FROM migrated_files WHERE task_id=? AND rel_path=? LIMIT 1",
+            (task_id, rel_path)).fetchone() is not None
+
+
 def get_migrated_dst(task_id: int, rel_path: str) -> Optional[str]:
     """最近一次迁移的实际目标；旧库无路径记录时返回 None。"""
     conn = get_conn()

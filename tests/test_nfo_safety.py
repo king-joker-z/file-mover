@@ -169,6 +169,98 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 0)
         self.assertFalse((self.dst / "new(2).nfo").exists())
 
+    def test_incremental_scan_skips_unchanged_symlink_directory_but_finds_new_file(self):
+        cache = {}
+        folder = self.src / "library"
+        folder.mkdir()
+        target = self.dst / "old.mp4"
+        target.write_bytes(b"old")
+        (folder / "old.mp4").symlink_to(target)
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+        with patch.object(scanner.os, "scandir", wraps=os.scandir) as scandir:
+            self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+            self.assertEqual(scandir.call_count, 0)
+        new = self.source("library/new.mp4", b"new")
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
+        with patch.object(scanner.os, "scandir", wraps=os.scandir) as scandir:
+            scanner.scan_task(self.task, directory_cache=cache, force_full=True)
+            self.assertGreater(scandir.call_count, 0)
+
+    def test_incremental_scan_skips_symlink_checks_even_in_changed_directory(self):
+        cache = {}
+        folder = self.src / "library"
+        folder.mkdir()
+        target = self.dst / "old.mp4"
+        target.write_bytes(b"old")
+        (folder / "old.mp4").symlink_to(target)
+        new = self.source("library/new.mp4", b"new")
+        with patch.object(scanner, "_trusted_link_target", side_effect=AssertionError("symlink checked")):
+            self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
+
+    def test_incremental_scan_finds_new_nested_directories(self):
+        cache = {}
+        scanner.scan_task(self.task, directory_cache=cache)
+        new = self.source("new/deep/video.mp4", b"new")
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
+
+    def test_incremental_scan_rechecks_quiet_files_without_directory_change(self):
+        cache = {}
+        self.settings["stable_quiet_seconds"] = 60
+        new = self.source("video.mp4", b"new")
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+        self.assertTrue(cache["entries"][str(self.src)][2])
+        os.utime(new, (time.time() - 120, time.time() - 120))
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
+
+    def test_incremental_cache_does_not_commit_failed_scan(self):
+        cache = {}
+        self.source("video.mp4", b"new")
+        with patch.object(db, "enqueue", side_effect=OSError("database unavailable")):
+            with self.assertRaisesRegex(OSError, "database unavailable"):
+                scanner.scan_task(self.task, directory_cache=cache)
+        self.assertNotIn("entries", cache)
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+
+    def test_sync_now_forces_full_scan_after_incremental_cache(self):
+        worker = scheduler.Scheduler()
+        task_id = db.create_task(dict(self.task, name="test"))
+        task = db.get_task(task_id)
+        cache = worker._directory_caches.setdefault(task_id, {})
+        scanner.scan_task(task, directory_cache=cache)
+        self.source("video.mp4", b"new")
+        with patch.object(worker, "_task_paths_safe", return_value=True), \
+                patch.object(scanner, "scan_task", wraps=scanner.scan_task) as scan:
+            self.assertTrue(worker.sync_now(task_id)["ok"])
+            worker._process_sync_requests()
+        self.assertTrue(scan.call_args.kwargs["force_full"])
+        self.assertEqual(worker.sync_progress[task_id]["enqueued"], 1)
+        self.assertTrue(worker.sync_progress[task_id]["done"])
+
+    def test_incremental_scan_invalidates_cache_when_filter_changes(self):
+        cache = {}
+        self.task["exclude_patterns"] = "*.mp4"
+        source = self.source("video.mp4", b"new")
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+        self.task["exclude_patterns"] = ""
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(source))
+
+    def test_full_scan_reconciles_changes_without_directory_mtime_change(self):
+        cache = {}
+        self.task["after_action"] = "keep"
+        source = self.source("video.mp4", b"old")
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        db.clear_queue("all")
+        parent_mtime = self.src.stat().st_mtime_ns
+        source.write_bytes(b"newer")
+        os.utime(self.src, ns=(parent_mtime, parent_mtime))
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache, force_full=True)["enqueued"], 1)
+
     def test_generated_nfo_joins_the_same_scan(self):
         self.settings["douyin_nfo_enabled"] = True
         self.source("clip.mp4", b"video")

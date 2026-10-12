@@ -1,5 +1,6 @@
 """扫描源目录 → 稳定性检测 → 入队"""
 import os
+import stat
 import time
 from contextvars import ContextVar
 from typing import Optional, Tuple, List
@@ -48,13 +49,48 @@ def _stable(path: str, wait: int) -> bool:
             and (path in generated or time.time() - current.st_mtime >= quiet))
 
 
-def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None, on_dir=None) -> dict:
-    """扫描入口。兼容旧调用参数，但立即同步不能绕过完整性判定。"""
+def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None,
+              on_dir=None, directory_cache: Optional[dict] = None,
+              force_full: bool = False) -> dict:
+    """扫描入口。无缓存/立即同步为全量；周期扫描可按目录变更增量枚举。"""
     token = _scan_samples.set(None)
     try:
-        return _scan_task(task, progress=progress, on_dir=on_dir)
+        return _scan_task(task, progress=progress, on_dir=on_dir,
+                          directory_cache=directory_cache, force_full=force_full)
     finally:
         _scan_samples.reset(token)
+
+
+def _collect_directories(src: str, previous: dict, force_full: bool):
+    """未变化目录只 stat 并沿已知子目录向下走，不枚举其文件/软链。"""
+    directories, current = [], {}
+
+    pending = [src]
+    while pending:
+        root = pending.pop()
+        try:
+            info = os.stat(root) if root == src else os.lstat(root)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        identity = (info.st_dev, info.st_ino, info.st_mtime_ns)
+        old = previous.get(root)
+        if not force_full and old and old[0] == identity and not old[2]:
+            current[root] = old
+            pending.extend(os.path.join(root, name) for name in old[1])
+            continue
+        children, files = [], []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    children.append(entry.name)
+                else:
+                    files.append(entry.name)
+        current[root] = (identity, tuple(children), False)
+        directories.append((root, files))
+        pending.extend(os.path.join(root, name) for name in children)
+    return directories, current
 
 
 def compute_dst(dst_dir: str, rel_path: str, path_rule: str, date_str: str) -> str:
@@ -83,7 +119,8 @@ def _trusted_link_target(task: dict, rel: str, link: str) -> bool:
             and target == os.path.realpath(recorded))
 
 
-def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict:
+def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
+               directory_cache: Optional[dict] = None, force_full: bool = False) -> dict:
     """扫描一个任务的源目录并入队已静默文件。"""
     src = task["src_dir"]
     cfg = config.get()
@@ -101,8 +138,6 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
     if not os.path.isdir(src):
         return stats
     includes = _parse_patterns(task.get("include_patterns"))
-    # 批量预加载历史相对路径；删除仍需读回逐字节校验目标。
-    migrated_rels = db.get_migrated_rels(task["id"])
     initial_device = transfer._mount_identity(task["dst_dir"])
     excludes = _parse_patterns(task.get("exclude_patterns"))
     ignores = cfg.get("ignore_suffixes", [])
@@ -114,10 +149,21 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
     quiet = max(0, float(cfg.get("stable_quiet_seconds", 60)))
     wait = cfg.get("stable_check_seconds", 2) if cfg.get("stable_check") else 0
     # 先收集整轮目录和首采样，统一等待一次；不对每个文件或每层目录 sleep。
-    directories = []
+    cache_key = (os.path.realpath(src), os.path.realpath(task["dst_dir"]),
+                 task.get("include_patterns"), task.get("exclude_patterns"),
+                 task.get("path_rule"), task.get("after_action"),
+                 task.get("symlink_enabled"), filename_nfo_enabled,
+                 douyin_nfo_enabled, cfg.get("nfo_fix_enabled"), re_download_action,
+                 tuple(ignores), quiet, wait)
+    if directory_cache is None:
+        directories = [(root, files) for root, _dirs, files in os.walk(src)]
+        next_entries = None
+    else:
+        previous = (directory_cache.get("entries", {})
+                    if directory_cache.get("key") == cache_key else {})
+        directories, next_entries = _collect_directories(src, previous, force_full)
     samples = {}
-    for root, _dirs, files in os.walk(src):
-        directories.append((root, files))
+    for root, files in directories:
         for name in files:
             path = os.path.join(root, name)
             rel = os.path.relpath(path, src)
@@ -127,9 +173,19 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
                     or os.path.islink(path)):
                 continue
             try:
-                samples[path] = _signature(os.stat(path))
+                info = os.stat(path)
+                samples[path] = _signature(info)
+                if next_entries is not None and time.time() - info.st_mtime < quiet:
+                    identity, children, _ = next_entries[root]
+                    next_entries[root] = (identity, children, True)
             except OSError:
-                pass
+                if next_entries is not None:
+                    identity, children, _ = next_entries[root]
+                    next_entries[root] = (identity, children, True)
+    if not directories:
+        if directory_cache is not None:
+            directory_cache["entries"] = next_entries
+        return stats
     if samples and wait:
         time.sleep(wait)
     generated = set()
@@ -196,7 +252,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
                         or (includes and not _match_any(rel, fn, includes))
                         or (excludes and _match_any(rel, fn, excludes))):
                     continue
-                if rel not in migrated_rels or not _stable(full, wait):
+                if not db.has_migrated_rel(task["id"], rel) or not _stable(full, wait):
                     continue
                 try:
                     size = os.path.getsize(full)
@@ -243,6 +299,10 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
             if rel in dedup_handled:
                 continue
             if os.path.islink(full):
+                if directory_cache is not None and not force_full:
+                    # 周期增量只处理真实文件；软链占位的授权/NFO 巡检交给每日全量扫描。
+                    _bump("skipped_symlink")
+                    continue
                 # 只信任指向当前任务目标内的软链，其他软链绝不写入或补齐。
                 if not _trusted_link_target(task, rel, full):
                     _bump("skipped_symlink")
@@ -325,6 +385,9 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
                 continue
             # 两种扫描入口都必须经过相同的静默与采样校验。
             if not _stable(full, wait):
+                if next_entries is not None:
+                    identity, children, _ = next_entries[root]
+                    next_entries[root] = (identity, children, True)
                 continue
             try:
                 current_signature = _signature(os.stat(full))
@@ -332,10 +395,13 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
                 continue
             # 入队所记身份必须是本轮首采样且经过末次静默校验的同一文件。
             if samples.get(full) != current_signature:
+                if next_entries is not None:
+                    identity, children, _ = next_entries[root]
+                    next_entries[root] = (identity, children, True)
                 continue
             size = current_signature[2]
             prior_dst = db.get_migrated_dst(task["id"], rel) if fn.lower().endswith(".nfo") else None
-            if (fn.lower().endswith(".nfo") and rel in migrated_rels and not prior_dst
+            if (fn.lower().endswith(".nfo") and db.has_migrated_rel(task["id"], rel) and not prior_dst
                     and task.get("path_rule") == "by_date"
                     and not db.has_migrated_destination(task["id"], rel)):
                 db.add_log(task["id"], None, full, "", size, 0, "skipped",
@@ -357,4 +423,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None) -> dict
                           source_snapshot=current_signature if not fn.lower().endswith(".nfo") else None):
                 _bump("enqueued")
 
+    if directory_cache is not None:
+        directory_cache["key"] = cache_key
+        directory_cache["entries"] = next_entries
     return stats
