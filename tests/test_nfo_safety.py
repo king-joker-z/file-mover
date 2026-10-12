@@ -460,6 +460,47 @@ class NfoSafetyTests(unittest.TestCase):
         db.set_status(item["id"], "done")
         return item
 
+    def test_oversized_snapshot_identifiers_round_trip_without_requeue(self):
+        source = self.source("movie.mp4", b"video")
+        path = str(source)
+        destination = str(self.dst / source.name)
+        snapshot = (2**64 - 1, 2**63 + 123, 5, 2**63 + 456)
+        self.assertTrue(db.enqueue(1, path, source.name, destination, 5, snapshot))
+        row = db.list_queue()[0]
+        self.assertEqual((row["source_dev"], row["source_inode"], row["source_mtime_ns"]),
+                         tuple(f"i:{value}" for value in (snapshot[0], snapshot[1], snapshot[3])))
+        self.assertEqual(tuple(db.get_conn().execute(
+            "SELECT typeof(source_dev), typeof(source_inode), typeof(source_mtime_ns)"
+            " FROM queue WHERE id=?", (row["id"],)).fetchone()),
+            ("text", "text", "text"))
+        db.set_status(row["id"], "done")
+        self.assertFalse(db.enqueue(1, path, source.name, destination, 5, snapshot))
+        self.assertTrue(db.enqueue(1, path, source.name, destination, 5,
+                                   (snapshot[0], snapshot[1] + 1, 5, snapshot[3])))
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+
+    def test_oversized_inode_from_scan_is_enqueued_and_survives_restart(self):
+        source = self.source("movie.mp4", b"video")
+        original_signature = scanner._signature
+
+        def oversized_signature(info):
+            dev, inode, size, mtime = original_signature(info)
+            if info.st_ino == source.stat().st_ino:
+                return dev, 2**63 + 77, size, mtime
+            return dev, inode, size, mtime
+
+        with patch.object(scanner, "_signature", side_effect=oversized_signature):
+            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+            row = db.list_queue()[0]
+            self.assertEqual(row["source_inode"], f"i:{2**63 + 77}")
+            db._conn.close()
+            db._conn = None
+            self.assertFalse(db.enqueue(1, str(source), source.name, str(self.dst / source.name),
+                                        source.stat().st_size,
+                                        (source.stat().st_dev, 2**63 + 77,
+                                         source.stat().st_size, source.stat().st_mtime_ns)))
+            self.assertEqual(db.take_next_pending(claim=False)["id"], row["id"])
+
     def test_keep_source_is_not_requeued_or_rehashed_each_scan(self):
         self.task["after_action"] = "keep"
         source = self.source("movie.mp4", b"first")

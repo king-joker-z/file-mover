@@ -2,7 +2,7 @@ version: "3"
 
 services:
   file-mover:
-    image: king-joker-z/file-mover:1.0.0   # v1.0.0，amd64 + arm64
+    image: king-joker-z/file-mover:1.0.1   # v1.0.1，amd64 + arm64
     container_name: file-mover
     restart: unless-stopped
     ports:

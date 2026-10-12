@@ -269,6 +269,13 @@ def delete_task(task_id: int):
 
 # ---------- queue ----------
 
+def _sqlite_snapshot_value(value: int):
+    """SQLite INTEGER 只能保存有符号 64 位；越界标识保留为非数值文本以免亲和性转浮点。"""
+    if -(1 << 63) <= value < (1 << 63):
+        return value
+    return f"i:{value}"
+
+
 def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int,
             source_snapshot=None) -> bool:
     """入队；done 且源快照完整、路径/大小/身份均未变时跳过。
@@ -276,7 +283,7 @@ def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int
     未提供快照（旧调用或 NFO 内容复核）及旧库缺失快照时保守入队。
     failed/conflict 仅在路径或大小变化时重置，避免耗尽重试后循环调度。
     """
-    dev, inode, mtime_ns = ((source_snapshot[0], source_snapshot[1], source_snapshot[3])
+    dev, inode, mtime_ns = (tuple(_sqlite_snapshot_value(source_snapshot[i]) for i in (0, 1, 3))
                             if source_snapshot is not None else (None, None, None))
     conn = get_conn()
     with _lock, conn:
