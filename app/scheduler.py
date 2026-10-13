@@ -31,6 +31,7 @@ class Scheduler:
         self.last_scan_error = None
         self.last_scan_error_at = None
         self._last_scan_error_task_id = None
+        self._last_scan_error_path = None
         self.last_scan_success_at = None
         self.last_worker_error = None
         self._next_eligible = {}  # task_id -> monotonic deadline
@@ -151,6 +152,8 @@ class Scheduler:
             "worker_alive": any(t.name == "fm-worker" and t.is_alive() for t in self._threads),
             "last_scan_error": self.last_scan_error,
             "last_scan_error_at": self.last_scan_error_at,
+            "last_scan_error_task_id": self._last_scan_error_task_id,
+            "last_scan_error_path": self._last_scan_error_path,
             "last_scan_success_at": self.last_scan_success_at,
             "last_worker_error": self.last_worker_error,
             "accounting_pending": q.get("accounting_pending", 0),
@@ -215,6 +218,7 @@ class Scheduler:
         self.last_scan_error = (f"任务 {task_id}: {exc}" if task_id is not None else str(exc))
         self.last_scan_error_at = time.time()
         self._last_scan_error_task_id = task_id
+        self._last_scan_error_path = exc.filename if isinstance(exc, OSError) else None
 
     def _scan_succeeded(self, task_id):
         # 仅同一任务的成功扫描可解除它的旧告警，其他任务的成功不能掩盖故障。
@@ -222,6 +226,7 @@ class Scheduler:
             self.last_scan_error = None
             self.last_scan_error_at = None
             self._last_scan_error_task_id = None
+            self._last_scan_error_path = None
 
     def _task_paths_safe(self, task):
         from .main import validate_task_paths

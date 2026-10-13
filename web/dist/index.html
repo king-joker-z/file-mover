@@ -82,7 +82,7 @@ input:checked+.slider:before{transform:translateX(16px)}
       <div class="stat orange"><div class="num" id="s-conflict">0</div><div class="lbl">冲突</div></div>
       <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">累计完成</div></div>
     </div>
-    <div class="panel"><h2>当前状态</h2><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div></div>
+    <div class="panel"><h2>当前状态</h2><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div><button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button></div>
   </div>
 
   <!-- 任务管理 -->
@@ -115,7 +115,7 @@ input:checked+.slider:before{transform:translateX(16px)}
           <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" max="86400" value="5"></div>
           <div class="field small"><label>扫描间隔（秒，0=全局）</label><input id="f-scan" type="number" min="0" max="86400" value="0"></div>
           <div class="field"><label>包含（通配，逗号分隔，空=全部）</label><input id="f-inc" placeholder="*.mp4, *.jpg"></div>
-          <div class="field"><label>排除（文件/目录通配；排除目录后不进入扫描）</label><input id="f-exc" placeholder="B站/投稿/然然前辈, *.tmp"></div>
+          <div class="field"><label>排除（相对源目录或完整路径，逗号分隔；排除目录后不进入扫描）</label><input id="f-exc" placeholder="B站/投稿/然然前辈, /data/local/故障目录, *.tmp"></div>
         </div>
         <div class="row">
           <div class="field"><label>运行周期（可多段，逗号分隔，留空=全天运行）</label>
@@ -169,6 +169,7 @@ input:checked+.slider:before{transform:translateX(16px)}
         <span id="browse-crumb" class="log-detail" style="flex:1;word-break:break-all"></span>
         <button class="btn small gray" onclick="browseUp()">上级</button>
       </div>
+      <div id="browse-error" class="status-warnings" role="alert"></div>
       <div id="browse-list"></div>
     </div>
   </div>
@@ -256,7 +257,28 @@ async function loadDash(){
     if(d.last_scan_error)warnings.push("最近扫描异常: "+d.last_scan_error);
     if(d.accounting_pending>0)warnings.push(`待补偿记账: ${d.accounting_pending} 项`);
     $("#status-warnings").textContent=warnings.join("\n");
-  }catch(e){$("#current-file").textContent=e.message;$("#status-warnings").textContent="";}
+    const excludeBtn=$("#exclude-error-dir");
+    excludeBtn.style.display=d.last_scan_error_path && d.last_scan_error_task_id!=null && d.last_scan_error?.includes("枚举目录失败")?"":"none";
+    excludeBtn.onclick=()=>prepareExcludeDir(d.last_scan_error_task_id,d.last_scan_error_path);
+  }catch(e){$("#current-file").textContent=e.message;$("#status-warnings").textContent="";$("#exclude-error-dir").style.display="none";}
+}
+
+async function prepareExcludeDir(taskId, path){
+  try{
+    const task=(await api("/api/tasks")).find(t=>t.id===taskId);
+    if(!task)throw new Error("任务不存在");
+    const src=task.src_dir.replace(/\/+$/,"");
+    if(!path.startsWith(src+"/"))throw new Error("故障路径不在任务源目录内");
+    const rel=path.slice(src.length+1);
+    const tabs=$$(".tabs button"), taskTab=[...tabs].find(b=>b.dataset.tab==="tasks");
+    taskTab.click();
+    await editTask(taskId);
+    const patterns=$("#f-exc").value.split(",").map(x=>x.trim()).filter(Boolean);
+    if(!patterns.includes(rel) && !patterns.includes(path))patterns.push(rel);
+    $("#f-exc").value=patterns.join(", ");
+    $("#f-exc").focus();
+    alert("已预填排除目录："+rel+"\n请核对后点击「保存修改」；排除会跳过该目录所有文件，不会修复底层 I/O 故障。");
+  }catch(e){alert("无法预填排除目录: "+e.message);}
 }
 
 let editingTaskId = null;  // 非 null = 编辑模式
@@ -541,14 +563,19 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&l
 function fmtSize(n){if(!n)return"-";const u=["B","KB","MB","GB"];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return n.toFixed(1)+u[i];}
 
 let browseRel="", browseRequestId=0;
+function browseCrumb(root, rel){
+  const parts=rel?rel.split("/"):[], links=[{name:root,rel:""}];
+  parts.forEach((name,i)=>links.push({name,rel:parts.slice(0,i+1).join("/")}));
+  $("#browse-crumb").innerHTML="当前: "+links.map(x=>`<button type="button" class="btn small gray" data-rel="${esc(encodeURIComponent(x.rel))}">${esc(x.name)}</button>`).join(" / ");
+  $("#browse-crumb").querySelectorAll("button").forEach(b=>b.onclick=()=>browseTo(decodeURIComponent(b.dataset.rel)));
+}
 function browseTo(rel){
-  browseRel=rel||"";
-  const requestedRel=browseRel, requestId=++browseRequestId;
-  $("#browse-crumb").textContent="当前: /"+requestedRel;
+  const requestedRel=rel||"", requestId=++browseRequestId;
+  $("#browse-error").textContent="";
   api("/api/browse"+(requestedRel?"?rel="+encodeURIComponent(requestedRel):"")).then(d=>{
     if(requestId!==browseRequestId)return;
     browseRel=d.rel||"";
-    $("#browse-crumb").textContent="当前: /"+browseRel;
+    browseCrumb(d.root,browseRel);
     const box=$("#browse-list");
     if(!d.items.length){box.innerHTML='<div class="empty">空目录</div>';return;}
     box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th></tr>`+
@@ -566,8 +593,9 @@ function browseTo(rel){
     });
   }).catch(e=>{
     if(requestId!==browseRequestId)return;
-    $("#browse-list").innerHTML='<div class="empty">加载目录失败: '+esc(e.message)+' <button class="btn small gray" id="browse-retry">重试</button></div>';
-    $("#browse-retry").onclick=()=>browseTo(browseRel);
+    const error=$("#browse-error");
+    error.innerHTML='加载 /'+esc(requestedRel)+' 失败: '+esc(e.message)+' <button type="button" class="btn small gray">重试该目录</button>';
+    error.querySelector("button").onclick=()=>browseTo(requestedRel);
   });
 }
 function browseUp(){browseTo(browseRel.split("/").slice(0,-1).join(""));}

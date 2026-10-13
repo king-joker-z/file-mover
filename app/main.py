@@ -2,6 +2,7 @@
 import hmac
 import ipaddress
 import os
+import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
@@ -245,21 +246,29 @@ def api_browse(rel: Optional[str] = None, limit: int = 500):
     else:
         target = root
         rel = ""
-    if not target.resolve().is_relative_to(root):
-        raise HTTPException(400, "路径非法")
-    if not target.is_dir():
-        raise HTTPException(404, "目录不存在")
+    try:
+        if not target.resolve().is_relative_to(root):
+            raise HTTPException(400, "路径非法")
+        info = target.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise HTTPException(404, "不是目录")
+        # 一次性枚举，避免目录读取失败被误当作空目录。
+        children = sorted(target.iterdir(), key=lambda x: x.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, f"目录不存在: {target}") from exc
+    except OSError as exc:
+        raise HTTPException(503, f"读取目录失败: {target} ({exc})") from exc
     items = []
-    for p in sorted(target.iterdir(), key=lambda x: x.name):
+    for p in children:
         try:
             info = p.lstat()
-            t = "dir" if p.is_dir() and not p.is_symlink() else (
-                "file" if p.is_file() and not p.is_symlink() else "other")
+            t = "dir" if stat.S_ISDIR(info.st_mode) and not p.is_symlink() else (
+                "file" if stat.S_ISREG(info.st_mode) and not p.is_symlink() else "other")
             size = info.st_size if t == "file" else 0
         except OSError:
             t, size = "other", 0
         items.append({"name": p.name, "type": t, "size": size})
-    return {"rel": rel, "path": str(target), "items": items[:limit]}
+    return {"rel": rel, "path": str(target), "root": str(root), "items": items[:limit]}
 
 
 # ---------- dashboard ----------

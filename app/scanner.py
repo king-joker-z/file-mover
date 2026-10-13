@@ -22,6 +22,22 @@ def _match_any(rel_path: str, name: str, patterns: List[str]) -> bool:
     return False
 
 
+def _exclude_patterns(raw: str, src: str) -> list[str]:
+    """允许填写相对源目录的规则，或直接粘贴源目录下的绝对路径。"""
+    patterns = []
+    source = os.path.normpath(src)
+    for pattern in _parse_patterns(raw):
+        if os.path.isabs(pattern):
+            pattern = os.path.normpath(pattern)
+            if pattern == source:
+                raise ValueError("不能排除整个源目录")
+            if os.path.commonpath((source, pattern)) != source:
+                raise ValueError(f"排除路径不在源目录内: {pattern}")
+            pattern = os.path.relpath(pattern, source)
+        patterns.append(pattern)
+    return patterns
+
+
 # 每次扫描独立保存首轮采样；即使测试/调用方并发扫描也不会串用样本。
 _scan_samples = ContextVar("scan_samples", default=None)
 
@@ -179,7 +195,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
         return stats
     includes = _parse_patterns(task.get("include_patterns"))
     initial_device = transfer._mount_identity(task["dst_dir"])
-    excludes = _parse_patterns(task.get("exclude_patterns"))
+    excludes = _exclude_patterns(task.get("exclude_patterns"), src)
     ignores = cfg.get("ignore_suffixes", [])
     filename_nfo_enabled = task.get("filename_nfo_enabled", False)
     # 两种生成格式不能在同一任务上竞争同一个 .nfo 路径。

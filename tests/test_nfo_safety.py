@@ -270,6 +270,31 @@ class NfoSafetyTests(unittest.TestCase):
             self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(healthy))
 
+    def test_absolute_exclusion_prunes_unreadable_directory(self):
+        healthy = self.source("healthy/video.mp4", b"video")
+        broken = self.src / "B站" / "投稿" / "然然前辈"
+        broken.mkdir(parents=True)
+        self.task["exclude_patterns"] = str(broken) + "/, *.tmp"
+        original_scandir = scanner.os.scandir
+
+        def flaky_scandir(path):
+            if os.fspath(path) == str(broken):
+                raise OSError(errno.EIO, "directory iteration failed", str(broken))
+            return original_scandir(path)
+
+        with patch.object(scanner.os, "scandir", side_effect=flaky_scandir):
+            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(healthy))
+
+    def test_absolute_exclusion_cannot_silently_skip_source_or_other_root(self):
+        self.source("healthy/video.mp4", b"video")
+        for pattern in (str(self.src), str(self.dst / "broken")):
+            with self.subTest(pattern=pattern):
+                self.task["exclude_patterns"] = pattern
+                with self.assertRaises(ValueError):
+                    scanner.scan_task(self.task)
+        self.assertFalse(db.list_queue())
+
     def test_source_root_eio_is_not_reported_as_empty_successful_scan(self):
         with patch.object(scanner.os, "stat", side_effect=OSError(errno.EIO, "unreadable root")):
             with self.assertRaises(OSError) as error:
@@ -1465,6 +1490,17 @@ class NfoSafetyTests(unittest.TestCase):
         worker._scan_succeeded(1)
         self.assertIsNone(worker.last_scan_error)
         self.assertIsNone(worker.last_scan_error_at)
+        self.assertIsNone(worker.stats()["last_scan_error_path"])
+
+    def test_scan_warning_exposes_failed_directory_for_explicit_exclusion(self):
+        worker = scheduler.Scheduler()
+        broken = self.src / "B站" / "投稿" / "然然前辈"
+        with patch("app.scheduler.traceback.print_exception"):
+            worker._scan_failed(OSError(errno.EIO, "枚举目录失败", str(broken)), task_id=1)
+        self.assertEqual(worker.stats()["last_scan_error_path"], str(broken))
+        self.assertEqual(worker.stats()["last_scan_error_task_id"], 1)
+        worker._scan_succeeded(1)
+        self.assertIsNone(worker.stats()["last_scan_error_path"])
 
     def test_successful_transfer_accounting_failure_is_not_retried_as_transfer(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
@@ -1971,6 +2007,44 @@ class NfoSafetyTests(unittest.TestCase):
                   patch.object(worker_thread, "is_alive", return_value=True)):
                 response = client.get("/readyz")
                 self.assertEqual((response.status_code, response.json()), (200, {"status": "ok"}))
+
+    def test_browse_parent_navigation_and_io_errors_are_not_missing_directories(self):
+        from fastapi.testclient import TestClient
+        from app import main
+
+        nested = self.src / "B站" / "投稿" / "然然前辈"
+        nested.mkdir(parents=True)
+        broken = nested / "broken"
+        broken.mkdir()
+        client = TestClient(main.app)
+        headers = {"Authorization": "Bearer test-token"}
+        with (patch.object(main, "MOUNT_ROOT", str(self.src)),
+              patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"})):
+            child = client.get("/api/browse", params={"rel": "B站/投稿/然然前辈"}, headers=headers)
+            self.assertEqual(child.status_code, 200)
+            self.assertEqual(child.json()["root"], str(self.src.resolve()))
+            parent = client.get("/api/browse", params={"rel": "B站/投稿"}, headers=headers)
+            self.assertEqual(parent.status_code, 200)
+            self.assertIn("然然前辈", [item["name"] for item in parent.json()["items"]])
+            original_iterdir = Path.iterdir
+
+            def flaky_iterdir(path):
+                if path in (nested.resolve(), nested.parent.resolve()):
+                    raise OSError(errno.EIO, "directory iteration failed", str(path))
+                return original_iterdir(path)
+
+            with patch.object(Path, "iterdir", flaky_iterdir):
+                failure = client.get("/api/browse", params={"rel": "B站/投稿/然然前辈"}, headers=headers)
+            self.assertEqual(failure.status_code, 503)
+            self.assertIn("读取目录失败", failure.json()["detail"])
+            self.assertIn(str(nested.resolve()), failure.json()["detail"])
+            with patch.object(Path, "iterdir", flaky_iterdir):
+                parent_failure = client.get("/api/browse", params={"rel": "B站/投稿"}, headers=headers)
+            self.assertEqual(parent_failure.status_code, 503)
+            self.assertIn(str(nested.parent.resolve()), parent_failure.json()["detail"])
+            self.assertEqual(client.get("/api/browse", params={"rel": "B站/投稿"}, headers=headers).status_code, 200)
+            missing = client.get("/api/browse", params={"rel": "B站/投稿/不存在"}, headers=headers)
+            self.assertEqual(missing.status_code, 404)
 
     def test_sync_now_api_returns_503_when_scheduler_rejects_request(self):
         from fastapi.testclient import TestClient
