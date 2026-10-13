@@ -20,8 +20,6 @@ DEFAULTS = {
     "default_interval_seconds": 5,
     "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
     "douyin_nfo_enabled": False,  # 对无 nfo 的抖音视频自动生成简易 nfo
-    "re_download_action": "delete",  # 已迁移文件被重新下载: delete=删除 / skip=保留跳过 / keep=照常迁移
-    "symlink_enabled": True,  # 迁移后在源路径创建符号链接（供 dysync 对账/Emby 播放，防重下循环）
 }
 
 _lock = threading.Lock()
@@ -41,11 +39,9 @@ def _validate(data: dict) -> None:
             if type(value) not in expected or not minimum <= value <= maximum:
                 raise ValueError(f"配置项 {key} 超出允许范围")
     for key in ("stable_check", "safe_mode", "verify_size", "remove_empty_dirs",
-                "nfo_fix_enabled", "douyin_nfo_enabled", "symlink_enabled"):
+                "nfo_fix_enabled", "douyin_nfo_enabled"):
         if key in data and type(data[key]) is not bool:
             raise ValueError(f"配置项 {key} 必须是布尔值")
-    if "re_download_action" in data and data["re_download_action"] not in ("delete", "skip", "keep"):
-        raise ValueError("配置项 re_download_action 非法")
     for key in ("retry_backoff_seconds", "ignore_suffixes"):
         if key in data:
             values = data[key]

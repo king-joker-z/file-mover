@@ -2,6 +2,7 @@
 import errno
 import hashlib
 import os
+import stat
 import uuid
 from contextlib import contextmanager
 from typing import Optional, Tuple
@@ -25,44 +26,48 @@ def _sha256(path: str) -> str:
 
 
 def _matching_digest(src: str, dst: str) -> Optional[str]:
+    """仅内容不同或目标缺失返回 None；I/O 错误上抛，禁止据此删源/覆盖。"""
     try:
-        if (os.path.isfile(dst) and not os.path.islink(dst)
-                and _size(src) >= 0 and _size(src) == _size(dst)):
-            digest = _sha256(src)
-            if digest == _sha256(dst):
-                return digest
-    except OSError:
-        pass
-    return None
-
-
-def _same_content(src: str, dst: str) -> bool:
-    return _matching_digest(src, dst) is not None
-
-
-def _already_migrated(src: str, dst: str) -> bool:
-    return _same_content(src, dst)
+        target = os.lstat(dst)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(target.st_mode):
+        return None
+    source_size = os.stat(src).st_size
+    if source_size != target.st_size:
+        return None
+    digest = _sha256(src)
+    return digest if digest == _sha256(dst) else None
 
 
 def _verified_nfo(dst: str, expected: bytes) -> bool:
     try:
-        if not os.path.isfile(dst) or os.path.islink(dst):
-            return False
-        with open(dst, "rb") as stream:
-            return stream.read() == expected
-    except OSError:
+        info = os.lstat(dst)
+    except FileNotFoundError:
         return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    with open(dst, "rb") as stream:
+        return stream.read() == expected
 
 
 def _resolve_conflict(dst: str, policy: str) -> Optional[Tuple[str, str]]:
-    if not os.path.lexists(dst):
+    """仅 ENOENT 表示可创建；EIO 等目录故障必须上报，绝不当作空位。"""
+    def exists(path):
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        return True
+
+    if not exists(dst):
         return dst, "none"
     if policy == "overwrite":
         return dst, "overwrite"
     if policy == "rename":
         base, ext = os.path.splitext(dst)
         i = 1
-        while os.path.lexists(f"{base}({i}){ext}"):
+        while exists(f"{base}({i}){ext}"):
             i += 1
         return f"{base}({i}){ext}", "renamed"
     return None
@@ -107,7 +112,7 @@ def _fd_digest(fd: int) -> tuple[int, str]:
 def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None):
     """在固定的目录描述符内原子发布并读回，避免父目录软链替换。"""
     if root is None:
-        root = os.path.dirname(dst)  # 旧 NFO 软链源文件只在其所在目录内物化
+        root = os.path.dirname(dst)
     name = os.path.basename(dst)
     tmp = f".fm-{uuid.uuid4().hex}.moving"
     with _target_parent(dst, root) as parent_fd:
@@ -185,12 +190,6 @@ def _write_nfo(dst: str, content: bytes, root: str = None):
     _write_verified(dst, content=content, root=root)
 
 
-def _materialize_nfo_source(src: str, content: bytes):
-    """旧版本遗留的 NFO 软链先转为源目录独立副本，再改写网盘目标。"""
-    if os.path.islink(src):
-        _write_verified(src, content=content)
-
-
 def _mount_identity(path: str):
     """校验要求的网盘挂载存在，并记录实际目标文件系统身份。"""
     root = os.environ.get("FILEMOVER_REQUIRED_MOUNT")
@@ -213,14 +212,19 @@ def _mount_identity(path: str):
 
 def _remove_verified_source(src: str, dst: str, expected_stat=None,
                             target_dir: str = None, target_device=None,
-                            expected_content: tuple[int, str] = None) -> Tuple[bool, str]:
+                            expected_content: tuple[int, str] = None,
+                            expected_target: tuple[int, str] = None) -> Tuple[bool, str]:
     """暂存后再次核对身份和内容；不删除扫描/迁移期间被替换的源文件。"""
     staging = os.path.join(os.path.dirname(src), f".fm-source-{uuid.uuid4().hex}.moving")
     try:
+        current_source = os.lstat(src)
         if expected_stat is None:
-            expected_stat = os.lstat(src)
-        if not os.path.isfile(src) or os.path.islink(src):
+            expected_stat = current_source
+        if not stat.S_ISREG(current_source.st_mode):
             return False, "源不是普通文件，已保留"
+        if any(getattr(current_source, field) != getattr(expected_stat, field)
+               for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
+            return False, "删除前源身份或时间已变化，已保留"
         os.rename(src, staging)
     except OSError as exc:
         return False, f"源文件暂存失败: {exc}"
@@ -229,31 +233,39 @@ def _remove_verified_source(src: str, dst: str, expected_stat=None,
         identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
         if any(getattr(current, field) != getattr(expected_stat, field) for field in identity):
             raise IOError("源文件身份或时间已变化")
+        target = os.lstat(dst)
+        if not stat.S_ISREG(target.st_mode):
+            raise IOError("目标不是普通文件")
         if expected_content is None:
-            if not _same_content(staging, dst):
+            if _matching_digest(staging, dst) is None:
                 raise IOError("暂存源与目标内容不同")
         else:
-            if not os.path.isfile(dst) or os.path.islink(dst):
-                raise IOError("目标不是普通文件")
-            # 对暂存源和现有目标各读一次，均须匹配复制期间校验过的摘要。
+            # NFO 可以在迁移时修正内容，源和目标分别与各自读回凭证校验。
             if (_size(staging), _sha256(staging)) != expected_content or (
-                    _size(dst), _sha256(dst)) != expected_content:
+                    target.st_size, _sha256(dst)) != (expected_target or expected_content):
                 raise IOError("暂存源或目标与复制内容不同")
+        target_after = os.lstat(dst)
+        if any(getattr(target_after, field) != getattr(target, field) for field in identity):
+            raise IOError("校验期间目标文件被替换")
         if target_dir is not None and (target_device is not None
                 and _mount_identity(target_dir) != target_device):
             raise IOError("目标文件系统已切换")
         latest = os.lstat(staging)
         if any(getattr(latest, field) != getattr(current, field) for field in identity):
             raise IOError("校验期间源文件被改写")
+        target_final = os.lstat(dst)
+        if any(getattr(target_final, field) != getattr(target, field) for field in identity):
+            raise IOError("删除前目标文件被替换")
         os.remove(staging)
         return True, ""
     except OSError as exc:
-        # 硬链接排他恢复：与新下载文件并发时绝不覆盖；暂存始终保留供核查。
+        # 恢复采用排他硬链接，绝不覆盖并发下载的新文件。
         try:
             os.link(staging, src, follow_symlinks=False)
-            return False, f"删除前校验失败；源已恢复，暂存备份保留在 {staging}: {exc}"
         except OSError:
             return False, f"删除前校验失败；源备份保留在 {staging}: {exc}"
+        # 与下载器并发替换源路径时，暂存可能是旧文件最后一份，不能自动清理。
+        return False, f"删除前校验失败；源已恢复，暂存备份保留在 {staging}: {exc}"
 
 
 def _paths_overlap(first: str, second: str) -> bool:
@@ -270,29 +282,27 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             return "failed", "源目录与目标目录重叠，已拒绝迁移"
         if not os.path.isabs(src) or not os.path.isabs(dst):
             return "failed", "源路径或目标路径不是绝对路径"
-        source_location = os.path.realpath(os.path.dirname(src)) if os.path.islink(src) else os.path.realpath(src)
+        source_location = os.path.realpath(os.path.dirname(src))
         if os.path.commonpath((source_location, os.path.realpath(task["src_dir"]))) != os.path.realpath(task["src_dir"]):
             return "failed", "源路径不在任务源目录中"
         if os.path.commonpath((os.path.realpath(os.path.dirname(dst)), os.path.realpath(task["dst_dir"]))) != os.path.realpath(task["dst_dir"]):
             return "failed", "目标路径不在任务目标目录中"
-        if (not os.path.islink(src) and os.path.exists(dst) and os.path.exists(src)
-                and os.path.samefile(src, dst)):
+        if os.path.exists(dst) and os.path.exists(src) and os.path.samefile(src, dst):
             return "failed", "源与目标为同一文件，已拒绝迁移"
     except (OSError, ValueError) as exc:
         return "failed", f"路径校验失败: {exc}"
 
     cfg = config.get()
     policy = task.get("conflict_policy", "skip")
-    if not os.path.isfile(src):
+    try:
+        source_info = os.lstat(src)
+    except FileNotFoundError:
         return "failed", "源文件不存在（可能已被移动或删除）"
+    except OSError as exc:
+        return "failed", f"源路径状态读取失败: {exc}"
     is_nfo = src.lower().endswith(".nfo")
-    if is_nfo and os.path.islink(src):
-        linked = os.path.realpath(src)
-        if (os.path.commonpath((linked, os.path.realpath(task["dst_dir"])))
-                != os.path.realpath(task["dst_dir"])):
-            return "failed", "NFO 软链不指向任务目标目录，已保留源文件"
-    if not is_nfo and os.path.islink(src):
-        return "failed", "源是符号链接，禁止作为普通文件迁移"
+    if not stat.S_ISREG(source_info.st_mode):
+        return "failed", "源不是普通文件，已保留"
     detail_extra = ""
     content = None
     if is_nfo:
@@ -305,35 +315,76 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         except OSError as exc:
             return "failed", f"NFO 预处理失败: {exc}"
 
-    resolved = _resolve_conflict(dst, policy)
-    if resolved is None:
-        if is_nfo and _verified_nfo(dst, content):
+    try:
+        resolved = _resolve_conflict(dst, policy)
+        # 目标已经是相同内容时不再覆盖或重命名；直接进入读回并删源流程。
+        if resolved is not None and resolved[1] != "none":
+            same = (_verified_nfo(dst, content) if is_nfo else
+                    _matching_digest(src, dst) is not None)
+            if same:
+                resolved = None
+        # 故障期间不应把“源可读、目标暂时不可读”当成可覆盖。
+        if resolved is not None and resolved[1] == "overwrite":
             try:
-                _materialize_nfo_source(src, raw)
-            except OSError as exc:
-                return "failed", f"NFO 源备份失败: {exc}"
-            item["_verified_target"] = (len(content), hashlib.sha256(content).hexdigest(), False,
-                                         len(raw), hashlib.sha256(raw).hexdigest())
-            return "success", "ok (NFO 已校验，源文件保留)" + detail_extra
+                existing = os.lstat(dst)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and stat.S_ISREG(existing.st_mode):
+                if is_nfo:
+                    _verified_nfo(dst, content)
+                else:
+                    _sha256(dst)
+    except OSError as exc:
+        return "failed", f"源或目标读取失败，未写入: {exc}"
+    if resolved is None:
+        try:
+            target_matches = is_nfo and _verified_nfo(dst, content)
+        except OSError as exc:
+            return "failed", f"NFO 目标读回失败，未覆盖: {exc}"
+        if target_matches:
+            target_hash = hashlib.sha256(content).hexdigest()
+            source_hash = hashlib.sha256(raw).hexdigest()
+            if task.get("after_action", "delete") == "delete":
+                try:
+                    target_device = _mount_identity(task["dst_dir"])
+                    deleted, reason = _remove_verified_source(
+                        src, dst, source_info, task["dst_dir"], target_device,
+                        (len(raw), source_hash), (len(content), target_hash))
+                except OSError as exc:
+                    return "failed", f"NFO 源文件删除失败: {exc}"
+                if not deleted:
+                    return "failed", reason
+                if cfg.get("remove_empty_dirs"):
+                    _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
+            item["_verified_target"] = (len(content), target_hash,
+                                         task.get("after_action", "delete") == "delete",
+                                         len(raw), source_hash)
+            return "success", "ok (NFO 目标内容一致)" + detail_extra
         prior = db.get_migrated_dst(task["id"], item["rel_path"]) if is_nfo else None
         if is_nfo and prior == dst:
             if not db.migrated_destination_matches(task["id"], item["rel_path"], dst):
                 return "conflict", f"NFO 目标可能被外部改写: {dst}；需人工确认，不自动覆盖"
             resolved = (dst, "overwrite")
-        elif not is_nfo and (matching_hash := _matching_digest(src, dst)) is not None:
+        elif not is_nfo:
+            try:
+                matching_hash = _matching_digest(src, dst)
+            except OSError as exc:
+                return "failed", f"目标或源文件读回失败，未删除或覆盖: {exc}"
+            if matching_hash is None:
+                return "conflict", f"目标已存在: {dst}（策略 skip）"
             if task.get("after_action", "delete") == "delete":
                 try:
                     target_device = _mount_identity(task["dst_dir"])
-                    snapshot = os.lstat(src)
+                    source_stat = os.lstat(src)
                     deleted, reason = _remove_verified_source(
-                        src, dst, snapshot, task["dst_dir"], target_device,
-                        (snapshot.st_size, matching_hash))
+                        src, dst, source_stat, task["dst_dir"], target_device,
+                        (source_stat.st_size, matching_hash))
                     if not deleted:
                         return "failed", reason
                 except OSError as exc:
                     return "failed", f"源文件删除失败: {exc}"
-                if task.get("symlink_enabled"):
-                    _symlink_source(src, dst)
+                if cfg.get("remove_empty_dirs"):
+                    _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
             item["_verified_target"] = (_size(dst), matching_hash, True,
                                          _size(dst), matching_hash)
             return "success", "ok (目标内容一致)"
@@ -344,17 +395,27 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
     final_dst, how = resolved
     try:
         if is_nfo:
-            _materialize_nfo_source(src, raw)
+            target_device = _mount_identity(task["dst_dir"])
             wrote_target = not _verified_nfo(final_dst, content)
             if wrote_target:
                 _write_nfo(final_dst, content, root=task["dst_dir"])
             if not _verified_nfo(final_dst, content):
                 raise IOError("NFO 目标文件读回校验失败，源文件已保留")
             item["dst_path"] = final_dst
-            item["_verified_target"] = (len(content), hashlib.sha256(content).hexdigest(),
-                                         wrote_target,
-                                         len(raw), hashlib.sha256(raw).hexdigest())
-            return "success", f"ok (NFO 已读回校验，源文件保留){detail_extra}"
+            target_hash = hashlib.sha256(content).hexdigest()
+            source_hash = hashlib.sha256(raw).hexdigest()
+            if task.get("after_action", "delete") == "delete":
+                deleted, reason = _remove_verified_source(
+                    src, final_dst, source_info, task["dst_dir"], target_device,
+                    (len(raw), source_hash), (len(content), target_hash))
+                if not deleted:
+                    return "failed", reason
+                if cfg.get("remove_empty_dirs"):
+                    _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
+            item["_verified_target"] = (len(content), target_hash,
+                                         task.get("after_action", "delete") == "delete",
+                                         len(raw), source_hash)
+            return "success", f"ok (NFO 已读回校验){detail_extra}"
 
         # 普通文件也使用先复制、完整性校验、原子替换的流程。
         # 挂载可能在 close 后丢写，读回校验失败时绝不能删除源文件。
@@ -364,7 +425,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         item["dst_path"] = final_dst
         current_stat = os.lstat(src)
         identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-        if (not os.path.isfile(src) or os.path.islink(src)
+        if (not stat.S_ISREG(current_stat.st_mode)
                 or any(getattr(current_stat, field) != getattr(source_stat, field)
                        for field in identity)):
             return "failed", "复制期间源文件变化，源文件已保留"
@@ -383,12 +444,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                     return "failed", reason
             except OSError as exc:
                 return "failed", f"源文件删除失败: {exc}"
-            if task.get("symlink_enabled"):
-                if _symlink_source(src, final_dst):
-                    detail += "，+symlink"
-                else:
-                    detail += "，symlink创建失败(不影响迁移)"
-            if cfg.get("remove_empty_dirs") and not _has_symlink_in_dir(os.path.dirname(src)):
+            if cfg.get("remove_empty_dirs"):
                 _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
         item["_verified_target"] = (source_stat.st_size, source_hash, True,
                                      source_stat.st_size, source_hash)
@@ -397,24 +453,6 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         return "failed", f"迁移失败，源文件已保留: {exc}"
     except Exception as exc:
         return "failed", f"迁移失败，源文件已保留: {exc}"
-
-
-def _symlink_source(src: str, dst: str) -> bool:
-    try:
-        if os.path.lexists(src):
-            return False
-        os.makedirs(os.path.dirname(src), exist_ok=True)
-        os.symlink(dst, src)
-        return True
-    except OSError:
-        return False
-
-
-def _has_symlink_in_dir(directory: str) -> bool:
-    try:
-        return any(os.path.islink(os.path.join(directory, entry)) for entry in os.listdir(directory))
-    except OSError:
-        return False
 
 
 def _remove_empty_parent_dirs(start: str, stop_at: str):

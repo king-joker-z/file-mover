@@ -93,7 +93,6 @@ def _init_schema(conn: sqlite3.Connection):
             path_rule TEXT NOT NULL DEFAULT 'keep_structure',
             after_action TEXT NOT NULL DEFAULT 'delete',
             run_windows TEXT NOT NULL DEFAULT '',
-            symlink_enabled INTEGER NOT NULL DEFAULT 0,
             filename_nfo_enabled INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
@@ -114,9 +113,6 @@ def _init_schema(conn: sqlite3.Connection):
             verified_trusted INTEGER NOT NULL DEFAULT 0,
             source_size INTEGER,
             source_sha256 TEXT,
-            source_dev INTEGER,
-            source_inode INTEGER,
-            source_mtime_ns INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(task_id, rel_path)
@@ -160,8 +156,8 @@ def _migrate_schema(conn: sqlite3.Connection):
     if "run_windows" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN run_windows TEXT NOT NULL DEFAULT ''")
         conn.commit()
-    if "symlink_enabled" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN symlink_enabled INTEGER NOT NULL DEFAULT 0")
+    if "symlink_enabled" in cols:
+        conn.execute("ALTER TABLE tasks DROP COLUMN symlink_enabled")
     if "filename_nfo_enabled" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN filename_nfo_enabled INTEGER NOT NULL DEFAULT 0")
     conn.commit()
@@ -183,11 +179,12 @@ def _migrate_schema(conn: sqlite3.Connection):
     for column, definition in (("verified_size", "INTEGER"),
                                ("verified_sha256", "TEXT"),
                                ("verified_trusted", "INTEGER NOT NULL DEFAULT 0"),
-                               ("source_size", "INTEGER"), ("source_sha256", "TEXT"),
-                               ("source_dev", "INTEGER"), ("source_inode", "INTEGER"),
-                               ("source_mtime_ns", "INTEGER")):
+                               ("source_size", "INTEGER"), ("source_sha256", "TEXT")):
         if column not in queue_cols:
             conn.execute(f"ALTER TABLE queue ADD COLUMN {column} {definition}")
+    for column in ("source_dev", "source_inode", "source_mtime_ns"):
+        if column in queue_cols:
+            conn.execute(f"ALTER TABLE queue DROP COLUMN {column}")
     conn.commit()
 
 
@@ -214,14 +211,13 @@ def create_task(data: dict) -> int:
         cur = conn.execute(
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
-               run_windows, symlink_enabled, filename_nfo_enabled, enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               run_windows, filename_nfo_enabled, enabled, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
              data.get("path_rule", "keep_structure"), data.get("after_action", "delete"),
-             data.get("run_windows", ""), 1 if data.get("symlink_enabled") else 0,
-             1 if data.get("filename_nfo_enabled") else 0,
+             data.get("run_windows", ""), 1 if data.get("filename_nfo_enabled") else 0,
              1 if data.get("enabled", True) else 0, now_str(), now_str()))
         return cur.lastrowid
 
@@ -231,7 +227,7 @@ def update_task(task_id: int, data: dict):
     fields, vals = [], []
     for k in ("name", "src_dir", "dst_dir", "interval_seconds", "scan_interval",
               "include_patterns", "exclude_patterns", "conflict_policy",
-              "path_rule", "after_action", "run_windows", "symlink_enabled",
+              "path_rule", "after_action", "run_windows",
               "filename_nfo_enabled", "enabled"):
         if k in data:
             fields.append(f"{k}=?")
@@ -254,7 +250,7 @@ def update_task(task_id: int, data: dict):
             raise ValueError("任务正在迁移，修改路径或规则前请等待当前文件完成")
         conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
         if changed:
-            # 仅在路径/规则真正变化时丢弃旧快照，下一轮扫描将按新配置入队。
+            # 路径/规则变化时清理旧队列，下一轮按新配置重新扫描。
             conn.execute("DELETE FROM queue WHERE task_id=? AND status NOT IN ('transferring','accounting_pending')",
                          (task_id,))
 
@@ -269,51 +265,27 @@ def delete_task(task_id: int):
 
 # ---------- queue ----------
 
-def _sqlite_snapshot_value(value: int):
-    """SQLite INTEGER 只能保存有符号 64 位；越界标识保留为非数值文本以免亲和性转浮点。"""
-    if -(1 << 63) <= value < (1 << 63):
-        return value
-    return f"i:{value}"
-
-
-def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int,
-            source_snapshot=None) -> bool:
-    """入队；done 且源快照完整、路径/大小/身份均未变时跳过。
-
-    未提供快照（旧调用或 NFO 内容复核）及旧库缺失快照时保守入队。
-    failed/conflict 仅在路径或大小变化时重置，避免耗尽重试后循环调度。
-    """
-    dev, inode, mtime_ns = (tuple(_sqlite_snapshot_value(source_snapshot[i]) for i in (0, 1, 3))
-                            if source_snapshot is not None else (None, None, None))
+def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int) -> bool:
+    """现存文件不受完成记录阻挡；在途和待记账条目仍由工作线程独占。"""
     conn = get_conn()
     with _lock, conn:
-        row = conn.execute("SELECT id, status, src_path, dst_path, size,"
-                           " source_dev, source_inode, source_mtime_ns FROM queue"
+        row = conn.execute("SELECT id, status, src_path, dst_path, size FROM queue"
                            " WHERE task_id=? AND rel_path=?", (task_id, rel_path)).fetchone()
         if row is None:
             conn.execute(
                 "INSERT INTO queue (task_id, src_path, rel_path, dst_path, size,"
-                " source_dev, source_inode, source_mtime_ns, status, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,'pending',?,?)",
-                (task_id, src_path, rel_path, dst_path, size, dev, inode, mtime_ns,
-                 now_str(), now_str()))
+                " status, created_at, updated_at) VALUES (?,?,?,?,?,'pending',?,?)",
+                (task_id, src_path, rel_path, dst_path, size, now_str(), now_str()))
             return True
-        source_changed = row["src_path"] != src_path or row["size"] != size
-        changed = source_changed or row["dst_path"] != dst_path
-        same_source = (source_snapshot is not None and source_snapshot[2] == size
-                       and row["source_dev"] is not None and row["source_inode"] is not None
-                       and row["source_mtime_ns"] is not None
-                       and (row["source_dev"], row["source_inode"], row["source_mtime_ns"])
-                       == (dev, inode, mtime_ns))
-        if (row["status"] == "done" and (source_changed or not same_source)
-                or row["status"] in ("conflict", "failed")
-                and (changed or source_snapshot is not None and not same_source)):
+        changed = (row["src_path"] != src_path or row["dst_path"] != dst_path
+                   or row["size"] != size)
+        if row["status"] == "done" or row["status"] == "conflict" or (
+                row["status"] == "failed" and changed):
             conn.execute(
-                "UPDATE queue SET src_path=?, dst_path=?, size=?, source_dev=?,"
-                " source_inode=?, source_mtime_ns=?, status='pending',"
+                "UPDATE queue SET src_path=?, dst_path=?, size=?, status='pending',"
                 " retries=0, next_retry_at=NULL, verified_size=NULL, verified_sha256=NULL,"
                 " verified_trusted=0, source_size=NULL, source_sha256=NULL, updated_at=? WHERE id=?",
-                (src_path, dst_path, size, dev, inode, mtime_ns, now_str(), row["id"]))
+                (src_path, dst_path, size, now_str(), row["id"]))
             return True
         return False
 
@@ -424,7 +396,7 @@ def reset_stuck_transferring():
     conn = get_conn()
     with _lock, conn:
         conn.execute("DELETE FROM queue WHERE task_id NOT IN (SELECT id FROM tasks)")
-        # 无凭证的中断转存不能据目标存在自动补记；仍按源身份检查路径执行。
+        # 无凭证的中断转存不能仅凭目标存在自动补记；重新从源路径迁移。
         conn.execute("UPDATE queue SET status='pending', updated_at=? WHERE status='transferring'",
                      (now_str(),))
 
@@ -498,32 +470,27 @@ def record_migrated(task_id: int, rel_path: str, size: int, dst_path: str = None
             "(task_id, rel_path, size, migrated_at, dst_path, dst_sha256)"
             " VALUES (?,?,?,?,?,?)",
             (task_id, rel_path, size, now_str(), dst_path, digest))
-        # 仅清除先前已完成的快照；在途条目必须由调用者自行标记完成。
+        # 仅清除先前已完成的队列条目；在途条目必须由调用者自行标记完成。
         # 与迁移记账保持同一事务，不能提前删除 transferring 行。
         conn.execute(
             "DELETE FROM queue WHERE task_id=? AND rel_path=? AND status='done'",
             (task_id, rel_path))
 
 
-def get_migrated_set(task_id: int) -> set:
-    """返回该任务已迁移的 (rel_path, size) 集合"""
-    conn = get_conn()
+def list_migrated_videos(task_id: int, extensions: set[str]) -> list[tuple[str, str, int, str]]:
+    """全量 NFO 补齐：每个相对路径仅采用最新且有读回凭证的迁移记录。"""
     with _lock:
-        rows = conn.execute(
-            "SELECT rel_path, size FROM migrated_files WHERE task_id=?",
-            (task_id,)).fetchall()
-        return {(r["rel_path"], r["size"]) for r in rows}
-
-
-
-def get_migrated_rels(task_id: int) -> set:
-    """返回该任务已迁移的 rel_path 集合（刮削小文件宽松匹配用）"""
-    conn = get_conn()
-    with _lock:
-        rows = conn.execute(
-            "SELECT rel_path FROM migrated_files WHERE task_id=?",
-            (task_id,)).fetchall()
-        return {r["rel_path"] for r in rows}
+        rows = get_conn().execute(
+            "SELECT rel_path, dst_path, size, dst_sha256 FROM migrated_files"
+            " WHERE task_id=? ORDER BY migrated_at DESC, id DESC", (task_id,)).fetchall()
+    latest = {}
+    for row in rows:
+        rel = row["rel_path"]
+        if rel not in latest:
+            latest[rel] = row
+    return [(rel, row["dst_path"], row["size"], row["dst_sha256"])
+            for rel, row in latest.items() if row["dst_path"] and row["dst_sha256"]
+            and os.path.splitext(rel)[1].lower() in extensions]
 
 
 def has_migrated_rel(task_id: int, rel_path: str) -> bool:
@@ -552,7 +519,7 @@ def get_migrated_dst(task_id: int, rel_path: str) -> Optional[str]:
             " AND logs.result='success'"
             " ORDER BY d.log_id DESC", (task_id, rel_path, task_id))
         for log in logs:
-            # 旧库可能已经索引了软链视频→补齐 NFO 的成功日志，逐条校验，
+            # 旧库可能索引了视频路径对应 NFO 补齐的成功日志，逐条校验，
             # 不让最新的脏记录遮住较早的真实迁移记录。
             if (log["src_path"] and log["src_path"].endswith(os.sep + rel_path)
                     and _same_file_type(log["src_path"], log["dst_path"])
@@ -587,27 +554,6 @@ def has_migrated_destination(task_id: int, rel_path: str) -> bool:
     with _lock:
         return conn.execute("SELECT 1 FROM migrated_files WHERE task_id=? AND rel_path=?"
                             " AND dst_path IS NOT NULL LIMIT 1", (task_id, rel_path)).fetchone() is not None
-
-
-def get_migrated_size(task_id: int, rel_path: str) -> int:
-    """返回该任务已迁移文件的记录 size，未找到返回 -1"""
-    conn = get_conn()
-    with _lock:
-        row = conn.execute(
-            "SELECT size FROM migrated_files WHERE task_id=? AND rel_path=?",
-            (task_id, rel_path)).fetchone()
-        return row["size"] if row else -1
-
-
-def is_re_migrated(task_id: int, rel_path: str, size: int) -> bool:
-    """该文件此前已迁移过，且现在源目录又出现了相同 rel_path+size 的文件
-    → 判定为下载器重新下载的重复文件"""
-    conn = get_conn()
-    with _lock:
-        row = conn.execute(
-            "SELECT 1 FROM migrated_files WHERE task_id=? AND rel_path=? AND size=? LIMIT 1",
-            (task_id, rel_path, size)).fetchone()
-        return row is not None
 
 
 # ---------- logs ----------

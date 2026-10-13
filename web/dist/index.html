@@ -128,8 +128,6 @@ input:checked+.slider:before{transform:translateX(16px)}
             <select id="f-path"><option value="keep_structure">保持相对结构（并入已有目录）</option><option value="flatten">平铺到目标根</option><option value="by_date">按日期归档</option></select></div>
           <div class="field"><label>迁移后源文件</label>
             <select id="f-after"><option value="delete">删除（迁移）</option><option value="keep">保留（复制）</option></select></div>
-          <div class="field" style="min-width:240px"><label>源路径符号链接（防下载器重下，默认关）</label>
-            <select id="f-symlink"><option value="0">关闭</option><option value="1">开启</option></select></div>
           <div class="field" style="min-width:260px"><label>缺失 NFO 补全（标题-作者-YYYYMMDD，默认关）</label>
             <select id="f-filename-nfo"><option value="0">关闭</option><option value="1">开启（按视频文件名和 -poster 封面）</option></select></div>
         </div>
@@ -192,12 +190,6 @@ input:checked+.slider:before{transform:translateX(16px)}
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-empty"> 清理迁移后的空目录</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-nfo"> nfo 预处理（迁移前修正：actor 数字UID name→role）</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-douyin"> 抖音 nfo 自动生成（无 nfo 的视频按文件名生成简易 nfo）</label>
-          <div class="field" style="min-width:280px"><label>重复下载处置（下载器把已迁移的文件重新下回源目录时）</label>
-            <select id="g-redownload" style="width:auto">
-              <option value="delete">自动删除（推荐，防迁移循环）</option>
-              <option value="skip">保留并跳过</option>
-              <option value="keep">照常迁移</option>
-            </select></div>
         </div>
         <button class="btn" type="submit">保存设置</button>
         <span id="settings-msg" style="color:var(--ok);margin-left:12px;font-size:13px"></span>
@@ -295,7 +287,6 @@ async function editTask(id){
   $("#f-inc").value=t.include_patterns||""; $("#f-exc").value=t.exclude_patterns||"";
   $("#f-conflict").value=t.conflict_policy; $("#f-path").value=t.path_rule;
   $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
-  $("#f-symlink").value = t.symlink_enabled ? "1" : "0";
   $("#f-filename-nfo").value = t.filename_nfo_enabled ? "1" : "0";
   const btn=$("#task-form button[type=submit]");
   btn.textContent="保存修改"; btn.classList.add("green");
@@ -401,7 +392,7 @@ $("#task-form").onsubmit=async e=>{
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
     include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
     conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value,
-    run_windows:$("#f-windows").value.trim(),symlink_enabled:$("#f-symlink").value==="1",
+    run_windows:$("#f-windows").value.trim(),
     filename_nfo_enabled:$("#f-filename-nfo").value==="1"};
   try{
     if (editingTaskId !== null) {
@@ -532,7 +523,6 @@ async function loadSettings(){
     $("#g-retries").value=s.max_retries;
     $("#g-stable").checked=s.stable_check;$("#g-empty").checked=s.remove_empty_dirs;
     $("#g-nfo").checked=s.nfo_fix_enabled!==false;$("#g-douyin").checked=!!s.douyin_nfo_enabled;
-    $("#g-redownload").value=s.re_download_action||"delete";
   }catch(e){}
 }
 $("#settings-form").onsubmit=async e=>{
@@ -542,9 +532,8 @@ $("#settings-form").onsubmit=async e=>{
     max_retries:+$("#g-retries").value,stable_check:$("#g-stable").checked,
     remove_empty_dirs:$("#g-empty").checked,
     nfo_fix_enabled:$("#g-nfo").checked,
-    douyin_nfo_enabled:$("#g-douyin").checked,
-    re_download_action:$("#g-redownload").value})});
-  $("#settings-msg").textContent="已保存 ✓";setTimeout(()=>$("#settings-msg").textContent="",2000);
+    douyin_nfo_enabled:$("#g-douyin").checked})});
+    $("#settings-msg").textContent="已保存 ✓";setTimeout(()=>$("#settings-msg").textContent="",2000);
   }catch(err){$("#settings-msg").textContent="保存失败: "+err.message;}
 };
 
@@ -558,16 +547,15 @@ function browseTo(rel, isRetry){
     $("#browse-crumb").textContent="当前: /"+(d.rel||"");
     const box=$("#browse-list");
     if(!d.items.length){box.innerHTML='<div class="empty">空目录</div>';return;}
-    box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th><th>软链指向</th></tr>`+
+    box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th></tr>`+
       d.items.map((it,i)=>{
-        const icon=it.type==="symlink"?"🔗":(it.type==="dir"?"📁":"📄");
+        const icon=it.type==="dir"?"📁":(it.type==="file"?"📄":"·");
         const childRel=(d.rel?d.rel+"/":"")+it.name;
         const click=it.type==="dir"?`data-rel="${esc(encodeURIComponent(childRel))}"`:"";
         return `<tr ${click} style="${it.type==="dir"?"cursor:pointer":""}">
-          <td>${icon} ${it.type==="symlink"?"软链":(it.type==="dir"?"目录":"文件")}</td>
+          <td>${icon} ${it.type==="dir"?"目录":(it.type==="file"?"文件":"其他")}</td>
           <td style="word-break:break-all">${esc(it.name)}</td>
-          <td>${it.type==="file"?fmtSize(it.size):"-"}</td>
-          <td class="log-detail" style="word-break:break-all">${esc(it.target)}</td></tr>`;
+          <td>${it.type==="file"?fmtSize(it.size):"-"}</td></tr>`;
       }).join("")+"</table>";
     box.querySelectorAll("tr[data-rel]").forEach(tr=>{
       tr.onclick=()=>browseTo(decodeURIComponent(tr.dataset.rel));

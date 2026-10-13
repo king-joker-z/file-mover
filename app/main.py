@@ -71,7 +71,6 @@ class TaskIn(BaseModel):
     enabled: bool = True
     # 运行周期：空 = 全天运行；否则窗口内运行，如 "01:00-07:00"，可多段逗号分隔
     run_windows: str = ""
-    symlink_enabled: bool = False
     filename_nfo_enabled: bool = False
 
     @field_validator("run_windows")
@@ -113,10 +112,6 @@ class SettingsIn(BaseModel):
     default_interval_seconds: Optional[float] = Field(default=None, ge=0, le=86400, allow_inf_nan=False)
     nfo_fix_enabled: Optional[bool] = None
     douyin_nfo_enabled: Optional[bool] = None
-    re_download_action: Optional[Literal["delete", "skip", "keep"]] = None
-    symlink_enabled: Optional[bool] = None
-
-
 def _task_path(value: str, field: str) -> Path:
     """归一化路径并解析现有软链；不存在的尾部仍可校验包含关系。"""
     if not value or not os.path.isabs(value) or "\x00" in value:
@@ -234,8 +229,7 @@ def api_dirs(rel: Optional[str] = None):
 
 @app.get("/api/browse")
 def api_browse(rel: Optional[str] = None, limit: int = 500):
-    """文件级浏览（含软链识别）：列出目录下所有条目并标注类型。
-    用于 Web UI 检查软链是否生成，无需 SSH。"""
+    """文件级浏览：列出目录下条目并标注类型。"""
     import pathlib
     root = pathlib.Path(MOUNT_ROOT).resolve()
     if str(root) == "/":
@@ -257,14 +251,14 @@ def api_browse(rel: Optional[str] = None, limit: int = 500):
         raise HTTPException(404, "目录不存在")
     items = []
     for p in sorted(target.iterdir(), key=lambda x: x.name):
-        is_link = p.is_symlink()
         try:
-            size = 0 if is_link else (p.stat().st_size if p.exists() else 0)
-            t = "symlink" if is_link else ("dir" if p.is_dir() else "file")
-            link_target = os.readlink(p) if is_link else ""
+            info = p.lstat()
+            t = "dir" if p.is_dir() and not p.is_symlink() else (
+                "file" if p.is_file() and not p.is_symlink() else "other")
+            size = info.st_size if t == "file" else 0
         except OSError:
-            t, size, link_target = "file", 0, ""
-        items.append({"name": p.name, "type": t, "size": size, "target": link_target})
+            t, size = "other", 0
+        items.append({"name": p.name, "type": t, "size": size})
     return {"rel": rel, "path": str(target), "items": items[:limit]}
 
 
@@ -332,7 +326,7 @@ def api_sync_progress(task_id: int):
 @app.post("/api/tasks/{task_id}/sync-now")
 def api_sync_now(task_id: int):
     """立即全量扫描指定任务：跳过周期调度，立刻扫描源目录。
-    软链自动跳过，非软链文件正常入队迁移（含重复下载检测）。返回扫描统计。"""
+    普通文件入队迁移（含重复下载检测）。返回扫描统计。"""
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.douyin_nfo import (parse_filename, build_nfo, ensure_nfo,
-                            backfill_nfo_for_link, ensure_filename_nfo, _create_nfo)
+                            ensure_filename_nfo, _create_nfo)
 from app.nfo_fix import fix_nfo, prepare_nfo
 import xml.etree.ElementTree as ET
 
@@ -187,28 +187,22 @@ check("B19 并发创建软链不覆盖", b19)
 
 def b20():
     with tempfile.TemporaryDirectory() as d:
-        source = os.path.join(d, "source")
-        cloud = os.path.join(d, "cloud")
-        os.mkdir(source)
-        os.mkdir(cloud)
-        video = os.path.join(source, "clip.mp4")
-        target = os.path.join(cloud, "clip.mp4")
+        video = os.path.join(d, "clip.mp4")
         open(video, "wb").close()
-        open(target, "wb").close()
         for existing in ("CLIP.NFO", "clip.NFO"):
-            nfo = os.path.join(cloud, existing)
+            nfo = os.path.join(d, existing)
             with open(nfo, "w") as f:
                 f.write("keep")
-            assert backfill_nfo_for_link(video, target) == (False, "已存在 nfo")
+            assert ensure_nfo(video) == (False, "已存在 nfo")
             assert open(nfo).read() == "keep"
             os.unlink(nfo)
-        upper = os.path.join(source, "CLIP.NFO")
+        upper = os.path.join(d, "CLIP.NFO")
         os.symlink("missing", upper)
         assert ensure_nfo(video) == (False, "已存在 nfo")
         os.unlink(upper)
-        assert backfill_nfo_for_link(video, target)[0]
-        assert ET.parse(os.path.join(cloud, "clip.nfo")).getroot().tag == "movie"
-check("B20 全局生成和补齐检测大小写 NFO 与软链", b20)
+        assert ensure_nfo(video)[0]
+        assert ET.parse(os.path.join(d, "clip.nfo")).getroot().tag == "movie"
+check("B20 自动生成检测大小写 NFO 与已有路径", b20)
 
 def b21():
     with tempfile.TemporaryDirectory() as d:

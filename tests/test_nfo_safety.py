@@ -34,7 +34,7 @@ class NfoSafetyTests(unittest.TestCase):
         self.task = {
             "id": 1, "src_dir": str(self.src), "dst_dir": str(self.dst),
             "path_rule": "keep_structure", "conflict_policy": "skip",
-            "after_action": "delete", "symlink_enabled": True,
+            "after_action": "delete",
         }
 
     def restore_db(self):
@@ -59,12 +59,20 @@ class NfoSafetyTests(unittest.TestCase):
                            os.path.getsize(item["dst_path"]), item["dst_path"])
         return stats, item
 
-    def test_new_nfo_is_copied_and_source_remains_even_with_delete_and_symlinks(self):
+    def test_nfo_keep_action_preserves_source(self):
+        self.task["after_action"] = "keep"
+        src = self.source(content=b"<movie/>")
+        self.scan_and_transfer()
+        self.assertEqual(src.read_bytes(), b"<movie/>")
+        self.assertEqual((self.dst / src.name).read_bytes(), b"<movie/>")
+
+    def test_new_nfo_is_copied_and_source_deleted_after_verification(self):
         src = self.source()
+        content = src.read_bytes()
         stats, item = self.scan_and_transfer()
         self.assertEqual(stats["enqueued"], 1)
-        self.assertEqual(Path(item["dst_path"]).read_bytes(), src.read_bytes())
-        self.assertFalse(src.is_symlink())
+        self.assertEqual(Path(item["dst_path"]).read_bytes(), content)
+        self.assertFalse(src.exists())
         self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 0)
 
     def test_new_version_of_same_nfo_is_not_dedup_deleted(self):
@@ -72,11 +80,11 @@ class NfoSafetyTests(unittest.TestCase):
         self.scan_and_transfer()
         src.write_bytes(b"new!")  # 同路径同大小，不允许旧记录造成误删
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["dedup_deleted"], stats["enqueued"]), (0, 1))
+        self.assertEqual(stats["enqueued"], 1)
         self.assertEqual(src.read_bytes(), b"new!")
         self.scan_and_transfer_existing_queue()
         self.assertEqual((self.dst / src.name).read_bytes(), b"new!")
-        self.assertEqual(src.read_bytes(), b"new!")
+        self.assertFalse(src.exists())
 
     def scan_and_transfer_existing_queue(self):
         item = db.take_next_pending(claim=False)
@@ -84,14 +92,18 @@ class NfoSafetyTests(unittest.TestCase):
         result, detail = transfer.transfer(item, self.task)
         self.assertEqual(result, "success", detail)
 
-    def test_missing_remote_is_restored_from_original(self):
+    def test_missing_remote_requires_source_to_restore(self):
         src = self.source()
+        original = src.read_bytes()
         self.scan_and_transfer()
         (self.dst / src.name).unlink()
-        stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["dedup_deleted"], stats["enqueued"]), (0, 1))
+        self.assertFalse(src.exists())
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
+        src.write_bytes(original)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.scan_and_transfer_existing_queue()
-        self.assertEqual((self.dst / src.name).read_bytes(), src.read_bytes())
+        self.assertEqual((self.dst / src.name).read_bytes(), original)
+        self.assertFalse(src.exists())
 
     def test_target_write_failure_never_deletes_source(self):
         src = self.source()
@@ -128,13 +140,14 @@ class NfoSafetyTests(unittest.TestCase):
         item = db.take_next_pending(claim=False)
         self.assertEqual(item["dst_path"], str(historical))
         self.scan_and_transfer_existing_queue()
-        self.assertEqual(historical.read_bytes(), src.read_bytes())
+        self.assertEqual(historical.read_bytes(), b"<title>new</title>")
+        self.assertFalse(src.exists())
 
-    def test_nfo_fix_preserves_source_and_writes_fixed_target(self):
+    def test_nfo_fix_deletes_verified_source_and_writes_fixed_target(self):
         raw = b"<actor><name>12345</name><role>Alice</role></actor>"
         src = self.source(content=raw)
         self.scan_and_transfer()
-        self.assertEqual(src.read_bytes(), raw)
+        self.assertFalse(src.exists())
         self.assertIn(b"<name>Alice</name>", (self.dst / src.name).read_bytes())
         self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 0)
 
@@ -169,68 +182,169 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(scanner.scan_task(self.task, skip_stable_check=True)["enqueued"], 0)
         self.assertFalse((self.dst / "new(2).nfo").exists())
 
-    def test_incremental_scan_skips_unchanged_symlink_directory_but_finds_new_file(self):
-        cache = {}
+    def test_every_scan_enumerates_existing_directories_and_finds_new_file(self):
         folder = self.src / "library"
         folder.mkdir()
         target = self.dst / "old.mp4"
         target.write_bytes(b"old")
         (folder / "old.mp4").symlink_to(target)
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         with patch.object(scanner.os, "scandir", wraps=os.scandir) as scandir:
-            self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
-            self.assertEqual(scandir.call_count, 0)
+            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
+            self.assertGreaterEqual(scandir.call_count, 2)
         new = self.source("library/new.mp4", b"new")
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
         with patch.object(scanner.os, "scandir", wraps=os.scandir) as scandir:
-            scanner.scan_task(self.task, directory_cache=cache, force_full=True)
+            scanner.scan_task(self.task, force_full=True)
             self.assertGreater(scandir.call_count, 0)
 
-    def test_incremental_scan_skips_symlink_checks_even_in_changed_directory(self):
-        cache = {}
+    def test_incremental_scan_ignores_non_regular_entries_even_in_changed_directory(self):
         folder = self.src / "library"
         folder.mkdir()
         target = self.dst / "old.mp4"
         target.write_bytes(b"old")
         (folder / "old.mp4").symlink_to(target)
         new = self.source("library/new.mp4", b"new")
-        with patch.object(scanner, "_trusted_link_target", side_effect=AssertionError("symlink checked")):
-            self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
 
     def test_incremental_scan_finds_new_nested_directories(self):
-        cache = {}
-        scanner.scan_task(self.task, directory_cache=cache)
+        scanner.scan_task(self.task)
         new = self.source("new/deep/video.mp4", b"new")
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
 
-    def test_incremental_scan_rechecks_quiet_files_without_directory_change(self):
-        cache = {}
+    def test_scan_rechecks_quiet_files_without_directory_change(self):
         self.settings["stable_quiet_seconds"] = 60
         new = self.source("video.mp4", b"new")
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
-        self.assertTrue(cache["entries"][str(self.src)][2])
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         os.utime(new, (time.time() - 120, time.time() - 120))
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(new))
 
-    def test_incremental_cache_does_not_commit_failed_scan(self):
-        cache = {}
+    def test_failed_scan_retries_existing_source(self):
         self.source("video.mp4", b"new")
         with patch.object(db, "enqueue", side_effect=OSError("database unavailable")):
             with self.assertRaisesRegex(OSError, "database unavailable"):
-                scanner.scan_task(self.task, directory_cache=cache)
-        self.assertNotIn("entries", cache)
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+                scanner.scan_task(self.task)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
 
-    def test_sync_now_forces_full_scan_after_incremental_cache(self):
+    def test_directory_iteration_eio_aborts_before_queue_commit(self):
+        source = self.source("healthy/video.mp4", b"video")
+        original_scandir = scanner.os.scandir
+        broken = self.src / "broken"
+        broken.mkdir()
+
+        def flaky_scandir(path):
+            if os.fspath(path) == str(broken):
+                raise OSError(errno.EIO, "directory iteration failed")
+            return original_scandir(path)
+
+        with patch.object(scanner.os, "scandir", side_effect=flaky_scandir):
+            with self.assertRaises(OSError) as error:
+                scanner.scan_task(self.task, force_full=True)
+        self.assertEqual(error.exception.errno, errno.EIO)
+        self.assertFalse(db.list_queue())
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(source))
+
+    def test_source_root_eio_is_not_reported_as_empty_successful_scan(self):
+        with patch.object(scanner.os, "stat", side_effect=OSError(errno.EIO, "unreadable root")):
+            with self.assertRaises(OSError) as error:
+                scanner.scan_task(self.task)
+        self.assertEqual(error.exception.errno, errno.EIO)
+
+    def test_file_metadata_eio_aborts_scan_before_queue_commit(self):
+        first = self.source("a.mp4", b"first")
+        second = self.source("z.mp4", b"second")
+        original = scanner.os.lstat
+
+        def fail_first(path, *args, **kwargs):
+            if os.fspath(path) == str(first):
+                raise OSError(errno.EIO, "source metadata unavailable")
+            return original(path, *args, **kwargs)
+
+        with patch.object(scanner.os, "lstat", side_effect=fail_first):
+            with self.assertRaises(OSError) as error:
+                scanner.scan_task(self.task)
+        self.assertEqual(error.exception.errno, errno.EIO)
+        self.assertFalse(db.list_queue())
+        self.assertEqual(second.read_bytes(), b"second")
+
+    def test_redownload_target_eio_stops_scan_without_deleting_or_requeueing(self):
+        source = self.source("a.mp4", b"original")
+        other = self.source("z.mp4", b"other")
+        target = self.dst / source.name
+        target.write_bytes(source.read_bytes())
+        db.record_migrated(1, source.name, source.stat().st_size, str(target))
+        original = transfer.os.lstat
+
+        def fail_target(path, *args, **kwargs):
+            if os.fspath(path) == str(target):
+                raise OSError(errno.EIO, "target metadata unavailable")
+            return original(path, *args, **kwargs)
+
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 2)
+        with patch.object(transfer.os, "lstat", side_effect=fail_target):
+            result, _ = transfer.transfer(db.take_next_pending(claim=False), self.task)
+        self.assertEqual(result, "failed")
+        self.assertEqual(source.read_bytes(), b"original")
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertEqual(other.read_bytes(), b"other")
+
+    def test_douyin_scan_reuses_directory_names_without_per_video_listdir(self):
+        self.settings["douyin_nfo_enabled"] = True
+        for index in range(12):
+            self.source(f"clip{index}.mp4", b"video")
+            self.source(f"clip{index}.nfo", b"<movie/>")
+        # 常见的伴生 NFO 已存在场景不应每个视频都重新枚举 NAS 目录。
+        with patch.object(douyin_nfo.os, "listdir", side_effect=AssertionError("repeated enumeration")):
+            stats = scanner.scan_task(self.task)
+        self.assertEqual(stats["enqueued"], 24)
+        self.assertEqual(len(list(self.src.glob("*.nfo"))), 12)
+
+    def test_douyin_source_write_eio_aborts_other_video_generation(self):
+        self.settings["douyin_nfo_enabled"] = True
+        self.source("a.mp4", b"video")
+        self.source("z.mp4", b"video")
+        with patch.object(scanner, "ensure_nfo", side_effect=OSError(errno.EIO, "NFO write failed")) as generate:
+            with self.assertRaises(OSError) as error:
+                scanner.scan_task(self.task)
+        self.assertEqual(error.exception.errno, errno.EIO)
+        generate.assert_called_once()
+        self.assertFalse(db.list_queue())
+
+    def test_failed_short_interval_scan_waits_at_least_sixty_seconds(self):
+        worker = scheduler.Scheduler()
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, scan_interval=1))
+        task = db.get_task(task_id)
+        worker.last_scan_ts[task_id] = 0
+        failures = []
+
+        def fail_scan(*args, **kwargs):
+            failures.append(time.time())
+            raise OSError(errno.EIO, "bad directory")
+
+        def stop_after_two_waits(timeout):
+            if worker._scan_retry_at:
+                worker._stop.set()
+            return False
+
+        with patch.object(db, "list_tasks", return_value=[task]), \
+             patch.object(worker, "_task_paths_safe", return_value=True), \
+             patch.object(scanner, "scan_task", side_effect=fail_scan), \
+             patch.object(worker._scan_wake, "wait", side_effect=stop_after_two_waits), \
+             patch.object(worker, "_scan_failed"):
+            worker._scan_loop()
+        self.assertEqual(len(failures), 1)
+        self.assertGreater(worker._scan_retry_at[task_id], failures[0] + 59)
+
+    def test_sync_now_forces_nfo_backfill_scan(self):
         worker = scheduler.Scheduler()
         task_id = db.create_task(dict(self.task, name="test"))
         task = db.get_task(task_id)
-        cache = worker._directory_caches.setdefault(task_id, {})
-        scanner.scan_task(task, directory_cache=cache)
+        scanner.scan_task(task)
         self.source("video.mp4", b"new")
         with patch.object(worker, "_task_paths_safe", return_value=True), \
                 patch.object(scanner, "scan_task", wraps=scanner.scan_task) as scan:
@@ -240,26 +354,24 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(worker.sync_progress[task_id]["enqueued"], 1)
         self.assertTrue(worker.sync_progress[task_id]["done"])
 
-    def test_incremental_scan_invalidates_cache_when_filter_changes(self):
-        cache = {}
+    def test_scan_applies_changed_filter(self):
         self.task["exclude_patterns"] = "*.mp4"
         source = self.source("video.mp4", b"new")
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         self.task["exclude_patterns"] = ""
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(source))
 
     def test_full_scan_reconciles_changes_without_directory_mtime_change(self):
-        cache = {}
         self.task["after_action"] = "keep"
         source = self.source("video.mp4", b"old")
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         db.clear_queue("all")
         parent_mtime = self.src.stat().st_mtime_ns
         source.write_bytes(b"newer")
         os.utime(self.src, ns=(parent_mtime, parent_mtime))
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache)["enqueued"], 0)
-        self.assertEqual(scanner.scan_task(self.task, directory_cache=cache, force_full=True)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(self.task, force_full=True)["enqueued"], 0)
 
     def test_generated_nfo_joins_the_same_scan(self):
         self.settings["douyin_nfo_enabled"] = True
@@ -460,65 +572,40 @@ class NfoSafetyTests(unittest.TestCase):
         db.set_status(item["id"], "done")
         return item
 
-    def test_oversized_snapshot_identifiers_round_trip_without_requeue(self):
+    def test_done_queue_requeues_existing_source_without_snapshot(self):
         source = self.source("movie.mp4", b"video")
-        path = str(source)
         destination = str(self.dst / source.name)
-        snapshot = (2**64 - 1, 2**63 + 123, 5, 2**63 + 456)
-        self.assertTrue(db.enqueue(1, path, source.name, destination, 5, snapshot))
+        self.assertTrue(db.enqueue(1, str(source), source.name, destination, 5))
         row = db.list_queue()[0]
-        self.assertEqual((row["source_dev"], row["source_inode"], row["source_mtime_ns"]),
-                         tuple(f"i:{value}" for value in (snapshot[0], snapshot[1], snapshot[3])))
-        self.assertEqual(tuple(db.get_conn().execute(
-            "SELECT typeof(source_dev), typeof(source_inode), typeof(source_mtime_ns)"
-            " FROM queue WHERE id=?", (row["id"],)).fetchone()),
-            ("text", "text", "text"))
         db.set_status(row["id"], "done")
-        self.assertFalse(db.enqueue(1, path, source.name, destination, 5, snapshot))
-        self.assertTrue(db.enqueue(1, path, source.name, destination, 5,
-                                   (snapshot[0], snapshot[1] + 1, 5, snapshot[3])))
+        self.assertTrue(db.enqueue(1, str(source), source.name, destination, 5))
         self.assertEqual(db.list_queue()[0]["status"], "pending")
+        self.assertFalse(db.enqueue(1, str(source), source.name, destination, 5))
 
-    def test_oversized_inode_from_scan_is_enqueued_and_survives_restart(self):
+    def test_scan_queue_survives_restart_without_source_snapshot(self):
         source = self.source("movie.mp4", b"video")
-        original_signature = scanner._signature
-
-        def oversized_signature(info):
-            dev, inode, size, mtime = original_signature(info)
-            if info.st_ino == source.stat().st_ino:
-                return dev, 2**63 + 77, size, mtime
-            return dev, inode, size, mtime
-
-        with patch.object(scanner, "_signature", side_effect=oversized_signature):
-            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
-            row = db.list_queue()[0]
-            self.assertEqual(row["source_inode"], f"i:{2**63 + 77}")
-            db._conn.close()
-            db._conn = None
-            self.assertFalse(db.enqueue(1, str(source), source.name, str(self.dst / source.name),
-                                        source.stat().st_size,
-                                        (source.stat().st_dev, 2**63 + 77,
-                                         source.stat().st_size, source.stat().st_mtime_ns)))
-            self.assertEqual(db.take_next_pending(claim=False)["id"], row["id"])
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+        row = db.list_queue()[0]
+        db._conn.close()
+        db._conn = None
+        self.assertFalse(db.enqueue(1, str(source), source.name, str(self.dst / source.name),
+                                    source.stat().st_size))
+        self.assertEqual(db.take_next_pending(claim=False)["id"], row["id"])
 
     def test_keep_source_is_not_requeued_or_rehashed_each_scan(self):
         self.task["after_action"] = "keep"
         source = self.source("movie.mp4", b"first")
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         item = self.finish_keep_transfer()
-        snapshot = source.stat()
         row = db.list_queue()[0]
         self.assertEqual(row["status"], "done")
-        self.assertEqual((row["source_dev"], row["source_inode"], row["source_mtime_ns"]),
-                         (snapshot.st_dev, snapshot.st_ino, snapshot.st_mtime_ns))
-        with patch.object(transfer, "_sha256", side_effect=AssertionError("duplicate hash")):
-            for _ in range(3):
-                self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
+        for _ in range(3):
+            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         self.assertEqual(db.list_queue()[0], row)
         self.assertIsNone(db.take_next_pending(claim=False))
         self.assertEqual(Path(item["dst_path"]).read_bytes(), b"first")
 
-    def test_keep_rename_done_snapshot_survives_multiple_scans(self):
+    def test_keep_rename_done_does_not_duplicate_transfer(self):
         self.task.update(after_action="keep", conflict_policy="rename")
         task_id = db.create_task(dict(self.task, name="rename", interval_seconds=0))
         self.task["id"] = task_id
@@ -578,22 +665,16 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertFalse((self.dst / "movie(3).mp4").exists())
 
     def test_redownload_keep_is_not_scheduled_repeatedly(self):
-        self.settings["re_download_action"] = "keep"
         self.task["after_action"] = "keep"
         source = self.source("movie.mp4", b"same")
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
-        item = self.finish_keep_transfer()
+        self.finish_keep_transfer()
         # 模拟下载器以同名新文件替换已迁移但保留的源文件。
         replacement = self.src / "replacement.tmp"
         replacement.write_bytes(b"same")
         replacement.replace(source)
-        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
-        next_item = db.take_next_pending(claim=False)
-        self.assertEqual(next_item["id"], item["id"])
-        result, detail = transfer.transfer(next_item, self.task)
-        self.assertEqual(result, "success", detail)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         self.assertEqual(source.read_bytes(), b"same")
-        db.set_status(item["id"], "done")
         for _ in range(3):
             self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         self.assertIsNone(db.take_next_pending(claim=False))
@@ -610,7 +691,7 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         row = db.list_queue()[0]
         self.assertEqual(row["status"], "pending")
-        self.assertEqual(row["source_mtime_ns"], source.stat().st_mtime_ns)
+        self.assertEqual(row["size"], source.stat().st_size)
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
         self.assertEqual(db.take_next_pending(claim=False)["id"], row["id"])
 
@@ -635,20 +716,28 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertIsNone(db.take_next_pending(claim=False))
         self.assertFalse(source.is_symlink())
         self.assertEqual(source.read_bytes(), b"first")
-        for _ in range(3):
-            self.assertEqual(scanner.scan_task(task)["enqueued"], 0)
-        self.assertEqual(db.list_queue()[0], old)
+        if terminal_status == "conflict":
+            self.assertEqual(scanner.scan_task(task)["enqueued"], 1)
+            pending = db.list_queue()[0]
+            self.assertEqual(pending["status"], "pending")
+            db.set_status(pending["id"], "conflict")
+        else:
+            for _ in range(3):
+                self.assertEqual(scanner.scan_task(task)["enqueued"], 0)
+            self.assertEqual(db.list_queue()[0], old)
 
         before = source.stat()
         source.write_bytes(b"other")
         os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns - 1_000_000_000))
         self.assertEqual(source.stat().st_size, before.st_size)
         self.assertNotEqual(source.stat().st_mtime_ns, before.st_mtime_ns)
-        self.assertEqual(scanner.scan_task(task)["enqueued"], 1)
+        self.assertEqual(scanner.scan_task(task)["enqueued"], 1 if terminal_status == "conflict" else 0)
+        if terminal_status == "failed":
+            db.retry_queue([old["id"]])
         pending = db.list_queue()[0]
         self.assertEqual((pending["id"], pending["status"], pending["retries"]),
                          (old["id"], "pending", 0))
-        self.assertEqual(pending["source_mtime_ns"], source.stat().st_mtime_ns)
+        self.assertEqual(pending["size"], source.stat().st_size)
         self.assertIsNone(pending["next_retry_at"])
         self.assertEqual(db.take_next_pending(claim=False)["id"], old["id"])
         for _ in range(3):
@@ -666,39 +755,133 @@ class NfoSafetyTests(unittest.TestCase):
     def test_conflict_same_size_mtime_rewrite_requeues_once(self):
         self._assert_terminal_source_rewrite_requeues_once("conflict")
 
-    def test_legacy_done_without_snapshot_is_requeued_once(self):
+    def test_done_keep_source_with_verified_target_is_not_requeued(self):
         self.task["after_action"] = "keep"
         source = self.source("movie.mp4", b"video")
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
-        item = self.finish_keep_transfer()
-        db.get_conn().execute("UPDATE queue SET source_dev=NULL, source_inode=NULL,"
-                              " source_mtime_ns=NULL WHERE id=?", (item["id"],))
-        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
-        self.assertEqual(db.list_queue()[0]["status"], "pending")
+        self.finish_keep_transfer()
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+        self.assertEqual(source.read_bytes(), b"video")
 
-    def test_nfo_target_rewrite_is_not_hidden_by_source_snapshot(self):
-        self.source("movie.nfo", b"<movie/>")
+    def test_nfo_target_rewrite_is_requeued(self):
+        source = self.source("movie.nfo", b"<movie/>")
         _, item = self.scan_and_transfer()
+        source.write_bytes(b"<movie/>")
         target = Path(item["dst_path"])
         target.write_bytes(b"external change")
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.list_queue()[0]["status"], "pending")
         self.assertEqual(target.read_bytes(), b"external change")
 
+    def test_auto_nfo_write_error_aborts_scan_before_video_queue(self):
+        self.settings["douyin_nfo_enabled"] = True
+        source = self.source("clip.mp4", b"video")
+        with patch.object(scanner, "ensure_nfo", side_effect=OSError(errno.ENOSPC, "no space")):
+            with self.assertRaises(OSError):
+                scanner.scan_task(self.task)
+        self.assertEqual(source.read_bytes(), b"video")
+        self.assertFalse(db.list_queue())
+
     def test_redownload_skip_keeps_identical_source_without_queueing(self):
-        self.settings["re_download_action"] = "skip"
         source = self.source("movie.mp4", b"same-content")
         target = self.dst / source.name
         target.write_bytes(source.read_bytes())
         db.record_migrated(1, source.name, source.stat().st_size, str(target))
 
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["dedup_skipped"], stats["dedup_deleted"], stats["enqueued"]),
-                         (1, 0, 0))
+        self.assertEqual(stats["enqueued"], 1)
         self.assertEqual(source.read_bytes(), b"same-content")
-        self.assertFalse(source.is_symlink())
-        self.assertFalse(db.list_queue())
+        item = db.take_next_pending(claim=False)
+        self.assertEqual(transfer.transfer(item, self.task)[0], "success")
+        self.assertFalse(source.exists())
+        self.assertEqual(target.read_bytes(), b"same-content")
+
+    def test_empty_source_parents_are_removed_after_verified_transfer(self):
+        self.settings["remove_empty_dirs"] = True
+        source = self.source("nested/deeper/movie.mp4", b"video")
+        parent = source.parent
+        grandparent = parent.parent
+        item = {"src_path": str(source), "dst_path": str(self.dst / "movie.mp4"),
+                "rel_path": "nested/deeper/movie.mp4"}
+
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(parent.exists())
+        self.assertFalse(grandparent.exists())
+        self.assertTrue(self.src.is_dir())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), b"video")
+
+    def test_matching_target_cleans_empty_source_parents_only_after_delete(self):
+        self.settings["remove_empty_dirs"] = True
+        source = self.source("nested/deeper/movie.mp4", b"video")
+        target = self.dst / "movie.mp4"
+        target.write_bytes(source.read_bytes())
+        item = {"src_path": str(source), "dst_path": str(target),
+                "rel_path": "nested/deeper/movie.mp4"}
+
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(source.parent.exists())
+        self.assertFalse((self.src / "nested").exists())
+        self.assertTrue(self.src.is_dir())
+        self.assertEqual(target.read_bytes(), b"video")
+
+    def test_matching_target_preserves_nonempty_source_parent_and_keep_action(self):
+        self.settings["remove_empty_dirs"] = True
+        source = self.source("nested/movie.mp4", b"video")
+        other = self.source("nested/other.txt", b"keep")
+        target = self.dst / "movie.mp4"
+        target.write_bytes(source.read_bytes())
+        item = {"src_path": str(source), "dst_path": str(target),
+                "rel_path": "nested/movie.mp4"}
+        self.task["after_action"] = "keep"
+
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual(source.read_bytes(), b"video")
+        self.assertTrue(source.parent.is_dir())
+
+        self.task["after_action"] = "delete"
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(source.exists())
+        self.assertTrue(source.parent.is_dir())
+        self.assertEqual(other.read_bytes(), b"keep")
+        self.assertTrue(self.src.is_dir())
+
+    def test_nfo_transfer_cleans_empty_source_parents_for_new_and_matching_targets(self):
+        self.settings["remove_empty_dirs"] = True
+        for target_exists in (False, True):
+            with self.subTest(target_exists=target_exists):
+                name = "existing" if target_exists else "new"
+                source = self.source(f"{name}/deeper/movie.nfo", b"<movie/>")
+                target = self.dst / f"{name}.nfo"
+                if target_exists:
+                    target.write_bytes(source.read_bytes())
+                item = {"src_path": str(source), "dst_path": str(target),
+                        "rel_path": f"{name}/deeper/movie.nfo"}
+
+                result, detail = transfer.transfer(item, self.task)
+                self.assertEqual(result, "success", detail)
+                self.assertFalse(source.parent.exists())
+                self.assertFalse((self.src / name).exists())
+                self.assertTrue(self.src.is_dir())
+                self.assertEqual(target.read_bytes(), b"<movie/>")
+
+    def test_disabled_empty_dir_cleanup_preserves_source_folders(self):
+        self.settings["remove_empty_dirs"] = False
+        source = self.source("nested/movie.mp4", b"video")
+        target = self.dst / "movie.mp4"
+        target.write_bytes(source.read_bytes())
+        item = {"src_path": str(source), "dst_path": str(target),
+                "rel_path": "nested/movie.mp4"}
+
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(source.exists())
+        self.assertTrue(source.parent.is_dir())
+        self.assertEqual(list(source.parent.iterdir()), [])
 
     def test_redownload_same_size_different_content_is_not_deleted(self):
         source = self.source("movie.mp4", b"new!")
@@ -707,7 +890,7 @@ class NfoSafetyTests(unittest.TestCase):
         db.record_migrated(1, source.name, target.stat().st_size, str(target))
 
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["dedup_deleted"], stats["enqueued"]), (0, 1))
+        self.assertEqual(stats["enqueued"], 1)
         self.assertEqual(source.read_bytes(), b"new!")
         self.assertEqual(target.read_bytes(), b"old!")
         self.assertEqual(db.take_next_pending(claim=False)["rel_path"], source.name)
@@ -721,8 +904,7 @@ class NfoSafetyTests(unittest.TestCase):
         db.record_migrated(1, "nested/movie.mp4", source.stat().st_size, str(target))
 
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["dedup_deleted"], stats["dedup_skipped"], stats["enqueued"]),
-                         (0, 0, 0))
+        self.assertEqual(stats["enqueued"], 0)
         self.assertEqual(source.read_bytes(), target.read_bytes())
         self.assertFalse(db.list_queue())
 
@@ -736,8 +918,7 @@ class NfoSafetyTests(unittest.TestCase):
         with patch.object(scanner, "_stable", return_value=False) as stable:
             stats = scanner.scan_task(self.task)
         stable.assert_called_with(str(source), self.settings["stable_check_seconds"])
-        self.assertEqual((stats["dedup_deleted"], stats["dedup_skipped"], stats["enqueued"]),
-                         (0, 0, 0))
+        self.assertEqual(stats["enqueued"], 0)
         self.assertEqual(source.read_bytes(), b"same-content")
         self.assertFalse(db.list_queue())
 
@@ -758,8 +939,7 @@ class NfoSafetyTests(unittest.TestCase):
         target.write_bytes(b"same")
         db.record_migrated(1, source.name, 4, str(target))
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["dedup_deleted"], stats["dedup_skipped"], stats["enqueued"]),
-                         (0, 0, 0))
+        self.assertEqual(stats["enqueued"], 0)
         self.assertEqual(source.read_bytes(), b"same")
 
     def test_same_size_mtime_change_during_batch_wait_is_rejected(self):
@@ -795,15 +975,12 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(stats["enqueued"], 30)
         self.assertEqual(stable.call_count, 30)
 
-    def test_included_nfo_of_trusted_placeholder_video_is_queued(self):
+    def test_included_nfo_of_regular_video_is_queued(self):
         self.task["include_patterns"] = "*.mp4"
-        target = self.dst / "movie.mp4"
-        target.write_bytes(b"video")
-        (self.src / target.name).symlink_to(target)
-        db.record_migrated(1, target.name, 5, str(target))
+        self.source("movie.mp4", b"video")
         nfo = self.source("movie.nfo", b"<movie/>")
-        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
-        self.assertEqual(db.take_next_pending(claim=False)["rel_path"], nfo.name)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 2)
+        self.assertIn(nfo.name, {item["rel_path"] for item in db.list_queue()})
 
     def test_unrelated_destination_link_does_not_authorize_companion_nfo(self):
         self.task["include_patterns"] = "*.mp4"
@@ -817,7 +994,6 @@ class NfoSafetyTests(unittest.TestCase):
 
     def test_transfer_never_cleans_unrelated_moving_files(self):
         self.settings["remove_empty_dirs"] = True
-        self.task["symlink_enabled"] = False
         source = self.source("nested/movie.mp4", b"video")
         source_work = self.src / "nested/other-program.moving"
         target_work = self.dst / "unrelated.moving"
@@ -863,7 +1039,7 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db.list_queue()[0], exhausted)
         self.assertIsNone(db.take_next_pending(claim=False))
 
-    def test_symlink_nfo_is_materialized_before_target_rewrite(self):
+    def test_legacy_linked_nfo_cannot_rewrite_target(self):
         raw = b"<actor><name>12345</name><role>Alice</role></actor>"
         target = self.dst / "linked.nfo"
         target.write_bytes(raw)
@@ -882,17 +1058,12 @@ class NfoSafetyTests(unittest.TestCase):
 
         with patch.object(transfer, "_write_nfo", side_effect=observe_rewrite):
             result, detail = transfer.transfer(item, self.task)
-        self.assertEqual(result, "success", detail)
-        self.assertEqual(len(before_rewrite), 1)
-        linked, source_before, target_before, path, fixed = before_rewrite[0]
-        self.assertFalse(linked)
-        self.assertEqual((source_before, target_before, path), (raw, raw, str(target)))
-        self.assertIn(b"<name>Alice</name>", fixed)
-        self.assertEqual(source.read_bytes(), raw)
-        self.assertFalse(source.is_symlink())
-        self.assertEqual(target.read_bytes(), fixed)
+        self.assertEqual(result, "failed", detail)
+        self.assertEqual(before_rewrite, [])
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(target.read_bytes(), raw)
 
-    def test_scanner_requeues_contaminated_symlink_nfo_without_deleting_it(self):
+    def test_scanner_does_not_follow_legacy_linked_nfo(self):
         self.settings["douyin_nfo_enabled"] = True
         raw = b"<actor><name>12345</name><role>Alice</role></actor>"
         target = self.dst / "linked.nfo"
@@ -902,18 +1073,12 @@ class NfoSafetyTests(unittest.TestCase):
         db.record_migrated(1, target.name, len(raw), str(target))
 
         stats = scanner.scan_task(self.task, skip_stable_check=True)
-        self.assertEqual((stats["enqueued"], stats["dedup_deleted"]), (1, 0))
+        self.assertEqual(stats["enqueued"], 0)
         self.assertTrue(source.is_symlink())
         self.assertEqual(target.read_bytes(), raw)
-        item = db.take_next_pending(claim=False)
-        self.assertEqual(item["dst_path"], str(target))
-        result, detail = transfer.transfer(item, self.task)
-        self.assertEqual(result, "success", detail)
-        self.assertFalse(source.is_symlink())
-        self.assertEqual(source.read_bytes(), raw)
-        self.assertIn(b"<name>Alice</name>", target.read_bytes())
+        self.assertFalse(db.list_queue())
 
-    def test_symlink_nfo_keeps_source_copy_if_target_rewrite_fails(self):
+    def test_legacy_linked_nfo_is_preserved_when_write_would_fail(self):
         raw = b"<actor><name>12345</name><role>Alice</role></actor>"
         target = self.dst / "linked.nfo"
         target.write_bytes(raw)
@@ -926,10 +1091,8 @@ class NfoSafetyTests(unittest.TestCase):
         with patch.object(transfer, "_write_nfo", side_effect=OSError("write failed")):
             result, detail = transfer.transfer(item, self.task)
         self.assertEqual(result, "failed", detail)
-        self.assertFalse(source.is_symlink())
-        self.assertEqual(source.read_bytes(), raw)
+        self.assertTrue(source.is_symlink())
         self.assertEqual(target.read_bytes(), raw)
-        self.assertNotEqual(os.stat(source).st_ino, os.stat(target).st_ino)
 
     def test_replaced_source_inode_is_not_deleted(self):
         source = self.source("movie.mp4", b"same")
@@ -990,6 +1153,49 @@ class NfoSafetyTests(unittest.TestCase):
         backups = list(self.src.glob(".fm-source-*.moving"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), b"original")
+
+    def test_failed_staging_restores_original_and_preserves_backup(self):
+        source = self.source("movie.mp4", b"original")
+        target = self.dst / source.name
+        target.write_bytes(b"different")
+        deleted, reason = transfer._remove_verified_source(str(source), str(target))
+        self.assertFalse(deleted)
+        self.assertIn("源已恢复", reason)
+        self.assertEqual(source.read_bytes(), b"original")
+        backups = list(self.src.glob(".fm-source-*.moving"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"original")
+
+    def test_eio_during_staging_link_restore_preserves_hidden_backup(self):
+        source = self.source("movie.mp4", b"original")
+        target = self.dst / source.name
+        target.write_bytes(b"different")
+        with patch.object(transfer.os, "link", side_effect=OSError(errno.EIO, "link failed")):
+            deleted, reason = transfer._remove_verified_source(str(source), str(target))
+        self.assertFalse(deleted)
+        self.assertIn("源备份保留", reason)
+        self.assertFalse(source.exists())
+        self.assertEqual(len(list(self.src.glob(".fm-source-*.moving"))), 1)
+
+    def test_unreadable_target_does_not_trigger_video_or_nfo_overwrite(self):
+        for name, content in (("movie.mp4", b"video"), ("movie.nfo", b"<movie/>")):
+            with self.subTest(name=name):
+                source = self.source(name, content)
+                target = self.dst / name
+                target.write_bytes(b"prior")
+                task = dict(self.task, conflict_policy="overwrite")
+                item = {"src_path": str(source), "dst_path": str(target), "rel_path": name}
+                if name.endswith(".nfo"):
+                    with patch.object(transfer, "_verified_nfo", side_effect=OSError(errno.EIO, "unreadable")), \
+                         patch.object(transfer, "_write_verified", side_effect=AssertionError("write")):
+                        result, _ = transfer.transfer(item, task)
+                else:
+                    with patch.object(transfer, "_sha256", side_effect=OSError(errno.EIO, "unreadable")), \
+                         patch.object(transfer, "_write_verified", side_effect=AssertionError("write")):
+                        result, _ = transfer.transfer(item, task)
+                self.assertEqual(result, "failed")
+                self.assertEqual(source.read_bytes(), content)
+                self.assertEqual(target.read_bytes(), b"prior")
 
     def test_unsupported_hardlink_rejects_overwrite_without_claiming_backup(self):
         for code in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
@@ -1233,7 +1439,7 @@ class NfoSafetyTests(unittest.TestCase):
               patch.object(worker, "_task_paths_safe", return_value=True),
               patch.object(db, "complete_accounting", side_effect=OSError("disk busy"))):
             worker._work_once()
-        self.assertTrue(source.is_symlink())
+        self.assertFalse(source.exists())
         self.assertEqual(db.list_queue()[0]["status"], "accounting_pending")
         self.assertEqual(db.list_queue()[0]["retries"], 0)
         self.assertEqual(db.list_logs()[0]["result"], "accounting_pending")
@@ -1248,6 +1454,52 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db.list_queue()[0]["status"], "done")
         self.assertEqual(restarted.stats()["accounting_pending"], 0)
 
+    def test_source_eio_during_work_remains_retryable_not_conflict(self):
+        task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        target = self.dst / source.name
+        db.enqueue(task_id, str(source), source.name, str(target), 5)
+        worker = scheduler.Scheduler()
+        original_lstat = scheduler.os.lstat
+
+        def eio_source(path, *args, **kwargs):
+            if os.fspath(path) == str(source):
+                raise OSError(errno.EIO, "source directory unavailable")
+            return original_lstat(path, *args, **kwargs)
+
+        with patch.object(db, "list_tasks", return_value=[dict(self.task, enabled=True,
+                                                                 interval_seconds=0)]), \
+             patch.object(worker, "_task_paths_safe", return_value=True), \
+             patch.object(scheduler.os, "lstat", side_effect=eio_source), \
+             patch.object(transfer, "transfer", side_effect=AssertionError("must not transfer")):
+            worker._work_once()
+        row = db.list_queue()[0]
+        self.assertEqual((row["status"], row["retries"]), ("failed", 0))
+        self.assertGreater(row["next_retry_at"], time.time())
+        self.assertIn(task_id, worker._scan_retry_at)
+        self.assertEqual(source.read_bytes(), b"video")
+        self.assertFalse(target.exists())
+
+    def test_scan_eio_circuit_breaker_blocks_queue_until_successful_scan(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        worker._scan_retry_at[task_id] = time.time() - 1  # 冷却结束仍不能直接继续写盘
+        with patch.object(worker, "_task_paths_safe", return_value=True), \
+             patch.object(db, "take_next_pending", wraps=db.take_next_pending) as take:
+            worker._work_once()
+        take.assert_called_once_with([])
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+        worker.sync_now(task_id)
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._process_sync_requests()
+        self.assertIsNone(worker.sync_progress[task_id]["error"])
+        self.assertNotIn(task_id, worker._scan_retry_at)
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._work_once()
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+
     def test_credential_write_failure_keeps_transferring_for_manual_review(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
         source = self.source("movie.mp4", b"video")
@@ -1259,7 +1511,7 @@ class NfoSafetyTests(unittest.TestCase):
               patch.object(worker, "_task_paths_safe", return_value=True),
               patch.object(db, "persist_accounting_pending", side_effect=OSError("db unavailable"))):
             worker._work_once()
-        self.assertTrue(source.is_symlink())
+        self.assertFalse(source.exists())
         self.assertEqual(db.list_queue()[0]["status"], "transferring")
         self.assertIsNone(db.get_migrated_dst(task_id, source.name))
         self.assertEqual(db.list_logs()[0]["result"], "accounting_pending")
@@ -1341,7 +1593,6 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertFalse(db.list_accounting_pending())
 
     def test_identical_regular_skip_delete_without_symlink_completes_accounting(self):
-        self.task["symlink_enabled"] = False
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
         source = self.source("movie.mp4", b"video")
         target = self.dst / source.name
@@ -1359,7 +1610,6 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db.list_logs()[0]["result"], "success")
 
     def test_identical_regular_skip_pending_compensates_after_restart(self):
-        self.task["symlink_enabled"] = False
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
         source = self.source("movie.mp4", b"video")
         target = self.dst / source.name
@@ -1398,7 +1648,125 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertFalse(db.list_queue())
         self.assertEqual(source.read_bytes(), b"video")
 
-    def test_untrusted_nfo_skip_does_not_authorize_later_overwrite(self):
+    def test_full_scan_backfills_douyin_nfo_after_source_deletion(self):
+        self.settings["douyin_nfo_enabled"] = True
+        video = self.source("creator/2026-05-11 7638661243377142373.mp4", b"video")
+        target = self.dst / "creator" / video.name
+        target.parent.mkdir()
+        target.write_bytes(video.read_bytes())
+        db.record_migrated(1, "creator/" + video.name, 5, str(target))
+        video.unlink()
+        real_open = open
+        reads = []
+        def observe_open(path, *args, **kwargs):
+            if path == str(target):
+                reads.append(path)
+            return real_open(path, *args, **kwargs)
+        with patch.object(scanner, "open", side_effect=observe_open, create=True):
+            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
+            self.assertEqual(reads, [])
+            self.assertEqual(scanner.scan_task(self.task, force_full=True)["enqueued"], 0)
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(scanner.scan_task(self.task, force_full=True)["enqueued"], 0)
+            self.assertEqual(len(reads), 1)
+        nfo = target.with_suffix(".nfo")
+        self.assertEqual(ET.parse(nfo).getroot().findtext("studio"), "creator")
+        self.assertFalse(video.exists())
+        self.assertEqual([row["result"] for row in db.list_logs()], ["nfo_backfilled"])
+
+    def test_full_scan_backfills_filename_nfo_and_reuses_target_poster(self):
+        self.task["filename_nfo_enabled"] = True
+        source = self.src / "author" / "Title-Author-20260511.mp4"
+        target = self.dst / "author" / source.name
+        target.parent.mkdir()
+        target.write_bytes(b"video")
+        poster = target.with_name("Title-Author-20260511-poster.jpg")
+        poster.write_bytes(b"poster")
+        db.record_migrated(1, "author/" + source.name, 5, str(target))
+        scanner.scan_task(self.task, force_full=True)
+        movie = ET.parse(target.with_suffix(".nfo")).getroot()
+        self.assertEqual(movie.findtext("title"), "Title")
+        self.assertEqual(movie.findtext("actor/name"), "Author")
+        self.assertEqual(movie.findtext("thumb"), poster.name)
+        self.assertFalse(source.exists())
+
+    def test_full_scan_backfill_skips_missing_modified_or_untrusted_targets(self):
+        self.settings["douyin_nfo_enabled"] = True
+        for name, data in (("missing.mp4", b"missing"), ("changed.mp4", b"original"),
+                           ("legacy.mp4", b"legacy")):
+            target = self.dst / name
+            if name != "missing.mp4":
+                target.write_bytes(data)
+            db.record_migrated(1, name, len(data), str(target) if target.exists() else None)
+        with db._lock, db.get_conn():
+            db.get_conn().execute("UPDATE migrated_files SET dst_sha256=NULL WHERE task_id=? AND rel_path=?",
+                                  (1, "legacy.mp4"))
+        (self.dst / "changed.mp4").write_bytes(b"modified")
+        with patch.object(douyin_nfo, "_create_nfo", wraps=douyin_nfo._create_nfo) as create:
+            scanner.scan_task(self.task, force_full=True)
+            create.assert_not_called()
+        self.assertFalse(list(self.dst.glob("*.nfo")))
+
+    def test_full_scan_backfill_io_failure_stops_scan_without_writing(self):
+        self.settings["douyin_nfo_enabled"] = True
+        target = self.dst / "clip.mp4"
+        target.write_bytes(b"video")
+        db.record_migrated(1, "clip.mp4", 5, str(target))
+        with patch.object(scanner, "open", side_effect=OSError(errno.EIO, "cloud read"), create=True):
+            with self.assertRaises(OSError) as error:
+                scanner.scan_task(self.task, force_full=True)
+        self.assertEqual(error.exception.errno, errno.EIO)
+        self.assertFalse(target.with_suffix(".nfo").exists())
+
+    def test_full_scan_backfill_waits_for_source_companion(self):
+        self.settings["douyin_nfo_enabled"] = True
+        target = self.dst / "creator" / "clip.mp4"
+        target.parent.mkdir()
+        target.write_bytes(b"video")
+        db.record_migrated(1, "creator/clip.mp4", 5, str(target))
+        original_nfo = self.source("creator/clip.nfo", b"<movie><title>downloaded</title></movie>")
+        scanner.scan_task(self.task, force_full=True)
+        self.assertFalse(target.with_suffix(".nfo").exists())
+        self.assertTrue(original_nfo.exists())
+        self.assertEqual(db.take_next_pending(claim=False)["rel_path"], "creator/clip.nfo")
+
+    def test_full_scan_backfill_uses_latest_record_and_never_overwrites_nfo(self):
+        self.settings["douyin_nfo_enabled"] = True
+        rel = "clip.mp4"
+        first = self.dst / "first" / rel
+        second = self.dst / "second" / rel
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_bytes(b"old")
+        second.write_bytes(b"newer")
+        db.record_migrated(1, rel, 3, str(first))
+        db.record_migrated(1, rel, 5, str(second))
+        second.with_suffix(".NFO").write_bytes(b"existing")
+        scanner.scan_task(self.task, force_full=True)
+        self.assertFalse(first.with_suffix(".nfo").exists())
+        self.assertEqual(second.with_suffix(".NFO").read_bytes(), b"existing")
+        self.assertNotIn("clip.nfo", os.listdir(second.parent))
+
+    def test_redownload_does_not_regenerate_already_migrated_nfo(self):
+        self.settings["douyin_nfo_enabled"] = True
+        video = self.source("clip.mp4", b"video")
+        target_video = self.dst / video.name
+        target_video.write_bytes(b"video")
+        target_nfo = self.dst / "clip.nfo"
+        target_nfo.write_bytes(b"<movie/>")
+        db.record_migrated(1, video.name, 5, str(target_video))
+        db.record_migrated(1, "clip.nfo", target_nfo.stat().st_size, str(target_nfo))
+        for _ in range(3):
+            stats = scanner.scan_task(self.task)
+            self.assertEqual(stats["enqueued"], 1 if _ == 0 else 0)
+            self.assertFalse((self.src / "clip.nfo").exists())
+            if _ == 0:
+                self.assertEqual(transfer.transfer(db.take_next_pending(claim=False), self.task)[0], "success")
+                db.clear_queue("all")
+        self.assertFalse(video.exists())
+        self.assertEqual(target_nfo.read_bytes(), b"<movie/>")
+
+    def test_verified_identical_nfo_authorizes_later_update(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
         source = self.source("new.nfo", b"<movie/>")
         target = self.dst / source.name
@@ -1410,12 +1778,14 @@ class NfoSafetyTests(unittest.TestCase):
               patch.object(worker, "_task_paths_safe", return_value=True)):
             worker._work_once()
         self.assertEqual(db.list_queue()[0]["status"], "done")
-        self.assertFalse(db.migrated_destination_matches(task_id, source.name, str(target)))
+        self.assertTrue(db.migrated_destination_matches(task_id, source.name, str(target)))
+        self.assertEqual(scanner.scan_task(dict(self.task, id=task_id))["enqueued"], 0)
         source.write_bytes(b"<new/>")
         result, _ = transfer.transfer({"src_path": str(source), "dst_path": str(target),
                                        "rel_path": source.name}, dict(self.task, id=task_id))
-        self.assertEqual(result, "conflict")
-        self.assertEqual(target.read_bytes(), b"<movie/>")
+        self.assertEqual(result, "success")
+        self.assertEqual(target.read_bytes(), b"<new/>")
+        self.assertFalse(source.exists())
 
     def test_restarted_unaccounted_missing_source_is_conflict_without_deletion(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
@@ -1473,7 +1843,7 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(scanner.scan_task(task)["enqueued"], 1)
         pending = db.list_queue()[0]
         self.assertEqual((pending["id"], pending["status"]), (conflicted["id"], "pending"))
-        self.assertEqual(pending["source_inode"], source.stat().st_ino)
+        self.assertEqual(pending["size"], source.stat().st_size)
         for _ in range(3):
             self.assertEqual(scanner.scan_task(task)["enqueued"], 0)
         self.assertEqual(db.list_queue()[0], pending)
@@ -1496,7 +1866,7 @@ class NfoSafetyTests(unittest.TestCase):
             worker._work_once()
             worker._work_once()
             self.assertEqual(db.list_queue()[1]["status"], "pending")
-            self.assertTrue(sources[2].is_symlink())
+            self.assertFalse(sources[2].exists())
             worker._work_once()
             wait.assert_called_once()
         self.assertTrue(sources[1].exists())
@@ -1611,7 +1981,7 @@ class NfoSafetyTests(unittest.TestCase):
             TaskIn(name="bad", src_dir=str(self.src), dst_dir=str(self.dst),
                    run_windows="24:00-06:00")
 
-    def test_old_queue_schema_adds_source_snapshot_without_trusting_old_done(self):
+    def test_old_queue_schema_adds_verification_columns_and_requeues_done(self):
         legacy = self.root / "old-queue.db"
         source = self.source("movie.mp4", b"video")
         target = self.dst / source.name
@@ -1630,12 +2000,34 @@ class NfoSafetyTests(unittest.TestCase):
         db.DB_PATH, db._conn = str(legacy), None
         self.task["after_action"] = "keep"
         row = db.list_queue()[0]
-        self.assertIsNone(row["source_mtime_ns"])
+        self.assertIsNone(row["verified_sha256"])
+        self.assertNotIn("source_inode", row)
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         row = db.list_queue()[0]
-        self.assertEqual(row["source_inode"], source.stat().st_ino)
+        self.assertEqual(row["size"], source.stat().st_size)
         db.set_status(row["id"], "done")
-        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 0)
+        self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+
+    def test_old_database_removes_obsolete_link_and_source_snapshot_columns(self):
+        legacy = self.root / "obsolete-columns.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, symlink_enabled INTEGER)")
+            conn.execute("""CREATE TABLE queue (
+                id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, src_path TEXT NOT NULL,
+                rel_path TEXT NOT NULL, dst_path TEXT NOT NULL, size INTEGER NOT NULL,
+                status TEXT NOT NULL, retries INTEGER NOT NULL DEFAULT 0,
+                next_retry_at REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                source_dev INTEGER, source_inode INTEGER, source_mtime_ns INTEGER,
+                UNIQUE(task_id, rel_path))""")
+        if db._conn is not None:
+            db._conn.close()
+        db.DB_PATH, db._conn = str(legacy), None
+        db.get_conn()
+        task_columns = {row[1] for row in db.get_conn().execute("PRAGMA table_info(tasks)")}
+        queue_columns = {row[1] for row in db.get_conn().execute("PRAGMA table_info(queue)")}
+        self.assertNotIn("symlink_enabled", task_columns)
+        self.assertFalse({"source_dev", "source_inode", "source_mtime_ns"} & queue_columns)
+        self.assertIn("source_sha256", queue_columns)
 
     def test_old_database_adds_destination_column(self):
         legacy = self.root / "legacy.db"

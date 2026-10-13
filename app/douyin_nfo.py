@@ -4,6 +4,7 @@
 import os
 import json
 import re
+import stat
 import errno
 import hashlib
 import tempfile
@@ -225,7 +226,7 @@ def _create_nfo(path: str, content: str) -> bool:
 
 
 def _has_nfo(video_path: str) -> bool:
-    """从实际目录检查大小写不敏感的同名 NFO（包括软链）。"""
+    """从实际目录检查大小写不敏感的同名 NFO。"""
     directory = os.path.dirname(video_path) or "."
     stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
     return any(os.path.splitext(name)[0].casefold() == stem
@@ -233,14 +234,19 @@ def _has_nfo(video_path: str) -> bool:
                for name in os.listdir(directory))
 
 
-def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") -> tuple[bool, str]:
+def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id",
+               filenames: list[str] | None = None) -> tuple[bool, str]:
     """若视频无伴生 nfo 则生成。优先 meta.json，其次文件名解析。
     返回 (是否生成, nfo路径或原因)"""
     base, ext = os.path.splitext(video_path)
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
     nfo_path = base + ".nfo"
-    if _has_nfo(video_path) or os.path.lexists(nfo_path):
+    # 扫描器已枚举该目录：复用清单，避免对每个视频重复枚举整个 NAS 目录。
+    stem = os.path.basename(base).casefold()
+    names = filenames if filenames is not None else os.listdir(os.path.dirname(video_path) or ".")
+    if any(os.path.splitext(name)[0].casefold() == stem
+           and os.path.splitext(name)[1].casefold() == ".nfo" for name in names):
         return False, "已存在 nfo"
     filename = os.path.basename(video_path)
     parent = os.path.basename(os.path.dirname(video_path))
@@ -257,6 +263,24 @@ def ensure_nfo(video_path: str, name_format_hint: str = "create_time uid id") ->
     return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
 
 
+def backfill_nfo_for_video(video_path: str, cloud_video: str,
+                           filenames: list[str] | None = None) -> tuple[bool, str]:
+    """已迁移视频缺少 NFO 时，依据原始相对文件名生成目标目录中的 NFO。"""
+    base, ext = os.path.splitext(cloud_video)
+    if ext.lower() not in VIDEO_EXTS:
+        return False, "非视频文件"
+    nfo_path = base + ".nfo"
+    names = filenames if filenames is not None else os.listdir(os.path.dirname(cloud_video) or ".")
+    stem = os.path.basename(base).casefold()
+    if any(os.path.splitext(name)[0].casefold() == stem
+           and os.path.splitext(name)[1].casefold() == ".nfo" for name in names):
+        return False, "已存在 nfo"
+    parent = os.path.basename(os.path.dirname(video_path))
+    meta = parse_filename(os.path.basename(video_path), parent_dir=parent) or {}
+    content = build_nfo(meta, nickname_fallback=parent or "未知博主")
+    return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
+
+
 def _xml_text(value: str) -> str:
     """文件名可能含有 XML 1.0 不允许的控制字符。"""
     clean = "".join(ch for ch in value if ch in "\t\n\r" or
@@ -266,13 +290,18 @@ def _xml_text(value: str) -> str:
 
 
 def ensure_filename_nfo(video_path: str, filenames: list[str],
-                        poster_filenames: list[str] | None = None) -> tuple[bool, str]:
-    """按 标题-作者-YYYYMMDD 生成 NFO；不完整时从目录和视频时间回退。"""
+                        poster_filenames: list[str] | None = None,
+                        target_path: str | None = None) -> tuple[bool, str]:
+    """按 标题-作者-YYYYMMDD 生成 NFO；可在已迁移目标侧按原文件名补齐。"""
     stem, ext = os.path.splitext(os.path.basename(video_path))
     if ext.lower() not in VIDEO_EXTS:
         return False, "非视频文件"
-    if os.path.islink(video_path) or not os.path.isfile(video_path):
-        return False, "源视频不存在或是软链"
+    actual_video = target_path or video_path
+    try:
+        if not stat.S_ISREG(os.lstat(actual_video).st_mode):
+            return False, "视频不是普通文件"
+    except FileNotFoundError:
+        return False, "视频不存在"
     parts = stem.rsplit("-", 2)
     date = None
     if (len(parts) == 3 and parts[0].strip() and parts[1].strip()
@@ -281,25 +310,30 @@ def ensure_filename_nfo(video_path: str, filenames: list[str],
             date = datetime.strptime(parts[2], "%Y%m%d").strftime("%Y-%m-%d")
         except ValueError:
             pass
-    # 同目录已有同名 NFO（包含大写扩展名/软链）时绝不抢占下载器的内容。
-    if any(os.path.splitext(name)[0].casefold() == stem.casefold()
+    # 同目录已有同名 NFO（包含大写扩展名）时绝不抢占下载器的内容。
+    target_stem = os.path.splitext(os.path.basename(actual_video))[0]
+    if any(os.path.splitext(name)[0].casefold() == target_stem.casefold()
            and os.path.splitext(name)[1].lower() == ".nfo" for name in filenames):
         return False, "已存在 nfo"
-    nfo_path = os.path.join(os.path.dirname(video_path), stem + ".nfo")
-    if os.path.lexists(nfo_path):
+    nfo_path = (os.path.splitext(target_path)[0] + ".nfo" if target_path
+                else os.path.join(os.path.dirname(video_path), stem + ".nfo"))
+    try:
+        os.lstat(nfo_path)
+    except FileNotFoundError:
+        pass
+    else:
         return False, "已存在 nfo"
     poster = next((name for name in (poster_filenames if poster_filenames is not None else filenames)
-                   if os.path.splitext(name)[0].casefold() == (stem + "-poster").casefold()
+                   if os.path.splitext(name)[0].casefold() == (target_stem + "-poster").casefold()
                    and os.path.splitext(name)[1].lower() in POSTER_EXTS
-                   and os.path.isfile(os.path.join(os.path.dirname(video_path), name))
-                   and not os.path.islink(os.path.join(os.path.dirname(video_path), name))), None)
+                   and stat.S_ISREG(os.lstat(os.path.join(os.path.dirname(actual_video), name)).st_mode)), None)
     if date is None:
         video_dir = os.path.dirname(video_path)
         title = os.path.basename(video_dir.rstrip(os.sep)) or stem
         author = os.path.basename(os.path.dirname(video_dir.rstrip(os.sep)).rstrip(os.sep)) or "未知博主"
-        stat = os.stat(video_path)
+        video_info = os.stat(actual_video)
         # macOS 等系统可提供出生时间；否则用修改时间，避免将 inode 变更时间误作创建时间。
-        created_at = getattr(stat, "st_birthtime", None) or stat.st_mtime
+        created_at = getattr(video_info, "st_birthtime", None) or video_info.st_mtime
         try:
             date = datetime.fromtimestamp(created_at).strftime("%Y-%m-%d")
         except (OverflowError, OSError, ValueError):
@@ -321,30 +355,3 @@ def ensure_filename_nfo(video_path: str, filenames: list[str],
     lines.append('</movie>')
     return ((True, nfo_path) if _create_nfo(nfo_path, "\n".join(lines) + "\n")
             else (False, "已存在 nfo"))
-
-
-def backfill_nfo_for_link(link_path: str, cloud_video: str) -> tuple[bool, str]:
-    """软链视频的 nfo 补齐：dysync 重下/时序竞态可能跳过刮削，
-    导致网盘里有视频但没 nfo。对源软链视频直接在网盘目标位置生成 nfo。
-    - link_path: 源目录软链路径（用于读取链接名与博主目录名）
-    - cloud_video: 网盘目标视频路径（nfo 写到它旁边）
-    返回 (是否生成, nfo路径或原因)"""
-    base, ext = os.path.splitext(cloud_video)
-    if ext.lower() not in VIDEO_EXTS:
-        return False, "非视频文件"
-    nfo_path = base + ".nfo"
-    if _has_nfo(cloud_video) or os.path.lexists(nfo_path):
-        return False, "已存在 nfo"
-    filename = os.path.basename(link_path)
-    parent = os.path.basename(os.path.dirname(link_path))
-
-    # 源目录若有 meta.json 优先使用（字段准确）
-    meta = _meta_from_metajson(os.path.realpath(link_path)) \
-        if os.path.isdir(os.path.dirname(os.path.realpath(link_path))) else None
-    if meta is None:
-        meta = parse_filename(filename, parent_dir=parent) or {}
-    try:
-        content = build_nfo(meta, nickname_fallback=parent or "未知博主")
-        return (True, nfo_path) if _create_nfo(nfo_path, content) else (False, "已存在 nfo")
-    except OSError as e:
-        return False, f"写入失败: {e}"

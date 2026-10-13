@@ -1,4 +1,5 @@
 """后台线程：扫描循环 + 迁移主循环（节流逐个迁移）"""
+import errno
 import hashlib
 import os
 import stat
@@ -9,7 +10,7 @@ from . import db, config, scanner, transfer
 
 
 class Scheduler:
-    FULL_SCAN_INTERVAL = 24 * 60 * 60  # 按墙上时间兜底：挂载不可靠、停机期变更及软链 NFO 巡检
+    FULL_SCAN_INTERVAL = 24 * 60 * 60  # 每日补齐历史目标视频的 NFO
 
     def __init__(self):
         self._stop = threading.Event()
@@ -20,8 +21,8 @@ class Scheduler:
         self._scan_lock = threading.Lock()
         self._requests_lock = threading.Lock()
         self.last_scan_ts = {1: time.time()}  # 防启动即触发; 各任务扫描时自动覆盖
-        self._directory_caches = {}  # task_id -> 最近成功扫描的目录快照（不存文件/软链名）
         self._last_full_scan = {}
+        self._scan_retry_at = {}  # task_id -> 扫描失败后允许再次尝试的墙上时间
         self.sync_progress = {}  # task_id -> 扫描进度
         self.current_file = None
         self.moved_today = 0
@@ -42,8 +43,8 @@ class Scheduler:
         db.reset_stuck_transferring()
         self._stop.clear()
         self.last_scan_success_at = None
-        self._directory_caches.clear()
         self._last_full_scan.clear()
+        self._scan_retry_at.clear()
         now = time.time()
         for task in db.list_tasks():
             self.last_scan_ts[task["id"]] = now
@@ -76,8 +77,7 @@ class Scheduler:
             if prog and prog.get("running"):
                 return {"ok": True, "message": "扫描进行中"}
             self.sync_progress[task_id] = {"running": True, "scanned": 0, "enqueued": 0,
-                                           "dedup_deleted": 0, "dedup_skipped": 0,
-                                           "skipped_symlink": 0, "current": "", "done": False,
+                                           "current": "", "done": False,
                                            "error": None}
             self._sync_requests.add(task_id)
         self._scan_wake.set()
@@ -94,6 +94,9 @@ class Scheduler:
             if not prog:
                 continue
             try:
+                if time.time() < self._scan_retry_at.get(task_id, 0):
+                    prog["error"] = "目录故障后冷却中，请至少等待 60 秒再同步"
+                    continue
                 task = db.get_task(task_id)
                 if task and task.get("enabled"):
                     if not self._task_paths_safe(task):
@@ -104,14 +107,15 @@ class Scheduler:
                                           progress=prog,
                                           on_dir=lambda root, n: prog.__setitem__(
                                               "scanned", prog.get("scanned", 0) + n),
-                                          directory_cache=self._directory_caches.setdefault(task_id, {}),
                                           force_full=True)
                         self._last_full_scan[task_id] = time.time()
                         self.last_scan_success_at = time.time()
+                        self._scan_retry_at.pop(task_id, None)
                 else:
                     prog["error"] = "任务不存在或已停用"
             except Exception as e:
                 self._scan_failed(e)
+                self._scan_retry_at[task_id] = time.time() + 60
                 prog["error"] = str(e)
             finally:
                 prog["done"] = True
@@ -169,23 +173,27 @@ class Scheduler:
                         if not task.get("enabled") or not self._task_paths_safe(task):
                             continue
                         interval = task.get("scan_interval") or cfg["scan_interval"]
-                        if now - self.last_scan_ts.get(task["id"], 0) < interval:
+                        if (now - self.last_scan_ts.get(task["id"], 0) < interval
+                                or now < self._scan_retry_at.get(task["id"], 0)):
                             continue
                         if self._sync_requests or not self._scan_lock.acquire(timeout=0.1):
                             break
                         try:
-                            cache = self._directory_caches.setdefault(task["id"], {})
                             full = (time.time() - self._last_full_scan.get(task["id"], 0)
                                     >= self.FULL_SCAN_INTERVAL)
-                            scanner.scan_task(task, directory_cache=cache, force_full=full)
+                            scanner.scan_task(task, force_full=full)
                             if full:
                                 self._last_full_scan[task["id"]] = time.time()
                             self.last_scan_success_at = time.time()
                         except Exception as exc:
                             self._scan_failed(exc)
+                            # 不依赖用户设置的扫描间隔，持续 EIO 最多每分钟重试一次。
+                            self._scan_retry_at[task["id"]] = time.time() + 60
+                        else:
+                            self._scan_retry_at.pop(task["id"], None)
                         finally:
+                            self.last_scan_ts[task["id"]] = time.time()
                             self._scan_lock.release()
-                        self.last_scan_ts[task["id"]] = time.time()
                     self._process_sync_requests()
                     timeout = min(5, max(1, cfg["scan_interval"] / 6))
                 except Exception as exc:
@@ -308,26 +316,20 @@ class Scheduler:
                 os.close(target_fd)
         finally:
             os.close(fd)
-        if src.lower().endswith('.nfo'):
-            if (os.path.islink(src) or not os.path.isfile(src)
+        try:
+            source_stat = os.lstat(src)
+        except FileNotFoundError:
+            if not item['verified_trusted']:
+                raise OSError('未授权目标且源文件缺失，需人工核查')
+        else:
+            expected = ((item['source_size'], item['source_sha256'])
+                        if src.lower().endswith('.nfo') else
+                        (item['verified_size'], item['verified_sha256']))
+            if (not stat.S_ISREG(source_stat.st_mode)
                     or os.path.commonpath((src_root, os.path.realpath(src))) != src_root
-                    or item['source_sha256'] is None
-                    or (os.path.getsize(src), transfer._sha256(src)) !=
-                    (item['source_size'], item['source_sha256'])):
-                raise OSError('NFO 源身份不匹配，需人工核查')
-        elif os.path.islink(src):
-            if (os.path.realpath(src) != os.path.realpath(dst)
-                    or os.path.commonpath((src_root, os.path.realpath(os.path.dirname(src)))) != src_root
-                    or item['source_sha256'] != item['verified_sha256']):
-                raise OSError('源软链身份不匹配，需人工核查')
-        elif os.path.lexists(src):
-            if (not os.path.isfile(src)
-                    or os.path.commonpath((src_root, os.path.realpath(src))) != src_root
-                    or (os.path.getsize(src), transfer._sha256(src)) !=
-                    (item['verified_size'], item['verified_sha256'])):
+                    or expected[1] is None
+                    or (source_stat.st_size, transfer._sha256(src)) != expected):
                 raise OSError('源文件身份不匹配，需人工核查')
-        elif not item['verified_trusted']:
-            raise OSError('未授权目标且源文件缺失，需人工核查')
 
     def _retry_accounting(self):
         for item in db.list_accounting_pending():
@@ -345,8 +347,14 @@ class Scheduler:
                     raise ValueError('任务路径冲突，需人工核查')
                 self._verify_accounting(item, task)
             except (OSError, ValueError) as exc:
-                self._accounting_blocked.add(item['id'])
-                self.last_accounting_error = f"记账待人工核查 ({item['id']}): {exc}"
+                if isinstance(exc, OSError) and exc.errno in (
+                        errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT,
+                        errno.EINTR, errno.EBUSY):
+                    self._accounting_retry_at[item['id']] = time.monotonic() + 60
+                    self.last_accounting_error = f"记账目标读取失败 ({item['id']}): {exc}；60s 后重试"
+                else:
+                    self._accounting_blocked.add(item['id'])
+                    self.last_accounting_error = f"记账待人工核查 ({item['id']}): {exc}"
                 print(self.last_accounting_error, flush=True)
                 continue
             try:
@@ -364,7 +372,10 @@ class Scheduler:
         self._retry_accounting()
         task_map = {t["id"]: t for t in db.list_tasks()}
         now = time.monotonic()
+        # 扫描已发现该任务目录故障时，不仅延迟下次扫描，也暂停其迁移写入。
+        # 即使冷却时间到了，也须先完成一次成功扫描才能解除暂停。
         eligible = [tid for tid, task in task_map.items() if task.get("enabled")
+                    and tid not in self._scan_retry_at
                     and now >= self._next_eligible.get(tid, 0)
                     and self._in_run_window(task) and self._task_paths_safe(task)]
         item = db.take_next_pending(eligible)
@@ -387,16 +398,24 @@ class Scheduler:
         started = time.monotonic()
         try:
             # 无持久化凭证的 transferring 重启后回退；已删源不可重传或盲目补记。
-            if (not os.path.lexists(item["src_path"])
-                    or (os.path.islink(item["src_path"])
-                        and not item["src_path"].lower().endswith(".nfo"))):
-                result, detail = "conflict", "源文件缺失或是软链占位，可能迁移成功但记账丢失；需人工核查目标与记录"
+            transient_source_io = False
+            try:
+                source_stat = os.lstat(item["src_path"])
+            except FileNotFoundError:
+                result, detail = "conflict", "源文件缺失，可能迁移成功但记账丢失；需人工核查目标与记录"
+            except OSError as exc:
+                transient_source_io = exc.errno in (
+                    errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY)
+                result, detail = "failed", f"源路径读取失败，已保留待重试: {exc}"
             else:
-                try:
-                    result, detail = transfer.transfer(item, task)
-                except Exception as exc:
-                    traceback.print_exc()
-                    result, detail = "failed", f"迁移异常: {exc}"
+                if not stat.S_ISREG(source_stat.st_mode):
+                    result, detail = "conflict", "源不是普通文件，可能是历史残留；需人工核查目标与记录"
+                else:
+                    try:
+                        result, detail = transfer.transfer(item, task)
+                    except Exception as exc:
+                        traceback.print_exc()
+                        result, detail = "failed", f"迁移异常: {exc}"
             duration_ms = int((time.monotonic() - started) * 1000)
             if result == "success":
                 self.moved_today += 1
@@ -421,6 +440,13 @@ class Scheduler:
             elif result == "conflict":
                 db.set_status(item["id"], "conflict")
             elif result == "failed":
+                if transient_source_io:
+                    # 源目录 EIO 不消耗迁移重试额度，需成功扫描后才恢复同任务写入。
+                    self._scan_retry_at[task["id"]] = time.time() + 60
+                    db.set_status(item["id"], "failed", next_retry_at=time.time() + 60)
+                    detail += "；源目录故障，60s 后限速探测恢复"
+                    self._log(item, duration_ms, "failed", detail)
+                    return
                 retries = item.get("retries", 0) + 1
                 cfg = config.get()
                 detail = f"[第{retries}次尝试] {detail}"
