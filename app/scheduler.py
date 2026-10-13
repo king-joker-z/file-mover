@@ -30,6 +30,7 @@ class Scheduler:
         self.started_at = time.time()
         self.last_scan_error = None
         self.last_scan_error_at = None
+        self._last_scan_error_task_id = None
         self.last_scan_success_at = None
         self.last_worker_error = None
         self._next_eligible = {}  # task_id -> monotonic deadline
@@ -110,11 +111,12 @@ class Scheduler:
                                           force_full=True)
                         self._last_full_scan[task_id] = time.time()
                         self.last_scan_success_at = time.time()
+                        self._scan_succeeded(task_id)
                         self._scan_retry_at.pop(task_id, None)
                 else:
                     prog["error"] = "任务不存在或已停用"
             except Exception as e:
-                self._scan_failed(e)
+                self._scan_failed(e, task_id)
                 self._scan_retry_at[task_id] = time.time() + 60
                 prog["error"] = str(e)
             finally:
@@ -185,8 +187,9 @@ class Scheduler:
                             if full:
                                 self._last_full_scan[task["id"]] = time.time()
                             self.last_scan_success_at = time.time()
+                            self._scan_succeeded(task["id"])
                         except Exception as exc:
-                            self._scan_failed(exc)
+                            self._scan_failed(exc, task["id"])
                             # 不依赖用户设置的扫描间隔，持续 EIO 最多每分钟重试一次。
                             self._scan_retry_at[task["id"]] = time.time() + 60
                         else:
@@ -207,10 +210,18 @@ class Scheduler:
                         prog.update(running=False, done=True, error="扫描线程已退出，请重启服务")
                 self._sync_requests.clear()
 
-    def _scan_failed(self, exc):
+    def _scan_failed(self, exc, task_id=None):
         traceback.print_exception(type(exc), exc, exc.__traceback__)
-        self.last_scan_error = str(exc)
+        self.last_scan_error = (f"任务 {task_id}: {exc}" if task_id is not None else str(exc))
         self.last_scan_error_at = time.time()
+        self._last_scan_error_task_id = task_id
+
+    def _scan_succeeded(self, task_id):
+        # 仅同一任务的成功扫描可解除它的旧告警，其他任务的成功不能掩盖故障。
+        if self._last_scan_error_task_id == task_id:
+            self.last_scan_error = None
+            self.last_scan_error_at = None
+            self._last_scan_error_task_id = None
 
     def _task_paths_safe(self, task):
         from .main import validate_task_paths

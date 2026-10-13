@@ -30,6 +30,11 @@ def _signature(info):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
+def _scan_io_error(action: str, path: str, error: OSError) -> OSError:
+    """保留 errno 和实际路径，并说明扫描时失败的文件系统操作。"""
+    return OSError(error.errno, f"{action}: {error.strerror or error}", error.filename or path)
+
+
 def _stable(path: str, wait: int) -> bool:
     """校验本轮首采样与当前 size/mtime/inode；I/O 故障不能伪装成不稳定。"""
     context = _scan_samples.get()
@@ -41,6 +46,8 @@ def _stable(path: str, wait: int) -> bool:
         current = os.lstat(path)
     except FileNotFoundError:
         return False
+    except OSError as error:
+        raise _scan_io_error("复查文件状态失败", path, error) from error
     if not stat.S_ISREG(current.st_mode):
         return False
     first = samples.get(path)
@@ -166,6 +173,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
         source_info = os.stat(src)
     except FileNotFoundError:
         return stats
+    except OSError as error:
+        raise _scan_io_error("读取源目录状态失败", src, error) from error
     if not stat.S_ISDIR(source_info.st_mode):
         return stats
     includes = _parse_patterns(task.get("include_patterns"))
@@ -181,9 +190,13 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
     # 先收集整轮目录和首采样，统一等待一次；不对每个文件或每层目录 sleep。
     # 完整收集目录后才入队；目录枚举失败不能被当作空目录。
     def raise_walk_error(error):
-        raise error
-    directories = [(root, files) for root, _dirs, files in os.walk(
-        src, onerror=raise_walk_error)]
+        raise _scan_io_error("枚举目录失败", error.filename or src, error) from error
+    directories = []
+    for root, dirs, files in os.walk(src, onerror=raise_walk_error):
+        # 明确排除的目录在进入前剪枝；未排除的目录故障仍必须中断扫描。
+        dirs[:] = [name for name in dirs if not _match_any(
+            os.path.relpath(os.path.join(root, name), src), name, excludes)]
+        directories.append((root, files))
     samples = {}
     for root, files in directories:
         for name in files:
@@ -200,6 +213,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                 samples[path] = _signature(info)
             except FileNotFoundError:
                 continue
+            except OSError as error:
+                raise _scan_io_error("首次读取文件状态失败", path, error) from error
     if not directories:
         if force_full and (filename_nfo_enabled or douyin_nfo_enabled):
             _backfill_migrated_nfo(task, filename_nfo_enabled, initial_device)
@@ -300,6 +315,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                 current_signature = _signature(os.lstat(full))
             except FileNotFoundError:
                 continue
+            except OSError as error:
+                raise _scan_io_error("末次读取文件状态失败", full, error) from error
             # 本轮首采样与末次校验必须仍是同一文件。
             if samples.get(full) != current_signature:
                 continue

@@ -115,7 +115,7 @@ input:checked+.slider:before{transform:translateX(16px)}
           <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" max="86400" value="5"></div>
           <div class="field small"><label>扫描间隔（秒，0=全局）</label><input id="f-scan" type="number" min="0" max="86400" value="0"></div>
           <div class="field"><label>包含（通配，逗号分隔，空=全部）</label><input id="f-inc" placeholder="*.mp4, *.jpg"></div>
-          <div class="field"><label>排除（通配）</label><input id="f-exc" placeholder="*.tmp"></div>
+          <div class="field"><label>排除（文件/目录通配；排除目录后不进入扫描）</label><input id="f-exc" placeholder="B站/投稿/然然前辈, *.tmp"></div>
         </div>
         <div class="row">
           <div class="field"><label>运行周期（可多段，逗号分隔，留空=全天运行）</label>
@@ -207,7 +207,7 @@ let curQueueFilter="";
 $$(".tabs button").forEach(b=>b.onclick=()=>{
   $$(".tabs button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
   ["dash","tasks","queue","logs","settings","browse"].forEach(t=>{const el=$("#tab-"+t);if(el)el.style.display=t===b.dataset.tab?"":"none";});
-  if(b.dataset.tab==="browse")browseTo("");
+  if(b.dataset.tab==="browse")browseTo(browseRel);
   if(b.dataset.tab==="tasks")loadTasks();
   if(b.dataset.tab==="queue")loadQueue();
   if(b.dataset.tab==="logs")loadLogs();
@@ -540,11 +540,15 @@ $("#settings-form").onsubmit=async e=>{
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(n){if(!n)return"-";const u=["B","KB","MB","GB"];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return n.toFixed(1)+u[i];}
 
-let browseRel="";
-function browseTo(rel, isRetry){
+let browseRel="", browseRequestId=0;
+function browseTo(rel){
   browseRel=rel||"";
-  api("/api/browse"+(browseRel?"?rel="+encodeURIComponent(browseRel):"")).then(d=>{
-    $("#browse-crumb").textContent="当前: /"+(d.rel||"");
+  const requestedRel=browseRel, requestId=++browseRequestId;
+  $("#browse-crumb").textContent="当前: /"+requestedRel;
+  api("/api/browse"+(requestedRel?"?rel="+encodeURIComponent(requestedRel):"")).then(d=>{
+    if(requestId!==browseRequestId)return;
+    browseRel=d.rel||"";
+    $("#browse-crumb").textContent="当前: /"+browseRel;
     const box=$("#browse-list");
     if(!d.items.length){box.innerHTML='<div class="empty">空目录</div>';return;}
     box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th></tr>`+
@@ -561,8 +565,9 @@ function browseTo(rel, isRetry){
       tr.onclick=()=>browseTo(decodeURIComponent(tr.dataset.rel));
     });
   }).catch(e=>{
-    if(browseRel && !isRetry){ return browseTo("", true); }  // 失败回退根
-    $("#browse-list").innerHTML='<div class="empty">'+esc(e.message)+'</div>';
+    if(requestId!==browseRequestId)return;
+    $("#browse-list").innerHTML='<div class="empty">加载目录失败: '+esc(e.message)+' <button class="btn small gray" id="browse-retry">重试</button></div>';
+    $("#browse-retry").onclick=()=>browseTo(browseRel);
   });
 }
 function browseUp(){browseTo(browseRel.split("/").slice(0,-1).join(""));}

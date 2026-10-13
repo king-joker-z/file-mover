@@ -238,22 +238,45 @@ class NfoSafetyTests(unittest.TestCase):
 
         def flaky_scandir(path):
             if os.fspath(path) == str(broken):
-                raise OSError(errno.EIO, "directory iteration failed")
+                raise OSError(errno.EIO, "directory iteration failed", str(broken))
             return original_scandir(path)
 
         with patch.object(scanner.os, "scandir", side_effect=flaky_scandir):
             with self.assertRaises(OSError) as error:
                 scanner.scan_task(self.task, force_full=True)
         self.assertEqual(error.exception.errno, errno.EIO)
+        self.assertIn("枚举目录失败", str(error.exception))
+        self.assertIn(str(broken), str(error.exception))
         self.assertFalse(db.list_queue())
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
         self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(source))
+
+    def test_explicitly_excluded_unreadable_directory_allows_other_files(self):
+        healthy = self.source("healthy/video.mp4", b"video")
+        broken = self.src / "B站" / "投稿" / "然然前辈"
+        broken.mkdir(parents=True)
+        original_scandir = scanner.os.scandir
+
+        def flaky_scandir(path):
+            if os.fspath(path) == str(broken):
+                raise OSError(errno.EIO, "directory iteration failed", str(broken))
+            return original_scandir(path)
+
+        with patch.object(scanner.os, "scandir", side_effect=flaky_scandir):
+            with self.assertRaises(OSError):
+                scanner.scan_task(self.task)
+            self.assertFalse(db.list_queue())
+            self.task["exclude_patterns"] = "B站/投稿/然然前辈"
+            self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
+        self.assertEqual(db.take_next_pending(claim=False)["src_path"], str(healthy))
 
     def test_source_root_eio_is_not_reported_as_empty_successful_scan(self):
         with patch.object(scanner.os, "stat", side_effect=OSError(errno.EIO, "unreadable root")):
             with self.assertRaises(OSError) as error:
                 scanner.scan_task(self.task)
         self.assertEqual(error.exception.errno, errno.EIO)
+        self.assertIn("读取源目录状态失败", str(error.exception))
+        self.assertIn(str(self.src), str(error.exception))
 
     def test_file_metadata_eio_aborts_scan_before_queue_commit(self):
         first = self.source("a.mp4", b"first")
@@ -269,6 +292,8 @@ class NfoSafetyTests(unittest.TestCase):
             with self.assertRaises(OSError) as error:
                 scanner.scan_task(self.task)
         self.assertEqual(error.exception.errno, errno.EIO)
+        self.assertIn("首次读取文件状态失败", str(error.exception))
+        self.assertIn(str(first), str(error.exception))
         self.assertFalse(db.list_queue())
         self.assertEqual(second.read_bytes(), b"second")
 
@@ -1417,18 +1442,29 @@ class NfoSafetyTests(unittest.TestCase):
             worker.sync_now(1)
             worker._process_sync_requests()
         self.assertEqual(worker.sync_progress[1]["error"], "scan failed")
+        self.assertEqual(worker.stats()["last_scan_error"], "任务 1: scan failed")
         self.assertEqual((worker.sync_progress[1]["running"], worker.sync_progress[1]["done"]),
                          (False, True))
         with patch.object(db, "queue_stats", return_value={}):
             self.assertFalse(worker.stats()["scanner_alive"])
-            self.assertEqual(worker.stats()["last_scan_error"], "scan failed")
+            self.assertEqual(worker.stats()["last_scan_error"], "任务 1: scan failed")
         with patch.object(config, "get", side_effect=OSError("stats config unavailable")):
             snapshot = worker.stats()
         self.assertEqual(snapshot["stats_error"], "stats config unavailable")
-        self.assertEqual(snapshot["last_scan_error"], "scan failed")
+        self.assertEqual(snapshot["last_scan_error"], "任务 1: scan failed")
         worker._threads = [threading.Thread(name="fm-scanner")]
         self.assertFalse(worker.sync_now(2)["ok"])
         self.assertNotIn(2, worker.sync_progress)
+
+    def test_scan_warning_clears_only_after_same_task_recovers(self):
+        worker = scheduler.Scheduler()
+        with patch("app.scheduler.traceback.print_exception"):
+            worker._scan_failed(OSError(errno.EIO, "directory failed"), task_id=1)
+        worker._scan_succeeded(2)
+        self.assertIn("任务 1", worker.last_scan_error)
+        worker._scan_succeeded(1)
+        self.assertIsNone(worker.last_scan_error)
+        self.assertIsNone(worker.last_scan_error_at)
 
     def test_successful_transfer_accounting_failure_is_not_retried_as_transfer(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
