@@ -2025,6 +2025,8 @@ class NfoSafetyTests(unittest.TestCase):
             self.assertEqual(child.json()["root"], str(self.src.resolve()))
             parent = client.get("/api/browse", params={"rel": "B站/投稿"}, headers=headers)
             self.assertEqual(parent.status_code, 200)
+            self.assertEqual(parent.json()["rel"], "B站/投稿")
+            self.assertEqual(parent.json()["path"], str(self.src.resolve() / "B站" / "投稿"))
             self.assertIn("然然前辈", [item["name"] for item in parent.json()["items"]])
             original_iterdir = Path.iterdir
 

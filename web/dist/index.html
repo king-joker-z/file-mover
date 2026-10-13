@@ -562,7 +562,8 @@ $("#settings-form").onsubmit=async e=>{
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(n){if(!n)return"-";const u=["B","KB","MB","GB"];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return n.toFixed(1)+u[i];}
 
-let browseRel="", browseRequestId=0;
+let browseRel="", browseNavRel="", browseRoot="", browseRequestId=0;
+function browsePath(root, rel){return root.replace(/\/+$/,"")+(rel?"/"+rel:(root==="/"?"/":""));}
 function browseCrumb(root, rel){
   const parts=rel?rel.split("/"):[], links=[{name:root,rel:""}];
   parts.forEach((name,i)=>links.push({name,rel:parts.slice(0,i+1).join("/")}));
@@ -571,11 +572,14 @@ function browseCrumb(root, rel){
 }
 function browseTo(rel){
   const requestedRel=rel||"", requestId=++browseRequestId;
+  browseNavRel=requestedRel;
   $("#browse-error").textContent="";
   api("/api/browse"+(requestedRel?"?rel="+encodeURIComponent(requestedRel):"")).then(d=>{
     if(requestId!==browseRequestId)return;
+    browseRoot=d.root;
     browseRel=d.rel||"";
-    browseCrumb(d.root,browseRel);
+    browseNavRel=browseRel;
+    browseCrumb(browseRoot,browseRel);
     const box=$("#browse-list");
     if(!d.items.length){box.innerHTML='<div class="empty">空目录</div>';return;}
     box.innerHTML=`<table><tr><th>类型</th><th>名称</th><th>大小</th></tr>`+
@@ -594,11 +598,14 @@ function browseTo(rel){
   }).catch(e=>{
     if(requestId!==browseRequestId)return;
     const error=$("#browse-error");
-    error.innerHTML='加载 /'+esc(requestedRel)+' 失败: '+esc(e.message)+' <button type="button" class="btn small gray">重试该目录</button>';
-    error.querySelector("button").onclick=()=>browseTo(requestedRel);
+    const attempted=browseRoot?browsePath(browseRoot,requestedRel):"/"+requestedRel;
+    const current=browseRoot?browsePath(browseRoot,browseRel):"/"+browseRel;
+    error.innerHTML='尝试加载：'+esc(attempted)+'<br>失败原因：'+esc(e.message)+'<br>当前仍在：'+esc(current)+' <button type="button" class="btn small gray" data-action="retry">重试该目录</button> <button type="button" class="btn small gray" data-action="up">再上一级</button>';
+    error.querySelector('[data-action="retry"]').onclick=()=>browseTo(requestedRel);
+    error.querySelector('[data-action="up"]').onclick=browseUp;
   });
 }
-function browseUp(){browseTo(browseRel.split("/").slice(0,-1).join(""));}
+function browseUp(){browseTo(browseNavRel.split("/").slice(0,-1).join("/"));}
 loadDash();setInterval(loadDash,3000);
 </script>
 </body>
