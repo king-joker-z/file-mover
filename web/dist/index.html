@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>File Mover</title>
+<title>File Mover · 文件迁移控制台</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4f6ef7;--ok:#22a06b;--warn:#e68a00;--err:#d64545;--text:#2c3345;--muted:#8a93a6;--border:#e6e9f0}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -56,14 +56,28 @@ input:checked+.slider:before{transform:translateX(16px)}
 .dir-item{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px}
 .dir-item:hover{background:#f4f6fb}
 .dir-item.sel{background:#e3ecff}
-.sync-error:not(:empty){display:block;color:var(--err);font-size:12px;margin-top:4px;max-width:220px;white-space:normal;word-break:break-word}
+.sync-error:not(:empty),.sync-status:not(:empty){display:block;font-size:12px;margin-top:4px;max-width:220px;white-space:normal;word-break:break-word}
+.sync-error{color:var(--err)}.sync-status{color:var(--muted)}
 .status-warnings{color:var(--warn);font-size:12px;line-height:1.6;white-space:pre-line;word-break:break-word;margin-top:6px}
 .status-warnings:empty{display:none}
+/* Console visual system */
+:root{--bg:#f2f5f8;--card:#fff;--primary:#2563eb;--ok:#0e9f6e;--warn:#c47712;--err:#d64752;--text:#17283e;--muted:#67788f;--border:#e4eaf2}
+body{background:radial-gradient(circle at 90% -15%,#dce9ff 0,transparent 42%),var(--bg);line-height:1.5}
+.container{max-width:1280px;padding:28px 32px 64px}
+.site-header{display:flex;align-items:center;gap:14px;margin-bottom:26px}.brand-mark{width:44px;height:44px;border-radius:14px;background:linear-gradient(145deg,#1744a0,#3984ee);color:#fff;display:grid;place-items:center;font-size:26px;box-shadow:0 8px 20px #2366ce32}.brand-copy{min-width:0}.brand-copy h1{margin:0;font-size:20px;letter-spacing:-.04em}.brand-copy h1 span{font-size:9px;letter-spacing:.14em;color:var(--primary);background:#e8f0ff;padding:5px 7px;border-radius:5px;vertical-align:middle;margin-left:5px}.brand-copy p{font-size:12px;color:var(--muted)}.token-btn{margin-left:auto}
+.tabs{border:1px solid var(--border);background:#fff;border-radius:12px;padding:5px;gap:4px;margin-bottom:24px;box-shadow:0 4px 16px #1b3d6810;overflow-x:auto;white-space:nowrap}.tabs button{border:0;margin:0;border-radius:8px;padding:9px 17px;font-weight:600;transition:background .18s,color .18s}.tabs button.active{background:#eaf1ff;color:#1854bc}.tabs button:hover:not(.active){color:var(--text);background:#f5f7fb}
+.dash-intro{display:flex;justify-content:space-between;align-items:end;gap:12px;margin:5px 0 22px}.dash-intro h2{font-size:27px;letter-spacing:-.035em;margin:3px 0 3px}.dash-intro p,.panel-heading p{color:var(--muted);font-size:13px}.eyebrow{font-size:10px;font-weight:800;letter-spacing:.14em;color:var(--primary)}.live-badge{white-space:nowrap;font-size:12px;font-weight:600;color:var(--ok);background:#e5f8f0;border-radius:50px;padding:7px 12px}.live-badge i{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:4px}
+.cards{grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-bottom:22px}.stat,.panel{border:1px solid var(--border);background:var(--card);box-shadow:0 7px 26px #273a5610}.stat{border-radius:14px;padding:20px 19px;min-height:112px;position:relative;overflow:hidden}.stat:before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:var(--primary);opacity:.65}.stat.green:before{background:var(--ok)}.stat.orange:before{background:var(--warn)}.stat .num{font-size:31px;letter-spacing:-.05em;font-variant-numeric:tabular-nums}.stat .lbl{font-size:12px;margin-top:7px}.panel{border-radius:16px;padding:22px;margin-bottom:20px}.panel h2{font-size:17px;margin:0 0 14px}.panel-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:20px}.panel-heading h2{margin:2px 0}.panel-hint{color:var(--muted);font-size:11px;background:#f3f6fa;padding:7px 11px;border-radius:8px}
+.scan-panel{padding:24px}.scan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:14px}.scan-card{min-width:0;border:1px solid var(--border);border-radius:13px;background:linear-gradient(150deg,#fff,#fafcff);padding:18px;display:flex;flex-direction:column;min-height:270px;transition:transform .18s,box-shadow .18s}.scan-card:hover{transform:translateY(-2px);box-shadow:0 10px 26px #24477914}.scan-card-top{display:flex;justify-content:space-between;align-items:center}.scan-symbol{width:30px;height:30px;border-radius:9px;background:#eaf1ff;color:var(--primary);font-size:22px;text-align:center;line-height:28px}.scan-state{font-weight:600;border-radius:20px;padding:4px 9px}.scan-state.scheduled{background:#e7f8f1;color:var(--ok)}.scan-state.manual,.scan-state.scanning{background:#e8f0ff;color:var(--primary)}.scan-state.cooldown{background:#fff2df;color:var(--warn)}.scan-state.disabled{background:#edf0f5;color:var(--muted)}.scan-card h3{font-size:17px;line-height:1.4;margin:13px 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scan-path{color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scan-path span{color:var(--primary);margin:0 3px}.scan-divider{height:1px;background:var(--border);margin:16px 0 12px}.scan-caption{font-size:11px;color:var(--muted)}.countdown{font-size:27px;font-weight:750;letter-spacing:-.035em;font-variant-numeric:tabular-nums;margin:3px 0;color:var(--text)}.scan-detail{font-size:11px;color:var(--muted);margin-bottom:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scan-trigger{margin-top:auto;width:100%;padding:10px}.scan-card .sync-error:not(:empty),.scan-card .sync-status:not(:empty){max-width:none;white-space:normal;margin-top:8px}
+.btn{border-radius:8px;font-weight:600;transition:transform .15s,filter .15s,background .15s}.btn:not(:disabled):hover{filter:brightness(.94);transform:translateY(-1px)}.btn.gray{background:#eef3fa;color:#345270}.btn.red{background:#d85460}.btn.green{background:#128965}.btn:focus-visible,.tabs button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f7f9fc;color:#62758b;font-weight:700}tr:last-child td{border-bottom:none}tr:hover td{background:#fbfcff}table{min-width:700px}.panel:has(table){overflow-x:auto}.filters button{border-radius:8px;padding:7px 12px}.filters button.active{background:#eaf1ff}.field{min-width:190px}form input,form select{border-radius:8px;padding:10px 12px;background:#fff;color:var(--text)}form input:focus,form select:focus{border-color:var(--primary);outline:3px solid #2563eb20}form .row{gap:16px;margin-bottom:18px}.current{font-size:14px;color:var(--text);font-weight:600;margin-bottom:6px}.log-detail{line-height:1.6}.empty{padding:42px 20px;background:#f8fafd;border-radius:10px;grid-column:1/-1}
+@media(max-width:850px){.container{padding:18px 16px 40px}.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.panel-hint{display:none}}
+@media(max-width:570px){.site-header{margin-bottom:18px}.brand-copy h1 span{display:none}.tabs button{padding:9px 12px}.dash-intro{align-items:flex-start}.dash-intro h2{font-size:23px}.dash-intro p{max-width:235px}.live-badge{font-size:10px}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{padding:14px;min-height:96px}.stat .num{font-size:25px}.panel{padding:16px}.scan-panel{padding:16px}.scan-grid{grid-template-columns:minmax(0,1fr)}.field,.field.small{min-width:100%;flex:1}form .row{gap:11px}}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1><span class="dot"></span>File Mover <span style="font-size:12px;color:var(--muted)">本地文件 → 网盘 定期迁移</span><button class="btn small gray" style="margin-left:auto" onclick="if(setApiToken())loadDash()">API Token</button></h1>
+  <header class="site-header"><div class="brand-mark" aria-hidden="true">↗</div><div class="brand-copy"><h1>File Mover <span>CONTROL CENTER</span></h1><p>本地文件 → 网盘 · 安全迁移控制台</p></div><button class="btn small gray token-btn" onclick="if(setApiToken())loadDash()">API Token</button></header>
   <div class="tabs">
     <button class="active" data-tab="dash">仪表盘</button>
     <button data-tab="tasks">任务管理</button>
@@ -75,6 +89,7 @@ input:checked+.slider:before{transform:translateX(16px)}
 
   <!-- 仪表盘 -->
   <div id="tab-dash">
+    <div class="dash-intro"><div><span class="eyebrow">OVERVIEW / 实时概览</span><h2>迁移运行台</h2><p>掌握扫描节奏、队列状态和每个任务的下一步动作。</p></div><span class="live-badge"><i></i> 每 3 秒更新</span></div>
     <div class="cards">
       <div class="stat green"><div class="num" id="s-moved">0</div><div class="lbl">今日已迁移</div></div>
       <div class="stat"><div class="num" id="s-pending">0</div><div class="lbl">待迁移</div></div>
@@ -82,7 +97,8 @@ input:checked+.slider:before{transform:translateX(16px)}
       <div class="stat orange"><div class="num" id="s-conflict">0</div><div class="lbl">冲突</div></div>
       <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">累计完成</div></div>
     </div>
-    <div class="panel"><h2>当前状态</h2><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div><button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button></div>
+    <div class="panel scan-panel"><div class="panel-heading"><div><span class="eyebrow">SCAN SCHEDULE</span><h2>扫描计划</h2><p>按配置展示下一次扫描；倒计时每秒更新，可单独立即触发全量扫描。</p></div><span class="panel-hint">手动扫描不会中断正在进行的迁移</span></div><div id="dash-scan-list" class="scan-grid"><div class="empty">加载扫描计划中…</div></div></div>
+    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">SYSTEM STATUS</span><h2>运行状态</h2></div></div><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div><button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button></div>
   </div>
 
   <!-- 任务管理 -->
@@ -208,6 +224,7 @@ let curQueueFilter="";
 $$(".tabs button").forEach(b=>b.onclick=()=>{
   $$(".tabs button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
   ["dash","tasks","queue","logs","settings","browse"].forEach(t=>{const el=$("#tab-"+t);if(el)el.style.display=t===b.dataset.tab?"":"none";});
+  if(b.dataset.tab==="dash")loadDash();
   if(b.dataset.tab==="browse")browseTo(browseRel);
   if(b.dataset.tab==="tasks")loadTasks();
   if(b.dataset.tab==="queue")loadQueue();
@@ -243,15 +260,64 @@ async function api(path,opts={}){
   return r.json();
 }
 
+let scanSchedules=[],serverClockOffset=0,dashBusy=false;
+function formatCountdown(seconds){
+  const n=Math.ceil(Math.max(0,seconds)), h=Math.floor(n/3600), m=Math.floor(n%3600/60), s=n%60;
+  return h?`${h}小时 ${String(m).padStart(2,"0")}分 ${String(s).padStart(2,"0")}秒`:`${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+}
+function tickScanCountdowns(){
+  document.querySelectorAll("[data-countdown-id]").forEach(el=>{
+    const entry=scanSchedules.find(s=>s.id===Number(el.dataset.countdownId));
+    if(!entry)return;
+    if(entry.status==="disabled")el.textContent="已停用";
+    else if(entry.status==="manual")el.textContent="手动扫描中";
+    else if(entry.status==="scanning")el.textContent="定时扫描中";
+    else if(entry.next_scan_at==null)el.textContent="等待调度";
+    else{
+      const remaining=entry.next_scan_at-(Date.now()/1000-serverClockOffset);
+      el.textContent=remaining<=0?"等待调度":formatCountdown(remaining);
+    }
+  });
+}
+function renderScanSchedules(){
+  const box=$("#dash-scan-list");
+  if(!scanSchedules.length){box.innerHTML='<div class="empty">暂无任务 · 前往任务管理创建第一个迁移任务</div>';return;}
+  box.innerHTML=scanSchedules.map(s=>{
+    const label={disabled:"已停用",manual:"手动扫描",scanning:"定时扫描",cooldown:"故障冷却",scheduled:"运行中"}[s.status]||"等待中";
+    const active=s.status==="manual"||s.status==="scanning";
+    const detail=active?`${s.current||"扫描准备中"} · 已发现 ${s.scanned} · 新入队 ${s.enqueued}`:
+      s.status==="cooldown"?"源目录故障后等待重试":`扫描间隔 ${s.interval_seconds} 秒 · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
+    return `<article class="scan-card"><div class="scan-card-top"><div class="scan-symbol" aria-hidden="true">↻</div><span class="tag scan-state ${esc(s.status)}">${label}</span></div>
+      <h3 title="${esc(s.name)}">${esc(s.name)}</h3><div class="scan-path" title="${esc(s.src_dir)}">${esc(s.src_dir)} <span>→</span> ${esc(s.dst_dir)}</div>
+      <div class="scan-divider"></div><div class="scan-caption">${s.status==="cooldown"?"下次尝试":s.status==="disabled"?"扫描状态":"距下次扫描"}</div>
+      <div class="countdown" data-countdown-id="${s.id}">—</div><div class="scan-detail" title="${esc(detail)}">${esc(detail)}</div>
+      <button class="btn scan-trigger" data-sync-id="${s.id}" onclick="syncNow(${s.id})" ${!s.enabled||active||s.status==="cooldown"?"disabled":""}>${s.status==="disabled"?"任务已停用":s.status==="cooldown"?"冷却中":active?"扫描中…":"立即扫描"}</button>
+      <div class="sync-error" data-sync-error="${s.id}" role="alert"></div><div class="sync-status" data-sync-status="${s.id}" role="status"></div></article>`;
+  }).join("");
+  tickScanCountdowns();
+  scanSchedules.forEach(s=>updateSyncBtn(s.id));
+}
 async function loadDash(){
+  if(dashBusy)return;
+  dashBusy=true;
   try{
     const d=await api("/api/dashboard");
+    serverClockOffset=Date.now()/1000-d.server_time;
+    scanSchedules=d.scan_schedules||[];
+    scanSchedules.forEach(s=>{
+      if(s.status==="manual" && !syncUI[s.id]?.running){
+        syncUI[s.id]={running:true,starting:false,scanned:s.scanned,enqueued:s.enqueued,current:s.current||"",error:null,finished:false};
+        pollSyncProgress();
+      }
+    });
+    renderScanSchedules();
     $("#s-moved").textContent=d.moved_today;$("#s-pending").textContent=d.pending;
     $("#s-failed").textContent=d.failed;$("#s-conflict").textContent=d.conflict;$("#s-done").textContent=d.done;
     $("#current-file").textContent=d.current_file?("迁移中: "+d.current_file):"空闲";
     const h=Math.floor(d.uptime_seconds/3600),m=Math.floor(d.uptime_seconds%3600/60);
-    $("#uptime").textContent=`已运行 ${h}小时${m}分钟 · 扫描间隔 ${d.settings.scan_interval}s`;
+    $("#uptime").textContent=`已运行 ${h}小时${m}分钟 · 全局扫描间隔 ${d.settings?.scan_interval??"—"}s`;
     const warnings=[];
+    if(d.stats_error)warnings.push("状态数据读取失败: "+d.stats_error);
     if(d.scanner_alive===false)warnings.push("扫描线程已停止，请重启服务");
     if(d.worker_alive===false)warnings.push("迁移线程已停止，请重启服务");
     if(d.last_scan_error)warnings.push("最近扫描异常: "+d.last_scan_error);
@@ -260,7 +326,8 @@ async function loadDash(){
     const excludeBtn=$("#exclude-error-dir");
     excludeBtn.style.display=d.last_scan_error_path && d.last_scan_error_task_id!=null && d.last_scan_error?.includes("枚举目录失败")?"":"none";
     excludeBtn.onclick=()=>prepareExcludeDir(d.last_scan_error_task_id,d.last_scan_error_path);
-  }catch(e){$("#current-file").textContent=e.message;$("#status-warnings").textContent="";$("#exclude-error-dir").style.display="none";}
+  }catch(e){$("#current-file").textContent=e.message;$("#status-warnings").textContent="";$("#exclude-error-dir").style.display="none";$("#dash-scan-list").innerHTML='<div class="empty">扫描计划加载失败：'+esc(e.message)+'</div>';scanSchedules=[];}
+  finally{dashBusy=false;}
 }
 
 async function prepareExcludeDir(taskId, path){
@@ -295,6 +362,7 @@ async function loadTasks(){
         <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
         <button class="btn small green" data-sync-id="${t.id}" onclick="syncNow(${t.id})">立即同步</button>
         <span class="sync-error" data-sync-error="${t.id}" role="alert"></span>
+        <span class="sync-status" data-sync-status="${t.id}" role="status"></span>
         <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
     tasks.forEach(t=>updateSyncBtn(t.id));
   }catch(e){}
@@ -423,43 +491,61 @@ $("#task-form").onsubmit=async e=>{
       await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     }
   }catch(err){ alert("保存失败: "+err.message); return; }
-  e.target.reset(); resetFormMode(); loadTasks();
+  e.target.reset(); resetFormMode(); loadTasks(); loadDash();
 };
-async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();}
+async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();loadDash();}
 async function syncNow(id){
   if(syncUI[id]?.running) return;
+  const previous=syncUI[id]?.resetTimer;
+  if(previous)clearTimeout(previous);
   const st=syncUI[id]={running:true, starting:true, scanned:0, enqueued:0, error:null, finished:false};
   updateSyncBtn(id);
+  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),15000);
   try{
-    await api(`/api/tasks/${id}/sync-now`,{method:"POST"});
+    await api(`/api/tasks/${id}/sync-now`,{method:"POST",signal:controller.signal});
     if(syncUI[id]!==st) return;
     st.starting=false;
     pollSyncProgress();
+    loadDash();
   }catch(e){
     if(syncUI[id]!==st) return;
-    st.running=false; st.starting=false; st.error="触发失败: "+e.message;
+    st.running=false; st.starting=false;
+    st.error=e.name==="AbortError"?"提交超时，正在查询扫描状态":"触发失败: "+e.message;
     updateSyncBtn(id);
-    alert(st.error);
-  }
+    if(e.name==="AbortError"){
+      try{
+        const p=await api(`/api/tasks/${id}/sync-progress`,{signal:AbortSignal.timeout(10000)});
+        if(syncUI[id]===st && (p.running||p.done)){
+          st.running=!!p.running;st.scanned=p.scanned||0;st.enqueued=p.enqueued||0;
+          st.current=p.current||"";st.error=p.error||null;st.finished=!!p.done&&!st.error;
+          if(st.running)pollSyncProgress();
+          updateSyncBtn(id);
+        }
+      }catch(_){}
+    }
+    loadDash();
+  }finally{clearTimeout(timeout);}
 }
 function updateSyncBtn(id){
-  const st=syncUI[id];
-  const btn=document.querySelector(`button[data-sync-id="${id}"]`);
-  const error=document.querySelector(`[data-sync-error="${id}"]`);
-  if(!btn || !st) return;
-  if(error)error.textContent=st.error||"";
-  btn.title=st.error||"";
-  if(st.error){btn.textContent="重试同步";btn.disabled=st.running;}
-  else if(st.running){btn.textContent=st.starting?"扫描中…":`扫描 ${st.scanned} | 新${st.enqueued}`;btn.disabled=true;}
-  else if(st.finished){
-    btn.textContent=`✓ 新入队${st.enqueued}`;btn.disabled=false;
-    if(!st.resetTimer)st.resetTimer=setTimeout(()=>{
-      if(syncUI[id]!==st || st.running || st.error)return;
-      st.finished=false;
-      const current=document.querySelector(`button[data-sync-id="${id}"]`);
-      if(current)current.textContent="立即同步";
-    },4000);
-  }
+  const st=syncUI[id], schedule=scanSchedules.find(s=>s.id===Number(id));
+  const unavailable=schedule && (!schedule.enabled||schedule.status==="cooldown");
+  document.querySelectorAll(`button[data-sync-id="${id}"]`).forEach(btn=>{
+    const dashboard=btn.classList.contains("scan-trigger");
+    btn.title=st?.error||st?.current||"";
+    if(st?.running){btn.textContent=st.starting?"提交中…":`已发现 ${st.scanned} · 新入队 ${st.enqueued}`;btn.disabled=true;}
+    else if(unavailable){btn.textContent=dashboard?(schedule.enabled?"冷却中":"任务已停用"):"立即同步";btn.disabled=true;}
+    else if(schedule?.status==="scanning"){btn.textContent="定时扫描中…";btn.disabled=true;}
+    else if(st?.error){btn.textContent=dashboard?"重试扫描":"重试同步";btn.disabled=false;}
+    else if(st?.finished){btn.textContent=`✓ 新入队 ${st.enqueued}`;btn.disabled=false;}
+    else{btn.textContent=dashboard?"立即扫描":"立即同步";btn.disabled=false;}
+  });
+  document.querySelectorAll(`[data-sync-error="${id}"]`).forEach(el=>el.textContent=st?.error||"");
+  document.querySelectorAll(`[data-sync-status="${id}"]`).forEach(el=>el.textContent=st?.running && !st.starting?st.current||"":"");
+  if(st?.finished && !st.resetTimer)st.resetTimer=setTimeout(()=>{
+    if(syncUI[id]!==st || st.running || st.error)return;
+    st.finished=false;
+    updateSyncBtn(id);
+  },4000);
 }
 let pollTimer=null, pollBusy=false;
 function pollSyncProgress(){
@@ -472,17 +558,19 @@ function pollSyncProgress(){
         const st=syncUI[id];
         if(!st.running || st.starting)continue;
         try{
-          const p=await api(`/api/tasks/${id}/sync-progress`);
+          const p=await api(`/api/tasks/${id}/sync-progress`,{signal:AbortSignal.timeout(10000)});
           if(syncUI[id]!==st)continue;
           st.scanned=p.scanned||0;st.enqueued=p.enqueued||0;
-          st.error=p.error||null;
+          st.current=p.current||"";st.error=p.error||null;st.pollFailures=0;
           st.running=!!p.running;
           st.finished=!st.running && !st.error;
           updateSyncBtn(id);
           if(!st.running){loadQueue();loadDash();}
         }catch(e){
           if(syncUI[id]!==st)continue;
-          st.running=false;st.error="获取同步进度失败: "+e.message;
+          st.pollFailures=(st.pollFailures||0)+1;
+          st.error=(st.pollFailures>=10?"获取同步进度失败，请刷新页面核对任务状态: ":"进度暂不可用，正在重试: ")+e.message;
+          if(st.pollFailures>=10)st.running=false;
           updateSyncBtn(id);
         }
       }
@@ -494,7 +582,7 @@ function pollSyncProgress(){
     }
   },500);
 }
-async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});delete syncUI[id];loadTasks();}}
+async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});delete syncUI[id];loadTasks();loadDash();}}
 
 async function loadQueue(){
   try{
@@ -555,7 +643,7 @@ $("#settings-form").onsubmit=async e=>{
     remove_empty_dirs:$("#g-empty").checked,
     nfo_fix_enabled:$("#g-nfo").checked,
     douyin_nfo_enabled:$("#g-douyin").checked})});
-    $("#settings-msg").textContent="已保存 ✓";setTimeout(()=>$("#settings-msg").textContent="",2000);
+    $("#settings-msg").textContent="已保存 ✓";loadDash();setTimeout(()=>$("#settings-msg").textContent="",2000);
   }catch(err){$("#settings-msg").textContent="保存失败: "+err.message;}
 };
 
@@ -606,7 +694,7 @@ function browseTo(rel){
   });
 }
 function browseUp(){browseTo(browseNavRel.split("/").slice(0,-1).join("/"));}
-loadDash();setInterval(loadDash,3000);
+loadDash();setInterval(loadDash,3000);setInterval(tickScanCountdowns,1000);
 </script>
 </body>
 </html>

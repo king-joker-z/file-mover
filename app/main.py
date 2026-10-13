@@ -1,9 +1,11 @@
 """FastAPI 入口 + REST API"""
 import hmac
 import ipaddress
+import logging
 import os
 import stat
 from contextlib import asynccontextmanager
+from time import monotonic
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit
@@ -15,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import db, config
 from .scheduler import scheduler
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -289,6 +293,8 @@ def api_list_tasks():
 def api_create_task(data: TaskIn):
     _validate_task(data)
     task_id = db.create_task(data.model_dump())
+    logger.info("任务创建：task_id=%s 名称=%s 源=%s 目标=%s", task_id, data.name,
+                data.src_dir, data.dst_dir)
     scheduler.wake_scan()
     return {"id": task_id}
 
@@ -306,6 +312,8 @@ def api_update_task(task_id: int, data: TaskIn):
         db.update_task(task_id, payload)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    logger.info("任务更新：task_id=%s 名称=%s 源=%s 目标=%s", task_id, data.name,
+                data.src_dir, data.dst_dir)
     scheduler.wake_scan()
     return {"ok": True}
 
@@ -313,6 +321,7 @@ def api_update_task(task_id: int, data: TaskIn):
 @app.delete("/api/tasks/{task_id}")
 def api_delete_task(task_id: int):
     db.delete_task(task_id)
+    logger.info("任务删除：task_id=%s", task_id)
     return {"ok": True}
 
 
@@ -322,6 +331,7 @@ def api_toggle_task(task_id: int):
     if not task:
         raise HTTPException(404, "任务不存在")
     db.update_task(task_id, {"enabled": 0 if task["enabled"] else 1})
+    logger.info("任务启停变更：task_id=%s 启用=%s", task_id, not task["enabled"])
     scheduler.wake_scan()
     return {"ok": True, "enabled": not task["enabled"]}
 
@@ -336,16 +346,21 @@ def api_sync_progress(task_id: int):
 def api_sync_now(task_id: int):
     """立即全量扫描指定任务：跳过周期调度，立刻扫描源目录。
     普通文件入队迁移（含重复下载检测）。返回扫描统计。"""
+    started = monotonic()
+    logger.info("立即同步请求：task_id=%s", task_id)
     task = db.get_task(task_id)
     if not task:
+        logger.warning("立即同步请求拒绝：task_id=%s 任务不存在", task_id)
         raise HTTPException(404, "任务不存在")
     if not task.get("enabled"):
+        logger.warning("立即同步请求拒绝：task_id=%s 任务已停用", task_id)
         raise HTTPException(400, "任务已停用，请先启用")
-    if not scheduler._task_paths_safe(task):
-        raise HTTPException(400, "任务路径不安全，已拒绝扫描")
+    # 路径校验可能访问响应缓慢的挂载目录，交由扫描线程执行并通过进度报告错误。
     result = scheduler.sync_now(task_id)
     if not result["ok"]:
         raise HTTPException(503, result["message"])
+    logger.info("立即同步请求已受理：task_id=%s 耗时=%.1fs 状态=%s",
+                task_id, monotonic() - started, result.get("message"))
     return {"ok": True, "message": result.get("message", "全量扫描已触发")}
 
 
@@ -362,12 +377,14 @@ def api_queue(status: Optional[str] = None, limit: int = 200,
 @app.post("/api/queue/{queue_id}/retry")
 def api_retry(queue_id: int):
     db.retry_queue([queue_id])
+    logger.info("手动重试队列：queue_id=%s", queue_id)
     return {"ok": True}
 
 
 @app.post("/api/queue/retry-batch")
 def api_retry_batch(ids: list[int]):
     db.retry_queue(ids)
+    logger.info("批量重试队列：数量=%d", len(ids))
     return {"ok": True}
 
 
@@ -375,6 +392,7 @@ def api_retry_batch(ids: list[int]):
 def api_clear_queue(status: Optional[str] = None):
     """清空队列。默认只清 done；传 status=failed/conflict/all 按需清除"""
     n = db.clear_queue(status)
+    logger.warning("清空队列：状态=%s 删除=%d", status, n)
     return {"ok": True, "removed": n}
 
 
@@ -391,6 +409,7 @@ def api_logs(task_id: Optional[int] = None, status: Optional[str] = None,
 @app.delete("/api/logs")
 def api_clear_logs():
     n = db.clear_logs()
+    logger.warning("清空操作日志：删除=%d", n)
     return {"ok": True, "removed": n}
 
 
@@ -406,7 +425,9 @@ def api_update_settings(data: SettingsIn):
     data_dict = data.model_dump(exclude_unset=True)
     if any(value is None for value in data_dict.values()):
         raise HTTPException(422, "设置项不可为 null")
-    return config.update(data_dict)
+    result = config.update(data_dict)
+    logger.info("设置更新：字段=%s", sorted(data_dict))
+    return result
 
 
 # ---------- 前端静态托管 ----------

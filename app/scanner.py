@@ -1,5 +1,6 @@
 """扫描源目录 → 稳定性检测 → 入队"""
 import hashlib
+import logging
 import os
 import stat
 import time
@@ -9,6 +10,8 @@ import fnmatch
 from . import db, config, nfo_fix, transfer
 from .douyin_nfo import (ensure_nfo, ensure_filename_nfo, backfill_nfo_for_video,
                          VIDEO_EXTS, POSTER_EXTS)
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _parse_patterns(raw: str) -> list[str]:
@@ -98,8 +101,11 @@ def _within_destination(path: str, destination: str) -> bool:
     return os.path.commonpath((base, os.path.realpath(os.path.dirname(path)))) == base
 
 
-def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int):
+def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int,
+                           progress: Optional[dict] = None):
     """仅在全量扫描中巡检已迁移视频；每个目标目录只枚举一次。"""
+    if progress is not None:
+        progress["current"] = "检查历史视频 NFO"
     grouped = {}
     source_names = {}
     for rel, dst, size, digest in db.list_migrated_videos(task["id"], VIDEO_EXTS):
@@ -115,6 +121,8 @@ def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int):
         existing_nfo = {os.path.splitext(name)[0].casefold() for name in names
                         if os.path.splitext(name)[1].casefold() == ".nfo"}
         for rel, dst, size, expected_digest in videos:
+            if progress is not None:
+                progress["current"] = f"检查历史视频 NFO: {dst}"
             stem = os.path.splitext(os.path.basename(dst))[0].casefold()
             if stem in existing_nfo:
                 continue
@@ -162,6 +170,7 @@ def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int):
             else:
                 created, nfo_path = backfill_nfo_for_video(original, dst, filenames=names)
             if created:
+                logger.info("历史视频 NFO 已补齐：task_id=%s 视频=%s NFO=%s", task["id"], dst, nfo_path)
                 existing_nfo.add(stem)
                 names.append(os.path.basename(nfo_path))
                 db.add_log(task["id"], None, None, nfo_path, 0, 0,
@@ -172,9 +181,13 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                force_full: bool = False) -> dict:
     """扫描一个任务的源目录并入队已静默文件。"""
     src = task["src_dir"]
+    if progress is not None:
+        progress["current"] = "读取全局配置"
     cfg = config.get()
     if not os.path.isabs(src) or not os.path.isabs(task["dst_dir"]):
         raise ValueError("迁移目录必须是绝对路径")
+    if progress is not None:
+        progress["current"] = "解析源与目标路径"
     a, b = os.path.realpath(src), os.path.realpath(task["dst_dir"])
     if os.path.commonpath((a, b)) in (a, b):
         raise ValueError("源目录与目标目录重叠，已拒绝扫描")
@@ -185,15 +198,21 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
         if progress is not None:
             progress[key] = stats[key]
     # isdir() 会将 EIO 吞成 False，不能把损坏的源目录报告为成功的空扫描。
+    if progress is not None:
+        progress["current"] = "检查源目录状态"
     try:
         source_info = os.stat(src)
     except FileNotFoundError:
+        logger.warning("扫描跳过：task_id=%s 源目录不存在=%s", task["id"], src)
         return stats
     except OSError as error:
         raise _scan_io_error("读取源目录状态失败", src, error) from error
     if not stat.S_ISDIR(source_info.st_mode):
+        logger.warning("扫描跳过：task_id=%s 源路径不是目录=%s", task["id"], src)
         return stats
     includes = _parse_patterns(task.get("include_patterns"))
+    if progress is not None:
+        progress["current"] = "检查目标挂载"
     initial_device = transfer._mount_identity(task["dst_dir"])
     excludes = _exclude_patterns(task.get("exclude_patterns"), src)
     ignores = cfg.get("ignore_suffixes", [])
@@ -208,15 +227,30 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
     def raise_walk_error(error):
         raise _scan_io_error("枚举目录失败", error.filename or src, error) from error
     directories = []
+    if progress is not None:
+        progress["current"] = "枚举源目录"
     for root, dirs, files in os.walk(src, onerror=raise_walk_error):
         # 明确排除的目录在进入前剪枝；未排除的目录故障仍必须中断扫描。
         dirs[:] = [name for name in dirs if not _match_any(
             os.path.relpath(os.path.join(root, name), src), name, excludes)]
         directories.append((root, files))
+        if on_dir:
+            try:
+                on_dir(root, len(files))
+            except Exception:
+                pass
+        if progress is not None:
+            progress["current"] = f"枚举源目录: {root}"
+    if progress is not None:
+        progress["current"] = "采样文件状态"
+    logger.info("目录枚举完成：task_id=%s 目录=%d 文件=%d", task["id"], len(directories),
+                sum(len(files) for _, files in directories))
     samples = {}
     for root, files in directories:
         for name in files:
             path = os.path.join(root, name)
+            if progress is not None:
+                progress["current"] = f"采样文件状态: {path}"
             rel = os.path.relpath(path, src)
             if (name.startswith(".") or name.endswith(".moving")
                     or any(name.endswith(s) for s in ignores)
@@ -233,20 +267,19 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                 raise _scan_io_error("首次读取文件状态失败", path, error) from error
     if not directories:
         if force_full and (filename_nfo_enabled or douyin_nfo_enabled):
-            _backfill_migrated_nfo(task, filename_nfo_enabled, initial_device)
+            _backfill_migrated_nfo(task, filename_nfo_enabled, initial_device, progress)
         return stats
     if samples and wait:
+        logger.info("等待稳定性校验：task_id=%s 样本=%d 等待=%ss", task["id"], len(samples), wait)
+        if progress is not None:
+            progress["current"] = f"等待文件稳定性校验 ({wait}s)"
         time.sleep(wait)
     generated = set()
     _scan_samples.set((samples, quiet, generated))
 
     for root, files in directories:
-        # 每层目录回调: 更新进度 (sync_now 传入)
-        if on_dir:
-            try:
-                on_dir(root, len(files))
-            except Exception:
-                pass
+        if progress is not None:
+            progress["current"] = f"处理文件: {root}"
         # 按任务选择一种补全格式；生成的新 NFO 加入本轮文件列表并经正常队列迁移。
         if filename_nfo_enabled or douyin_nfo_enabled:
             # 发现已有 NFO 时必须使用原始目录清单，不能因过滤器排除它就误补一份。
@@ -262,6 +295,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                                              and os.path.splitext(name)[0].lower().endswith("-poster")))]
             for fn in list(files):
                 full_p = os.path.join(root, fn)
+                if progress is not None:
+                    progress["current"] = f"检查视频 NFO: {full_p}"
                 rel_video = os.path.relpath(full_p, src)
                 if (fn.startswith(".")
                         or any(fn.endswith(s) for s in ignores)
@@ -288,11 +323,14 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                             created, _ = ensure_nfo(full_p, filenames=files)
                         if created:
                             nfo_path = os.path.join(root, base + ".nfo")
+                            logger.info("源视频 NFO 已生成：task_id=%s 视频=%s NFO=%s",
+                                        task["id"], full_p, nfo_path)
                             # 由本进程原子发布的 NFO 已完整写入；仍校验 inode/size/mtime。
                             samples[nfo_path] = _signature(os.stat(nfo_path))
                             generated.add(nfo_path)
                             files.append(base + ".nfo")
                     except OSError as exc:
+                        logger.exception("源视频 NFO 生成失败：task_id=%s 视频=%s", task["id"], full_p)
                         db.add_log(task["id"], None, full_p,
                                    os.path.join(root, base + ".nfo"), 0, 0,
                                    "failed", f"源目录 NFO 生成失败: {exc}")
@@ -301,6 +339,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                         raise
         for fn in files:
             full = os.path.join(root, fn)
+            if progress is not None:
+                progress["current"] = f"处理文件: {full}"
             if fn.endswith(".moving") or any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue
             rel = os.path.relpath(full, src)
@@ -341,6 +381,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             if (fn.lower().endswith(".nfo") and db.has_migrated_rel(task["id"], rel) and not prior_dst
                     and task.get("path_rule") == "by_date"
                     and not db.has_migrated_destination(task["id"], rel)):
+                logger.warning("NFO 跳过：task_id=%s 源=%s 历史目标缺失", task["id"], full)
                 db.add_log(task["id"], None, full, "", size, 0, "skipped",
                            "旧迁移记录缺少实际日期目标，保留源文件；请核查历史目标位置")
                 continue
@@ -365,5 +406,5 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                 _bump("enqueued")
 
     if force_full and (filename_nfo_enabled or douyin_nfo_enabled):
-        _backfill_migrated_nfo(task, filename_nfo_enabled, initial_device)
+        _backfill_migrated_nfo(task, filename_nfo_enabled, initial_device, progress)
     return stats

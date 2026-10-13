@@ -391,6 +391,121 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertGreater(worker._scan_retry_at[task_id], failures[0] + 59)
 
+    def test_sync_progress_reports_enumeration_before_scan_finishes(self):
+        source = self.source("nested/video.mp4", b"video")
+        progress = {}
+        real_walk = os.walk
+
+        def slow_walk(*args, **kwargs):
+            for root, dirs, files in real_walk(*args, **kwargs):
+                yield root, dirs, files
+                if root == str(source.parent):
+                    self.assertEqual(progress["scanned"], 1)
+                    self.assertIn(str(source.parent), progress["current"])
+
+        progress["scanned"] = 0
+        with patch.object(scanner.os, "walk", side_effect=slow_walk):
+            scanner.scan_task(self.task, progress=progress,
+                              on_dir=lambda root, n: progress.__setitem__(
+                                  "scanned", progress["scanned"] + n))
+        self.assertEqual(progress["scanned"], 1)
+        self.assertEqual(progress["enqueued"], 1)
+
+    def test_manual_scan_logs_lifecycle_and_stage_during_slow_io(self):
+        worker = scheduler.Scheduler()
+        task = dict(self.task, enabled=True)
+        source = self.source("clip.mp4", b"video")
+        db.create_task(dict(task, name="test"))
+        worker.HEARTBEAT_INTERVAL = 0.01
+        observed = threading.Event()
+
+        def paused_scan(*args, **kwargs):
+            kwargs["progress"]["current"] = f"枚举源目录: {source.parent}"
+            self.assertTrue(observed.wait(2))
+            return {"enqueued": 1}
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", side_effect=paused_scan),
+              patch.object(scheduler.logger, "info") as info,
+              patch.object(scheduler.logger, "warning", side_effect=lambda *a, **kw: observed.set()) as warning):
+            worker.sync_now(1)
+            worker._process_sync_requests()
+        self.assertTrue(any("扫描开始" in c.args[0] for c in info.call_args_list))
+        self.assertTrue(any("扫描完成" in c.args[0] for c in info.call_args_list))
+        self.assertTrue(any("扫描仍在进行" in c.args[0] and str(source.parent) in str(c.args)
+                            for c in warning.call_args_list))
+        self.assertTrue(worker.sync_progress[1]["done"])
+
+    def test_dashboard_scan_schedules_track_manual_scans_and_cooldown(self):
+        task_id = db.create_task(dict(self.task, name="scheduled", enabled=True, scan_interval=120))
+        disabled_id = db.create_task(dict(self.task, name="paused", enabled=False))
+        worker = scheduler.Scheduler()
+        worker.last_scan_ts[task_id] = time.time() - 20
+        schedules = {item["id"]: item for item in worker.stats()["scan_schedules"]}
+        self.assertEqual(schedules[task_id]["status"], "scheduled")
+        self.assertAlmostEqual(schedules[task_id]["next_scan_at"] - time.time(), 100, delta=2)
+        self.assertIsNone(schedules[disabled_id]["next_scan_at"])
+        self.assertEqual(schedules[disabled_id]["status"], "disabled")
+
+        worker.sync_now(task_id)
+        schedules = {item["id"]: item for item in worker.stats()["scan_schedules"]}
+        self.assertEqual(schedules[task_id]["status"], "manual")
+        self.assertEqual(schedules[task_id]["current"], "等待扫描线程")
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._process_sync_requests()
+        schedules = {item["id"]: item for item in worker.stats()["scan_schedules"]}
+        self.assertEqual(schedules[task_id]["status"], "scheduled")
+        self.assertAlmostEqual(schedules[task_id]["next_scan_at"] - time.time(), 120, delta=2)
+
+        worker._scan_retry_at[task_id] = time.time() + 60
+        schedules = {item["id"]: item for item in worker.stats()["scan_schedules"]}
+        self.assertEqual(schedules[task_id]["status"], "cooldown")
+        self.assertAlmostEqual(schedules[task_id]["next_scan_at"] - time.time(), 120, delta=2)
+
+    def test_dashboard_reports_active_scheduled_scan_stage(self):
+        task_id = db.create_task(dict(self.task, name="scheduled", enabled=True))
+        worker = scheduler.Scheduler()
+        worker._active_scan_task_id = task_id
+        worker._active_scan_state = {"current": "枚举源目录: /data/local", "scanned": 4, "enqueued": 1}
+        entry = next(item for item in worker.stats()["scan_schedules"] if item["id"] == task_id)
+        self.assertEqual(entry["status"], "scanning")
+        self.assertIn("/data/local", entry["current"])
+        self.assertEqual((entry["scanned"], entry["enqueued"]), (4, 1))
+
+    def test_scan_loop_logs_when_config_read_is_blocked(self):
+        worker = scheduler.Scheduler()
+        worker.HEARTBEAT_INTERVAL = 0.01
+        blocked = threading.Event()
+        release = threading.Event()
+
+        def slow_config():
+            blocked.set()
+            release.wait(2)
+            return self.settings
+
+        with (patch.object(config, "get", side_effect=slow_config),
+              patch.object(scheduler.logger, "warning") as warning):
+            thread = threading.Thread(target=worker._scan_loop)
+            thread.start()
+            self.assertTrue(blocked.wait(2))
+            try:
+                self.assertTrue(self._wait_for_warning(warning, "读取全局配置"))
+            finally:
+                worker._stop.set()
+                release.set()
+                worker._scan_wake.set()
+                thread.join(2)
+        self.assertFalse(thread.is_alive())
+
+    @staticmethod
+    def _wait_for_warning(logger_mock, text):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if any(text in str(call.args) for call in logger_mock.call_args_list):
+                return True
+            time.sleep(0.01)
+        return False
+
     def test_sync_now_forces_nfo_backfill_scan(self):
         worker = scheduler.Scheduler()
         task_id = db.create_task(dict(self.task, name="test"))
@@ -1458,6 +1573,34 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertIn("tasks temporarily unavailable", worker.last_scan_error)
         self.assertIsNotNone(worker.last_scan_error_at)
 
+    def test_sync_failure_logs_stage_and_error(self):
+        worker = scheduler.Scheduler()
+        task = dict(self.task, enabled=True)
+        with (patch.object(db, "get_task", return_value=task),
+              patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", side_effect=OSError(errno.EIO, "read failed")),
+              patch.object(scheduler.logger, "error") as error):
+            worker.sync_now(1)
+            worker._process_sync_requests()
+        self.assertTrue(any("扫描中断" in c.args[0] for c in error.call_args_list))
+        self.assertTrue(any("扫描故障" in c.args[0] and c.kwargs.get("exc_info")
+                            for c in error.call_args_list))
+        self.assertEqual(worker.sync_progress[1]["error"], "[Errno 5] read failed")
+
+    def test_sync_path_failure_finishes_progress_without_scanning(self):
+        worker = scheduler.Scheduler()
+        task = dict(self.task, enabled=True)
+        with (patch.object(db, "get_task", return_value=task),
+              patch.object(worker, "_task_paths_safe", return_value=False),
+              patch.object(scanner, "scan_task") as scan):
+            self.assertTrue(worker.sync_now(1)["ok"])
+            self.assertEqual(worker.sync_progress[1]["current"], "等待扫描线程")
+            worker._process_sync_requests()
+        scan.assert_not_called()
+        self.assertTrue(worker.sync_progress[1]["done"])
+        self.assertFalse(worker.sync_progress[1]["running"])
+        self.assertIn("任务目录重叠", worker.sync_progress[1]["error"])
+
     def test_sync_failure_finishes_progress_and_dead_scanner_is_reported(self):
         worker = scheduler.Scheduler()
         task = dict(self.task, enabled=True)
@@ -1483,7 +1626,7 @@ class NfoSafetyTests(unittest.TestCase):
 
     def test_scan_warning_clears_only_after_same_task_recovers(self):
         worker = scheduler.Scheduler()
-        with patch("app.scheduler.traceback.print_exception"):
+        with patch.object(scheduler.logger, "error"):
             worker._scan_failed(OSError(errno.EIO, "directory failed"), task_id=1)
         worker._scan_succeeded(2)
         self.assertIn("任务 1", worker.last_scan_error)
@@ -1495,12 +1638,58 @@ class NfoSafetyTests(unittest.TestCase):
     def test_scan_warning_exposes_failed_directory_for_explicit_exclusion(self):
         worker = scheduler.Scheduler()
         broken = self.src / "B站" / "投稿" / "然然前辈"
-        with patch("app.scheduler.traceback.print_exception"):
+        with patch.object(scheduler.logger, "error"):
             worker._scan_failed(OSError(errno.EIO, "枚举目录失败", str(broken)), task_id=1)
         self.assertEqual(worker.stats()["last_scan_error_path"], str(broken))
         self.assertEqual(worker.stats()["last_scan_error_task_id"], 1)
         worker._scan_succeeded(1)
         self.assertIsNone(worker.stats()["last_scan_error_path"])
+
+    def test_path_warning_is_rate_limited_and_recovers(self):
+        worker = scheduler.Scheduler()
+        task = dict(self.task)
+        with (patch("app.main.validate_task_paths", side_effect=[ValueError("overlap"),
+                                                                  ValueError("overlap"), None,
+                                                                  ValueError("overlap")]),
+              patch.object(scheduler.logger, "warning") as warning):
+            self.assertFalse(worker._task_paths_safe(task))
+            self.assertFalse(worker._task_paths_safe(task))
+            self.assertTrue(worker._task_paths_safe(task))
+            self.assertFalse(worker._task_paths_safe(task))
+        self.assertEqual(warning.call_count, 2)
+
+    def test_transfer_logs_start_and_result(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scheduler.logger, "info") as info,
+              patch.object(scheduler.logger, "log") as result):
+            worker._work_once()
+        self.assertTrue(any("迁移开始" in c.args[0] for c in info.call_args_list))
+        self.assertTrue(any("迁移结果" in c.args[1] and "success" in str(c.args)
+                            for c in result.call_args_list))
+
+    def test_transfer_heartbeat_reports_blocked_file(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        worker.HEARTBEAT_INTERVAL = 0.01
+        seen = threading.Event()
+
+        def slow_transfer(*args):
+            self.assertTrue(seen.wait(2))
+            return "failed", "temporary error"
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(transfer, "transfer", side_effect=slow_transfer),
+              patch.object(scheduler.logger, "warning",
+                           side_effect=lambda *a, **kw: seen.set()) as warning):
+            worker._work_once()
+        self.assertTrue(any("迁移仍在进行" in c.args[0] and "复制并校验目标" in str(c.args)
+                            and source.name in str(c.args) for c in warning.call_args_list))
 
     def test_successful_transfer_accounting_failure_is_not_retried_as_transfer(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
@@ -2047,6 +2236,22 @@ class NfoSafetyTests(unittest.TestCase):
             self.assertEqual(client.get("/api/browse", params={"rel": "B站/投稿"}, headers=headers).status_code, 200)
             missing = client.get("/api/browse", params={"rel": "B站/投稿/不存在"}, headers=headers)
             self.assertEqual(missing.status_code, 404)
+
+    def test_sync_now_api_defers_slow_path_validation_to_scan_thread(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        client = TestClient(app)
+        with (patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}),
+              patch.object(scheduler.scheduler, "_task_paths_safe",
+                           side_effect=AssertionError("API must not check remote paths")),
+              patch.object(scheduler.scheduler, "sync_now",
+                           return_value={"ok": True, "message": "已触发"}) as sync):
+            response = client.post(f"/api/tasks/{task_id}/sync-now",
+                                   headers={"Authorization": "Bearer test-token"})
+        self.assertEqual(response.status_code, 200)
+        sync.assert_called_once_with(task_id)
 
     def test_sync_now_api_returns_503_when_scheduler_rejects_request(self):
         from fastapi.testclient import TestClient
