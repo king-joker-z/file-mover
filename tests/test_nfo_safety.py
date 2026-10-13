@@ -286,8 +286,9 @@ class NfoSafetyTests(unittest.TestCase):
             return original(path, *args, **kwargs)
 
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 2)
+        item = next(row for row in db.list_queue() if row["rel_path"] == source.name)
         with patch.object(transfer.os, "lstat", side_effect=fail_target):
-            result, _ = transfer.transfer(db.take_next_pending(claim=False), self.task)
+            result, _ = transfer.transfer(item, self.task)
         self.assertEqual(result, "failed")
         self.assertEqual(source.read_bytes(), b"original")
         self.assertEqual(target.read_bytes(), b"original")
