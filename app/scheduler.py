@@ -149,9 +149,19 @@ class Scheduler:
                         task, skip_stable_check=manual, progress=state,
                         on_dir=lambda root, n: state.__setitem__("scanned", state.get("scanned", 0) + n),
                         force_full=force_full)
-                except Exception:
+                except Exception as exc:
                     # 故障熔断必须在释放 I/O 锁前生效，否则迁移线程可能抢到下一文件。
                     self._pause_task_for_scan(task_id)
+                    if (isinstance(exc, OSError) and exc.errno == errno.EIO
+                            and exc.filename and getattr(exc, '_filemover_eio_path_type', None)
+                            in ('file', 'directory')):
+                        rel = os.path.relpath(exc.filename, task['src_dir'])
+                        if rel != '.' and not rel.startswith('..' + os.sep) and rel != '..':
+                            origin = exc._filemover_eio_path_type
+                            excluded = db.record_eio_failure(task_id, None, rel, origin, str(exc))
+                            if excluded:
+                                logger.warning('扫描 EIO 路径已自动排除：task_id=%s 路径=%s 类型=%s',
+                                               task_id, rel, origin)
                     raise
             enqueued = result.get("enqueued", 0) if isinstance(result, dict) else state.get("enqueued", 0)
             logger.info("扫描完成：task_id=%s 模式=%s 已发现=%s 新入队=%s 耗时=%.1fs",
@@ -663,6 +673,8 @@ class Scheduler:
             except OSError as exc:
                 transient_source_io = exc.errno in (
                     errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY)
+                if exc.errno == errno.EIO:
+                    item['_eio_origin'] = 'source'
                 result, detail = "failed", f"源路径读取失败，已保留待重试: {exc}"
             else:
                 if not stat.S_ISREG(source_stat.st_mode):
@@ -707,6 +719,13 @@ class Scheduler:
                     self._pause_task_for_scan(task["id"])
                     db.set_status(item["id"], "failed", next_retry_at=time.time() + 60)
                     detail += "；挂载 I/O 故障，60s 后限速探测恢复"
+                    if item.get('_eio_origin'):
+                        excluded = db.record_eio_failure(task['id'], item['id'],
+                                                         item['rel_path'], item['_eio_origin'], detail)
+                        if excluded:
+                            detail += '；EIO 已自动加入精确排除项（源文件保留）'
+                            logger.warning("EIO 文件已自动排除：task_id=%s 文件=%s 类型=%s",
+                                           task['id'], item['rel_path'], item['_eio_origin'])
                     self._log(item, duration_ms, "failed", detail)
                     return
                 retries = item.get("retries", 0) + 1

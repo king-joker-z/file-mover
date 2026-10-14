@@ -131,11 +131,15 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     digest.update(content)
                     expected_size = len(content)
                 else:
-                    with open(source, "rb") as original:
-                        for chunk in iter(lambda: original.read(1 << 20), b""):
-                            stream.write(chunk)
-                            digest.update(chunk)
-                            expected_size += len(chunk)
+                    try:
+                        with open(source, "rb") as original:
+                            for chunk in iter(lambda: original.read(1 << 20), b""):
+                                stream.write(chunk)
+                                digest.update(chunk)
+                                expected_size += len(chunk)
+                    except OSError as exc:
+                        exc._filemover_eio_origin = 'source'
+                        raise
                 stream.flush()
                 os.fsync(stream.fileno())
             expected_hash = digest.hexdigest()
@@ -311,7 +315,18 @@ def _failed_io(item: dict, detail: str, exc: OSError) -> Tuple[str, str]:
     while cause is not None:
         if isinstance(cause, OSError) and cause.errno in _TRANSIENT_IO_ERRNOS:
             item["_transient_io"] = True
-            break
+        if isinstance(cause, OSError) and cause.errno == errno.EIO:
+            filename = os.fspath(cause.filename) if cause.filename is not None else ''
+            if (getattr(cause, '_filemover_eio_origin', None) == 'source'
+                    or filename == item.get('src_path')):
+                item['_eio_origin'] = 'source'
+            elif os.path.basename(filename).startswith('.fm-') and filename.endswith('.moving'):
+                item['_eio_origin'] = 'target'
+            elif detail in ('源路径状态读取失败', 'NFO 预处理失败'):
+                item['_eio_origin'] = 'source'
+            elif detail in ('迁移失败，源文件已保留', '路径校验失败',
+                            'NFO 目标读回失败，未覆盖'):
+                item.setdefault('_eio_origin', 'target')
         cause = cause.__cause__
     return "failed", f"{detail}: {exc}"
 

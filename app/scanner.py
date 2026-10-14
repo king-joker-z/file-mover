@@ -21,7 +21,11 @@ def _parse_patterns(raw: str) -> list[str]:
 
 def _match_any(rel_path: str, name: str, patterns: List[str]) -> bool:
     for p in patterns:
-        if fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel_path, p):
+        # ./ 前缀只匹配指定相对路径及其子项，不匹配其他目录下的同名文件。
+        if p.startswith('./'):
+            if rel_path == p[2:] or rel_path.startswith(p[2:] + os.sep):
+                return True
+        elif fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel_path, p):
             return True
     return False
 
@@ -52,7 +56,10 @@ def _signature(info):
 
 def _scan_io_error(action: str, path: str, error: OSError) -> OSError:
     """保留 errno 和实际路径，并说明扫描时失败的文件系统操作。"""
-    return OSError(error.errno, f"{action}: {error.strerror or error}", error.filename or path)
+    failure = OSError(error.errno, f"{action}: {error.strerror or error}", error.filename or path)
+    failure._filemover_eio_path_type = 'directory' if action == '枚举目录失败' else (
+        'file' if '文件状态失败' in action else None)
+    return failure
 
 
 def _stable(path: str, wait: int) -> bool:

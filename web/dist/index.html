@@ -37,6 +37,7 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .tag.failed{background:#fde5e5;color:var(--err)}
 .tag.conflict{background:#fdeecd;color:var(--warn)}
 .tag.accounting_pending{background:#e1f5f3;color:#087f79}
+.tag.cancelled{background:#fff2df;color:var(--warn)}
 .filters{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .filters button{border:1px solid var(--border);background:#fff;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px}
 .filters button.active{border-color:var(--primary);color:var(--primary)}
@@ -86,6 +87,7 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
     <button class="active" data-tab="dash">仪表盘</button>
     <button data-tab="tasks">任务管理</button>
     <button data-tab="rounds">上传轮次</button>
+    <button data-tab="eio">EIO 故障</button>
     <button data-tab="queue">队列</button>
     <button data-tab="logs">日志</button>
     <button data-tab="settings">设置</button>
@@ -141,7 +143,7 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
           <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" max="86400" value="5"></div>
           <div class="field small"><label>扫描间隔（秒，0=全局）</label><input id="f-scan" type="number" min="0" max="86400" value="0"></div>
           <div class="field"><label>包含（通配，逗号分隔，空=全部）</label><input id="f-inc" placeholder="*.mp4, *.jpg"></div>
-          <div class="field"><label>排除（相对源目录或完整路径，逗号分隔；排除目录后不进入扫描）</label><input id="f-exc" placeholder="B站/投稿/然然前辈, /data/local/故障目录, *.tmp"></div>
+          <div class="field"><label>排除（相对源目录或完整路径，逗号分隔；排除目录后不进入扫描）</label><input id="f-exc" placeholder="B站/投稿/然然前辈, /data/local/故障目录, *.tmp"><div class="log-detail">遇到 EIO 即自动加入精确路径或目录并记录；移除规则并保存可重新尝试。</div></div>
         </div>
         <div class="row">
           <div class="field"><label>运行周期（可多段，逗号分隔，留空=全天运行）</label>
@@ -165,9 +167,17 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
 
   <!-- 上传轮次 -->
   <div id="tab-rounds" style="display:none">
-    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">UPLOAD ROUNDS / 历史记录</span><h2>上传轮次</h2><p>一次连续待上传批次为一轮；仅统计本轮纳入队列的文件。耗时从首个文件开始上传计至全轮处理结束，未开始显示 00:00。</p></div></div>
-      <div class="toolbar"><label for="round-task" class="hint">任务筛选</label><select id="round-task" aria-label="筛选任务"><option value="">全部任务</option></select><span class="hint">失败包含重试中；冲突单独计数</span></div>
+    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">UPLOAD ROUNDS / 历史记录</span><h2>上传轮次</h2><p>一次连续待上传批次为一轮；总数是入队数，不等于成功数。耗时从首个文件开始上传计至本轮结束，未开始显示 00:00。</p></div></div>
+      <div class="toolbar"><label for="round-task" class="hint">任务筛选</label><select id="round-task" aria-label="筛选任务"><option value="">全部任务</option></select><span class="hint">取消表示队列项因修改规则或清空队列而移除，不代表上传成功；失败包含重试中</span></div>
       <div id="round-list"><div class="empty">加载轮次中…</div></div><div class="pager" id="round-pager"></div>
+    </div>
+  </div>
+
+  <!-- EIO 故障 -->
+  <div id="tab-eio" style="display:none">
+    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">I/O FAILURES</span><h2>EIO 故障文件</h2><p>首次 EIO 即记录并自动排除该文件或故障目录；不会删除源文件。目标端 EIO 也会记录，若多文件连续失败请检查挂载。</p></div></div>
+      <div class="toolbar"><label for="eio-task" class="hint">任务筛选</label><select id="eio-task" aria-label="筛选故障任务"><option value="">全部任务</option></select><span class="hint">移除排除项并保存任务后可重试；源文件始终保留</span></div>
+      <div id="eio-list"><div class="empty">加载故障记录中…</div></div><div class="pager" id="eio-pager"></div>
     </div>
   </div>
 
@@ -248,11 +258,12 @@ let curQueueFilter="";
 // tabs
 $$(".tabs button").forEach(b=>b.onclick=()=>{
   $$(".tabs button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["dash","tasks","rounds","queue","logs","settings","browse"].forEach(t=>{const el=$("#tab-"+t);if(el)el.style.display=t===b.dataset.tab?"":"none";});
+  ["dash","tasks","rounds","eio","queue","logs","settings","browse"].forEach(t=>{const el=$("#tab-"+t);if(el)el.style.display=t===b.dataset.tab?"":"none";});
   if(b.dataset.tab==="dash")loadDash();
   if(b.dataset.tab==="browse")browseTo(browseRel);
   if(b.dataset.tab==="tasks")loadTasks();
   if(b.dataset.tab==="rounds"){loadRoundTasks();loadRounds();}
+  if(b.dataset.tab==="eio"){loadEioTasks();loadEioFailures();}
   if(b.dataset.tab==="queue")loadQueue();
   if(b.dataset.tab==="logs"){loadLogTasks();loadLogs();}
   if(b.dataset.tab==="settings")loadSettings();
@@ -296,6 +307,14 @@ function formatCountdown(seconds){
 function roundElapsed(r){
   return formatCountdown(r.started_at?Math.max(0,(r.finished_at||Date.now()/1000-serverClockOffset)-r.started_at):0);
 }
+function roundState(r){
+  if(r.scanning && !r.finished_at)return {label:"扫描中",tag:"transferring"};
+  if(!r.finished_at)return {label:r.started_at?"上传中":"等待上传",tag:"pending"};
+  if(r.cancelled_count)return {label:r.cancelled_count===r.total?"全部取消":"部分取消",tag:"cancelled"};
+  if(r.failed_count || r.conflict_count)return {label:"存在失败或冲突",tag:"failed"};
+  if(r.success_count===r.total)return {label:"全部成功",tag:"done"};
+  return {label:"已结束",tag:"pending"};
+}
 function tickScanCountdowns(){
   document.querySelectorAll("[data-round-elapsed]").forEach(el=>{
     const entry=scanSchedules.find(s=>s.id===Number(el.dataset.roundElapsed));
@@ -328,7 +347,7 @@ function renderScanSchedules(){
     const detail=active?`${s.current||"扫描准备中"} · ${s.backfill_nfo&&s.backfill_total?`历史视频已检查 ${s.backfill_checked}/${s.backfill_total} · `:""}源目录已发现 ${s.scanned} · 新入队 ${s.enqueued}`:
       s.status==="cooldown"?"挂载 I/O 故障后等待重试":`扫描间隔 ${s.interval_seconds} 秒 · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
     const r=s.round;
-    const roundBlock=r?`<div class="round-mini"><div class="round-mini-title">最近一轮 #${r.id} · ${r.finished_at?"已完成":r.scanning?"扫描中":"上传中"}</div><div class="round-mini-stats"><span>总数 <b>${r.total}</b></span><span>视频 <b>${r.video_count}</b></span><span>NFO <b>${r.nfo_count}</b></span><span>图片 <b>${r.image_count}</b></span>${r.other_count?`<span>其他 <b>${r.other_count}</b></span>`:""}</div><div class="round-mini-time">上传耗时 <b data-round-elapsed="${s.id}">${roundElapsed(r)}</b> · 成功 ${r.success_count} / 失败 ${r.failed_count} / 冲突 ${r.conflict_count}</div></div>`:
+    const roundBlock=r?`<div class="round-mini"><div class="round-mini-title">最近一轮 #${r.id} · ${roundState(r).label}</div><div class="round-mini-stats"><span>总数 <b>${r.total}</b></span><span>视频 <b>${r.video_count}</b></span><span>NFO <b>${r.nfo_count}</b></span><span>图片 <b>${r.image_count}</b></span>${r.other_count?`<span>其他 <b>${r.other_count}</b></span>`:""}</div><div class="round-mini-time">上传耗时 <b data-round-elapsed="${s.id}">${roundElapsed(r)}</b> · 成功 ${r.success_count} / 失败 ${r.failed_count} / 冲突 ${r.conflict_count} / 取消 ${r.cancelled_count} / 待处理 ${r.remaining_count}</div></div>`:
       `<div class="round-mini"><div class="round-mini-title">当前暂无上传轮次</div><div class="round-mini-time">发现新文件并入队后开始统计</div></div>`;
     return `<article class="scan-card"><div class="scan-card-top"><div class="scan-symbol" aria-hidden="true">↻</div><span class="tag scan-state ${esc(s.status)}">${label}</span></div>
       <h3 title="${esc(s.name)}">${esc(s.name)}</h3><div class="scan-path" title="${esc(s.src_dir)}">${esc(s.src_dir)} <span>→</span> ${esc(s.dst_dir)}</div>
@@ -435,8 +454,8 @@ async function loadTasks(){
   try{
     const tasks=await api("/api/tasks");
     if(!tasks.length){$("#task-list").innerHTML='<div class="empty">暂无任务，请先创建</div>';return;}
-    $("#task-list").innerHTML=`<table><tr><th>名称</th><th>源 → 目标</th><th>间隔</th><th>运行周期</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
-      tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td>
+    $("#task-list").innerHTML=`<div class="table-wrap"><table><tr><th>名称</th><th>源 → 目标</th><th>排除项</th><th>间隔</th><th>运行周期</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
+      tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td><td class="path-cell">${t.exclude_patterns?.trim()?t.exclude_patterns.split(",").map(p=>`<div>${esc(p.trim())}</div>`).join(""):"<span class=\"log-detail\">无</span>"}</td>
         <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.filename_nfo_enabled?" · NFO补全":""}</td>
         <td><label class="switch"><input type="checkbox" aria-label="启用任务 ${esc(t.name)}" ${t.enabled?"checked":""} onchange="toggleTask(${t.id},this)"><span class="slider"></span></label></td>
@@ -445,7 +464,7 @@ async function loadTasks(){
         <button class="btn small gray" data-backfill-id="${t.id}" onclick="syncNow(${t.id},true)" title="逐个校验历史目标视频，缺 NFO 时读取整段视频，可能产生大量远端 I/O">补齐历史 NFO…</button>
         <span class="sync-error" data-sync-error="${t.id}" role="alert"></span>
         <span class="sync-status" data-sync-status="${t.id}" role="status"></span>
-        <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
+        <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table></div>";
     tasks.forEach(t=>updateSyncBtn(t.id));
   }catch(e){$("#task-list").innerHTML='<div class="empty">任务加载失败：'+esc(e.message)+'</div>';}
 }
@@ -736,16 +755,42 @@ async function loadRounds(){
     if(requestId!==roundRequestId)return;
     if(!items.length && total && page>0){roundPage=Math.ceil(total/PAGE_SIZE)-1;return loadRounds();}
     if(!items.length)$("#round-list").innerHTML='<div class="empty">暂无上传轮次</div>';
-    else $("#round-list").innerHTML=`<div class="table-wrap"><table><tr><th>轮次 / 任务</th><th>开始 / 完成</th><th>文件（总 / 视频 / NFO / 图片 / 其他）</th><th>结果（成功 / 失败 / 冲突 / 取消）</th><th>上传耗时</th><th>状态</th></tr>`+
-      items.map(r=>`<tr><td><b>#${r.id}</b><br><span class="log-detail">${esc(r.task_name)}</span></td><td>${new Date(r.created_at*1000).toLocaleString("zh-CN")}<br><span class="log-detail">${r.finished_at?new Date(r.finished_at*1000).toLocaleString("zh-CN"):"—"}</span></td>
-      <td>${r.total} / ${r.video_count} / ${r.nfo_count} / ${r.image_count} / ${r.other_count}</td><td><b style="color:var(--ok)">${r.success_count}</b> / <b style="color:var(--err)">${r.failed_count}</b> / ${r.conflict_count} / ${r.cancelled_count}</td>
-      <td data-history-elapsed="${r.id}">${roundElapsed(r)}</td><td><span class="tag ${r.finished_at?"done":r.scanning?"transferring":"pending"}">${r.finished_at?"已完成":r.scanning?"扫描中":r.started_at?"上传中":"等待上传"}</span></td></tr>`).join("")+"</table></div>";
+    else $("#round-list").innerHTML=`<div class="table-wrap"><table><tr><th>轮次 / 任务</th><th>入队 / 上传开始 / 结束</th><th>文件（总 / 视频 / NFO / 图片 / 其他）</th><th>结果（成功 / 失败 / 冲突 / 取消）</th><th>上传耗时</th><th>状态</th></tr>`+
+      items.map(r=>`<tr><td><b>#${r.id}</b><br><span class="log-detail">${esc(r.task_name)}</span></td><td>${new Date(r.created_at*1000).toLocaleString("zh-CN")}<br><span class="log-detail">${r.started_at?new Date(r.started_at*1000).toLocaleString("zh-CN"):"未开始"} / ${r.finished_at?new Date(r.finished_at*1000).toLocaleString("zh-CN"):"—"}</span></td>
+      <td>${r.total} / ${r.video_count} / ${r.nfo_count} / ${r.image_count} / ${r.other_count}</td><td><b style="color:var(--ok)">${r.success_count}</b> / <b style="color:var(--err)">${r.failed_count}</b> / ${r.conflict_count} / <b style="color:var(--warn)" title="已从队列移除，不代表上传成功">${r.cancelled_count}</b> · 待处理 ${r.remaining_count}</td>
+      <td data-history-elapsed="${r.id}">${roundElapsed(r)}</td><td><span class="tag ${roundState(r).tag}">${roundState(r).label}</span></td></tr>`).join("")+"</table></div>";
     historyRounds=items;
     renderPager("#round-pager",page,total,p=>{roundPage=p;loadRounds();$("#tab-rounds").scrollIntoView({behavior:"smooth"});});
   }catch(e){if(requestId!==roundRequestId)return;$("#round-list").innerHTML='<div class="empty">轮次加载失败：'+esc(e.message)+'</div>';$("#round-pager").innerHTML="";}
 }
 let historyRounds=[];
 $("#round-task").addEventListener("change",()=>{roundPage=0;loadRounds();});
+
+let eioPage=0,eioRequestId=0;
+async function loadEioTasks(){
+  try{
+    const tasks=await api("/api/tasks"),select=$("#eio-task"),chosen=select.value;
+    select.innerHTML='<option value="">全部任务</option>'+tasks.map(t=>`<option value="${t.id}">${esc(t.name)}</option>`).join("");
+    if([...select.options].some(o=>o.value===chosen))select.value=chosen;
+  }catch(_){/* 故障记录仍可查看。 */}
+}
+async function loadEioFailures(){
+  const requestId=++eioRequestId,page=eioPage,filter=$("#eio-task").value;
+  const params=new URLSearchParams({limit:PAGE_SIZE,offset:page*PAGE_SIZE});
+  if(filter)params.set("task_id",filter);
+  try{
+    const {items,total}=await api("/api/eio-failures?"+params);
+    if(requestId!==eioRequestId)return;
+    if(!items.length && total && page>0){eioPage=Math.ceil(total/PAGE_SIZE)-1;return loadEioFailures();}
+    $("#eio-list").innerHTML=!items.length?'<div class="empty">暂无 EIO 故障记录</div>':
+      `<div class="table-wrap"><table><tr><th>任务 / 文件</th><th>发生位置</th><th>次数 / 最近发生</th><th>状态</th><th>详情</th></tr>`+
+      items.map(f=>`<tr><td><b>${esc(f.task_name||"已删除任务 #"+f.task_id)}</b><br><span class="log-detail">${esc(f.rel_path)}</span></td>
+        <td>${f.origin==="source"?"源文件":f.origin==="directory"?"源目录":"目标挂载"}</td><td>${f.occurrences} 次<br><span class="log-detail">${new Date(f.last_at*1000).toLocaleString("zh-CN")}</span></td>
+        <td><span class="tag ${f.active?"cancelled":"pending"}">${f.active?"已排除":f.auto_excluded?"规则已移除":"冷却/待重试"}</span></td><td class="path-cell log-detail">${esc(f.detail)}</td></tr>`).join("")+"</table></div>";
+    renderPager("#eio-pager",page,total,p=>{eioPage=p;loadEioFailures();});
+  }catch(e){if(requestId!==eioRequestId)return;$("#eio-list").innerHTML='<div class="empty">故障记录加载失败：'+esc(e.message)+'</div>';}
+}
+$("#eio-task").addEventListener("change",()=>{eioPage=0;loadEioFailures();});
 
 const queueStatusLabels={pending:"待迁移",transferring:"迁移中",accounting_pending:"待记账",done:"已完成",failed:"失败",conflict:"冲突"};
 const PAGE_SIZE=50;
@@ -901,8 +946,8 @@ function browseTo(rel){
   });
 }
 function browseUp(){browseTo(browseNavRel.split("/").slice(0,-1).join("/"));}
-loadDash();setInterval(()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();}},3000);setInterval(tickScanCountdowns,1000);
-document.addEventListener("visibilitychange",()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();}});
+loadDash();setInterval(()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();if($("#tab-eio").style.display!=="none")loadEioFailures();}},3000);setInterval(tickScanCountdowns,1000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();if($("#tab-eio").style.display!=="none")loadEioFailures();}});
 </script>
 </body>
 </html>

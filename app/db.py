@@ -151,6 +151,18 @@ def _init_schema(conn: sqlite3.Connection):
             task_id INTEGER PRIMARY KEY,
             retry_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS eio_failures (
+            task_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            occurrences INTEGER NOT NULL DEFAULT 0,
+            origin TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            first_at REAL NOT NULL,
+            last_at REAL NOT NULL,
+            auto_excluded INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, rel_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_eio_failures_last ON eio_failures(last_at DESC);
         CREATE TABLE IF NOT EXISTS upload_rounds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER NOT NULL,
@@ -306,17 +318,42 @@ def update_task(task_id: int, data: dict):
             validate_task_paths(proposed, [dict(row) for row in conn.execute("SELECT * FROM tasks")], task_id)
         path_keys = ("src_dir", "dst_dir", "path_rule", "include_patterns",
                      "exclude_patterns", "conflict_policy")
-        changed = any(key in data and data[key] != old[key] for key in path_keys)
-        if changed and conn.execute("SELECT 1 FROM queue WHERE task_id=?"
-                                    " AND status IN ('transferring','accounting_pending')",
-                                    (task_id,)).fetchone():
+        changed_keys = {key for key in path_keys if key in data and data[key] != old[key]}
+        if changed_keys and conn.execute("SELECT 1 FROM queue WHERE task_id=?"
+                                         " AND status IN ('transferring','accounting_pending')",
+                                         (task_id,)).fetchone():
             raise ValueError("任务正在迁移，修改路径或规则前请等待当前文件完成")
+        if changed_keys == {"exclude_patterns"}:
+            # 仅排除规则变化时，不要清空整批队列；先校验规则并精准匹配需要取消的文件。
+            from .scanner import _exclude_patterns, _match_any
+            excludes = _exclude_patterns(data["exclude_patterns"], old["src_dir"])
+            excluded_ids = [row["id"] for row in conn.execute(
+                "SELECT id, rel_path FROM queue WHERE task_id=?"
+                " AND status NOT IN ('done','conflict')", (task_id,))
+                if _match_any(row["rel_path"], os.path.basename(row["rel_path"]), excludes)]
         conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
         if "path_rule" in data and data["path_rule"] != old["path_rule"]:
             # 旧记录保持完整供审计和补齐；新规则只读取其自身世代的历史选址。
             conn.execute("UPDATE tasks SET rule_epoch=rule_epoch+1 WHERE id=?", (task_id,))
-        if changed:
-            # 路径/规则变化时清理旧队列，下一轮按新配置重新扫描。
+        if changed_keys == {"exclude_patterns"}:
+            # 用户编辑规则后对照原有自动添加的精确路径；手动移除才重新计数。
+            old_patterns = [p.strip() for p in (old['exclude_patterns'] or '').split(',') if p.strip()]
+            new_patterns = [p.strip() for p in (data['exclude_patterns'] or '').split(',') if p.strip()]
+            for row in conn.execute("SELECT rel_path FROM eio_failures WHERE task_id=?"
+                                    " AND auto_excluded=1", (task_id,)).fetchall():
+                exact = './' + row['rel_path']
+                if exact in old_patterns and exact not in new_patterns:
+                    conn.execute("UPDATE eio_failures SET auto_excluded=0"
+                                 " WHERE task_id=? AND rel_path=?", (task_id, row['rel_path']))
+            for queue_id in excluded_ids:
+                conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                             " WHERE queue_id=? AND status NOT IN ('done','conflict')"
+                             " AND round_id IN (SELECT id FROM upload_rounds WHERE finished_at IS NULL)",
+                             (queue_id,))
+                conn.execute("DELETE FROM queue WHERE id=?", (queue_id,))
+            _finish_rounds(conn, task_id)
+        elif changed_keys:
+            # 其他选址/规则变化时旧队列不可沿用，下一轮按新配置重新扫描。
             conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
                          " WHERE round_id IN (SELECT id FROM upload_rounds WHERE task_id=?"
                          " AND finished_at IS NULL) AND status NOT IN ('done','transferring','accounting_pending')",
@@ -345,6 +382,7 @@ def delete_task(task_id: int):
         conn.execute("DELETE FROM queue WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM migrated_files WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM scan_failures WHERE task_id=?", (task_id,))
+        # 保留故障审计记录，与轮次历史一样可在删除任务后查看。
         # 历史轮次保留任务名称快照，删除任务不抹去历史。
         conn.execute("UPDATE upload_rounds SET scanning=0 WHERE task_id=? AND finished_at IS NULL",
                      (task_id,))
@@ -379,6 +417,94 @@ def clear_scan_failure(task_id: int):
     conn = get_conn()
     with _lock, conn:
         conn.execute("DELETE FROM scan_failures WHERE task_id=?", (task_id,))
+
+
+# ---------- EIO failures ----------
+
+def record_eio_failure(task_id: int, queue_id: int, rel_path: str, origin: str,
+                       detail: str) -> bool:
+    """首次 EIO 即记录并精确排除对应的源路径；不删除源文件。
+
+    迁移时队列项必须已标记 failed；扫描时 queue_id=None，目录异常仅排除该目录。
+    """
+    conn = get_conn()
+    with _lock, conn:
+        if queue_id is not None and conn.execute(
+                "SELECT 1 FROM queue WHERE id=? AND task_id=? AND rel_path=? AND status='failed'",
+                (queue_id, task_id, rel_path)).fetchone() is None:
+            return False
+        task = conn.execute("SELECT src_dir, exclude_patterns FROM tasks WHERE id=?",
+                            (task_id,)).fetchone()
+        if task is None:
+            return False
+        if queue_id is None and conn.execute(
+                "SELECT 1 FROM queue WHERE task_id=? AND rel_path=?"
+                " AND status IN ('transferring','accounting_pending')",
+                (task_id, rel_path)).fetchone():
+            return False
+        now = time.time()
+        conn.execute("INSERT INTO eio_failures"
+                     " (task_id, rel_path, occurrences, origin, detail, first_at, last_at)"
+                     " VALUES (?,?,?,?,?,?,?) ON CONFLICT(task_id, rel_path) DO UPDATE SET"
+                     " occurrences=occurrences+1, origin=excluded.origin, detail=excluded.detail,"
+                     " last_at=excluded.last_at",
+                     (task_id, rel_path, 1, origin, detail, now, now))
+        row = conn.execute("SELECT occurrences, auto_excluded FROM eio_failures"
+                           " WHERE task_id=? AND rel_path=?", (task_id, rel_path)).fetchone()
+        if row['auto_excluded']:
+            return False
+        # 不根据含糊的异常字符串或目录路径生成通配规则；只加入这一文件的精确路径。
+        # 排除输入以逗号分隔，含逗号的路径无法安全表示；其他特殊字符由 ./ 精确匹配。
+        if (not rel_path or os.path.isabs(rel_path) or any(
+                part in ('', '.', '..') for part in rel_path.split(os.sep)) or ',' in rel_path):
+            return False
+        from .scanner import _exclude_patterns, _match_any
+        patterns = _exclude_patterns(task['exclude_patterns'], task['src_dir'])
+        if _match_any(rel_path, os.path.basename(rel_path), patterns):
+            return False  # 已由用户规则排除，不能冒充本次自动添加。
+        patterns = [p.strip() for p in (task['exclude_patterns'] or '').split(',') if p.strip()]
+        patterns.append('./' + rel_path)
+        conn.execute("UPDATE tasks SET exclude_patterns=?, updated_at=? WHERE id=?",
+                     (', '.join(patterns), now_str(), task_id))
+        conn.execute("UPDATE eio_failures SET auto_excluded=1 WHERE task_id=? AND rel_path=?",
+                     (task_id, rel_path))
+        if queue_id is not None:
+            ids = [queue_id]
+        else:
+            ids = [entry['id'] for entry in conn.execute(
+                "SELECT id, rel_path FROM queue WHERE task_id=?"
+                " AND status NOT IN ('done','conflict','transferring','accounting_pending')",
+                (task_id,)) if entry['rel_path'] == rel_path or (
+                    origin == 'directory' and entry['rel_path'].startswith(rel_path + os.sep))]
+        for item_id in ids:
+            conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                         " WHERE queue_id=? AND round_id IN (SELECT id FROM upload_rounds"
+                         " WHERE finished_at IS NULL)", (item_id,))
+            conn.execute("DELETE FROM queue WHERE id=?", (item_id,))
+        _finish_rounds(conn, task_id)
+        return True
+
+
+def list_eio_failures(task_id=None, limit=200, offset=0):
+    where = ' WHERE e.task_id=?' if task_id is not None else ''
+    params = (task_id,) if task_id is not None else ()
+    with _lock:
+        rows = get_conn().execute("SELECT e.*, t.name task_name, t.exclude_patterns"
+                                  " FROM eio_failures e LEFT JOIN tasks t ON t.id=e.task_id"
+                                  + where + " ORDER BY e.last_at DESC LIMIT ? OFFSET ?",
+                                  (*params, limit, offset)).fetchall()
+    return [dict(row, active=bool(row['auto_excluded'] and row['task_name']
+                                  and './' + row['rel_path'] in [p.strip() for p in
+                                      (row['exclude_patterns'] or '').split(',')]))
+            for row in rows]
+
+
+def count_eio_failures(task_id=None):
+    with _lock:
+        if task_id is None:
+            return get_conn().execute('SELECT COUNT(*) FROM eio_failures').fetchone()[0]
+        return get_conn().execute('SELECT COUNT(*) FROM eio_failures WHERE task_id=?',
+                                  (task_id,)).fetchone()[0]
 
 
 # ---------- upload rounds ----------
@@ -451,7 +577,9 @@ _ROUND_COUNTS = ("SELECT r.*, COUNT(f.queue_id) total,"
                  " SUM(CASE WHEN f.status='done' THEN 1 ELSE 0 END) success_count,"
                  " SUM(CASE WHEN f.status='failed' THEN 1 ELSE 0 END) failed_count,"
                  " SUM(CASE WHEN f.status='conflict' THEN 1 ELSE 0 END) conflict_count,"
-                 " SUM(CASE WHEN f.status='cancelled' THEN 1 ELSE 0 END) cancelled_count"
+                 " SUM(CASE WHEN f.status='cancelled' THEN 1 ELSE 0 END) cancelled_count,"
+                 " SUM(CASE WHEN f.status IN ('pending','transferring','accounting_pending')"
+                 " THEN 1 ELSE 0 END) remaining_count"
                  " FROM upload_rounds r LEFT JOIN upload_round_files f ON f.round_id=r.id")
 
 

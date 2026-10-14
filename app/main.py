@@ -296,6 +296,16 @@ def api_upload_rounds(task_id: Optional[int] = None, limit: int = 50, offset: in
             "total": db.count_upload_rounds(task_id)}
 
 
+# ---------- EIO failures ----------
+
+@app.get("/api/eio-failures")
+def api_eio_failures(task_id: Optional[int] = None, limit: int = 200, offset: int = 0):
+    if not 1 <= limit <= 500 or offset < 0 or (task_id is not None and task_id < 1):
+        raise HTTPException(422, "limit 必须在 1-500，offset 不得为负数，task_id 必须为正整数")
+    return {"items": db.list_eio_failures(task_id, limit, offset),
+            "total": db.count_eio_failures(task_id)}
+
+
 # ---------- tasks ----------
 
 @app.get("/api/tasks")

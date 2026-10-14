@@ -232,6 +232,98 @@ class NfoSafetyTests(unittest.TestCase):
                 scanner.scan_task(self.task)
         self.assertEqual(scanner.scan_task(self.task)["enqueued"], 1)
 
+    def test_first_scan_file_eio_excludes_only_that_file_and_keeps_others(self):
+        task_id = db.create_task(dict(self.task, name='source eio', enabled=True))
+        self.task['id'] = task_id
+        broken = self.source('broken.jpg', b'broken')
+        healthy = self.source('healthy.jpg', b'healthy')
+        worker = scheduler.Scheduler()
+        original = scanner.os.lstat
+
+        def fail_broken(path, *args, **kwargs):
+            if os.fspath(path) == str(broken):
+                raise OSError(errno.EIO, 'source EIO', str(broken))
+            return original(path, *args, **kwargs)
+
+        with (patch.object(worker, '_task_paths_safe', return_value=True),
+              patch.object(scanner.os, 'lstat', side_effect=fail_broken)):
+            with self.assertRaises(OSError):
+                worker._run_scan(db.get_task(task_id))
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './broken.jpg')
+        self.assertEqual(db.list_eio_failures(task_id)[0]['occurrences'], 1)
+        self.assertTrue(db.list_eio_failures(task_id)[0]['active'])
+        self.assertEqual(scanner.scan_task(db.get_task(task_id))['enqueued'], 1)
+        self.assertEqual([item['rel_path'] for item in db.list_queue()], ['healthy.jpg'])
+        self.assertTrue(broken.exists())
+        self.assertTrue(healthy.exists())
+        db.update_task(task_id, {'exclude_patterns': ''})
+        self.assertFalse(db.list_eio_failures(task_id)[0]['active'])
+        self.assertEqual(db.list_eio_failures(task_id)[0]['occurrences'], 1)
+
+    def test_target_eio_excludes_only_affected_file_on_first_failure(self):
+        task_id = db.create_task(dict(self.task, name='target eio', enabled=True))
+        for name in ('bad.jpg', 'other.jpg', 'healthy.jpg'):
+            path = self.source(name, b'payload')
+            db.enqueue(task_id, str(path), name, str(self.dst / name), 7)
+        ids = {item['rel_path']: item['id'] for item in db.list_queue()}
+        db.set_status(ids['bad.jpg'], 'failed', next_retry_at=time.time() + 60)
+        self.assertTrue(db.record_eio_failure(task_id, ids['bad.jpg'], 'bad.jpg', 'target', 'EIO'))
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './bad.jpg')
+        self.assertEqual({item['rel_path'] for item in db.list_queue()},
+                         {'other.jpg', 'healthy.jpg'})
+        self.assertTrue(db.list_eio_failures(task_id)[0]['active'])
+
+    def test_first_transfer_eio_cancels_only_bad_file_in_round(self):
+        task_id = db.create_task(dict(self.task, name='transfer eio', enabled=True))
+        for name in ('bad.jpg', 'healthy.jpg'):
+            path = self.source(name, b'payload')
+            db.enqueue(task_id, str(path), name, str(self.dst / name), 7)
+        bad_id = next(item['id'] for item in db.list_queue() if item['rel_path'] == 'bad.jpg')
+        db.set_status(bad_id, 'failed', next_retry_at=time.time() + 60)
+        self.assertTrue(db.record_eio_failure(task_id, bad_id, 'bad.jpg', 'source', 'EIO'))
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './bad.jpg')
+        self.assertEqual([item['rel_path'] for item in db.list_queue()], ['healthy.jpg'])
+        current = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((current['total'], current['cancelled_count'], current['remaining_count']),
+                         (2, 1, 1))
+        self.assertTrue(db.list_eio_failures(task_id)[0]['active'])
+
+    def test_scanned_directory_eio_excludes_only_directory_on_first_error(self):
+        task_id = db.create_task(dict(self.task, name='directory eio', enabled=True))
+        healthy = self.source('healthy/good.jpg', b'good')
+        damaged = self.source('damaged/bad.jpg', b'bad')
+        worker = scheduler.Scheduler()
+        original_scandir = scanner.os.scandir
+
+        def fail_directory(path):
+            if os.fspath(path) == str(damaged.parent):
+                raise OSError(errno.EIO, 'unreadable directory', str(damaged.parent))
+            return original_scandir(path)
+
+        with (patch.object(worker, '_task_paths_safe', return_value=True),
+              patch.object(scanner.os, 'scandir', side_effect=fail_directory)):
+            with self.assertRaises(OSError):
+                worker._run_scan(db.get_task(task_id))
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './damaged')
+        self.assertEqual(db.list_eio_failures(task_id)[0]['origin'], 'directory')
+        self.assertEqual(scanner.scan_task(db.get_task(task_id))['enqueued'], 1)
+        self.assertEqual([item['rel_path'] for item in db.list_queue()], ['healthy/good.jpg'])
+        self.assertTrue(healthy.exists())
+        self.assertTrue(damaged.exists())
+
+    def test_auto_exclusion_exact_path_does_not_exclude_same_name_elsewhere(self):
+        task_id = db.create_task(dict(self.task, name='exact eio', enabled=True))
+        bad = self.source('one/same.jpg', b'bad')
+        good = self.source('two/same.jpg', b'good')
+        db.enqueue(task_id, str(bad), 'one/same.jpg', str(self.dst / 'one/same.jpg'), 3)
+        item_id = db.list_queue()[0]['id']
+        db.set_status(item_id, 'failed')
+        self.assertTrue(db.record_eio_failure(task_id, item_id, 'one/same.jpg', 'source', 'EIO'))
+        self.assertEqual(scanner.scan_task(db.get_task(task_id))['enqueued'], 1)
+        self.assertEqual([item['rel_path'] for item in db.list_queue()], ['two/same.jpg'])
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './one/same.jpg')
+        self.assertTrue(good.exists())
+
     def test_directory_iteration_eio_aborts_before_queue_commit(self):
         source = self.source("healthy/video.mp4", b"video")
         original_scandir = scanner.os.scandir
@@ -581,6 +673,64 @@ class NfoSafetyTests(unittest.TestCase):
             self.assertEqual(dashboard['round']['id'], fresh['id'])
             self.assertEqual(client.get('/api/rounds?limit=201',
                                         headers={"Authorization": "Bearer test-token"}).status_code, 422)
+
+    def test_excluding_one_file_preserves_the_rest_of_an_upload_round(self):
+        task_id = db.create_task(dict(self.task, name='exclude one', enabled=True))
+        for index in range(20):
+            path = self.source(f'博主/author/{index}.jpg', b'image')
+            db.enqueue(task_id, str(path), f'博主/author/{index}.jpg',
+                       str(self.dst / '博主' / 'author' / path.name), 5)
+        items = {item['rel_path']: item for item in db.list_queue()}
+        db.take_next_pending([task_id])
+        db.set_status(items['博主/author/0.jpg']['id'], 'done')
+        db.update_task(task_id, {'exclude_patterns': '博主/author/19.jpg'})
+        remaining = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((remaining['total'], remaining['success_count'],
+                          remaining['cancelled_count'], remaining['remaining_count']),
+                         (20, 1, 1, 18))
+        self.assertIsNone(remaining['finished_at'])
+        self.assertEqual(len(db.list_queue()), 19)
+        self.assertNotIn('博主/author/19.jpg', {q['rel_path'] for q in db.list_queue()})
+        for item in db.list_queue():
+            if item['status'] != 'done':
+                db.set_status(item['id'], 'done')
+        finished = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((finished['total'], finished['success_count'],
+                          finished['cancelled_count'], finished['remaining_count']),
+                         (20, 19, 1, 0))
+        self.assertIsNotNone(finished['finished_at'])
+
+    def test_exclude_rule_edit_keeps_terminal_queue_and_invalid_rule_rolls_back(self):
+        task_id = db.create_task(dict(self.task, name='exclude validation', enabled=True))
+        for name in ('a.jpg', 'b.jpg', 'c.jpg'):
+            path = self.source(name, b'image')
+            db.enqueue(task_id, str(path), name, str(self.dst / name), 5)
+        items = {item['rel_path']: item for item in db.list_queue()}
+        db.set_status(items['a.jpg']['id'], 'done')
+        db.set_status(items['b.jpg']['id'], 'conflict')
+        with self.assertRaisesRegex(ValueError, '不能排除整个源目录'):
+            db.update_task(task_id, {'exclude_patterns': str(self.src)})
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], '')
+        self.assertEqual(len(db.list_queue()), 3)
+        db.update_task(task_id, {'exclude_patterns': '*.jpg'})
+        self.assertEqual({q['rel_path'] for q in db.list_queue()}, {'a.jpg', 'b.jpg'})
+        finished = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((finished['success_count'], finished['conflict_count'],
+                          finished['cancelled_count']), (1, 1, 1))
+
+    def test_exclude_edit_rejects_in_flight_file_without_changing_the_round(self):
+        task_id = db.create_task(dict(self.task, name='in flight', enabled=True))
+        path = self.source('busy.jpg', b'image')
+        db.enqueue(task_id, str(path), path.name, str(self.dst / path.name), 5)
+        item = db.take_next_pending([task_id])
+        before = db.list_upload_rounds(task_id)[0]
+        with self.assertRaisesRegex(ValueError, '正在迁移'):
+            db.update_task(task_id, {'exclude_patterns': 'busy.jpg'})
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], '')
+        self.assertEqual(db.list_upload_rounds(task_id)[0], before)
+        self.assertEqual(db.list_queue()[0]['status'], 'transferring')
+        db.set_status(item['id'], 'done')
+        self.assertEqual(db.list_upload_rounds(task_id)[0]['success_count'], 1)
 
     def test_upload_round_persists_across_restart_and_includes_new_scan_files(self):
         task_id = db.create_task(dict(self.task, name="restart", enabled=True))
@@ -2097,8 +2247,9 @@ class NfoSafetyTests(unittest.TestCase):
         with (patch.object(worker, "_task_paths_safe", return_value=True),
               patch.object(transfer, "_write_verified", side_effect=OSError(errno.EIO, "cloud unavailable"))):
             worker._work_once()
-        row = db.list_queue()[0]
-        self.assertEqual((row["status"], row["retries"]), ("failed", 0))
+        self.assertFalse(db.list_queue())
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './movie.mp4')
+        self.assertEqual(db.list_eio_failures(task_id)[0]['origin'], 'target')
         self.assertIn(task_id, worker._scan_retry_at)
         self.assertIn(task_id, db.list_scan_failures())
         self.assertTrue(source.exists())
@@ -2122,9 +2273,9 @@ class NfoSafetyTests(unittest.TestCase):
              patch.object(scheduler.os, "lstat", side_effect=eio_source), \
              patch.object(transfer, "transfer", side_effect=AssertionError("must not transfer")):
             worker._work_once()
-        row = db.list_queue()[0]
-        self.assertEqual((row["status"], row["retries"]), ("failed", 0))
-        self.assertGreater(row["next_retry_at"], time.time())
+        self.assertFalse(db.list_queue())
+        self.assertEqual(db.get_task(task_id)['exclude_patterns'], './movie.mp4')
+        self.assertEqual(db.list_eio_failures(task_id)[0]['origin'], 'source')
         self.assertIn(task_id, worker._scan_retry_at)
         self.assertEqual(source.read_bytes(), b"video")
         self.assertFalse(target.exists())
