@@ -509,17 +509,36 @@ def queue_stats():
     return {r["status"]: r["c"] for r in rows}
 
 
-def list_queue(status=None, limit: int = 200, offset: int = 0):
-    conn = get_conn()
-    sql = "SELECT * FROM queue"
-    params: list = []
+def _search_pattern(search: str) -> str:
+    """将用户输入当作普通字符串，而不是 SQL LIKE 通配表达式。"""
+    return "%" + search.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
+
+def _queue_filter(status=None, search=None):
+    conditions, params = [], []
     if status:
-        sql += " WHERE status=?"
+        conditions.append("status=?")
         params.append(status)
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-    params += [limit, offset]
+    if search:
+        conditions.append("(rel_path LIKE ? ESCAPE '!' OR src_path LIKE ? ESCAPE '!'"
+                          " OR dst_path LIKE ? ESCAPE '!')")
+        params.extend([_search_pattern(search)] * 3)
+    return (" WHERE " + " AND ".join(conditions) if conditions else ""), params
+
+
+def list_queue(status=None, limit: int = 200, offset: int = 0, search=None):
+    conn = get_conn()
+    where, params = _queue_filter(status, search)
     with _lock:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM queue" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset]).fetchall()]
+
+
+def count_queue(status=None, search=None) -> int:
+    where, params = _queue_filter(status, search)
+    with _lock:
+        return get_conn().execute("SELECT COUNT(*) FROM queue" + where, params).fetchone()[0]
 
 
 def retry_queue(ids):
@@ -686,16 +705,31 @@ def add_log(task_id, queue_id, src_path, dst_path, size, duration_ms, result, de
             _index_success_log(conn, cur.lastrowid, task_id, src_path, dst_path)
 
 
-def list_logs(task_id=None, status=None, limit=100, offset=0):
-    conn = get_conn()
-    sql, params = "SELECT * FROM logs WHERE 1=1", []
-    if task_id:
-        sql += " AND task_id=?"
+def _logs_filter(task_id=None, status=None, search=None):
+    conditions, params = [], []
+    if task_id is not None:
+        conditions.append("task_id=?")
         params.append(task_id)
     if status:
-        sql += " AND result=?"
+        conditions.append("result=?")
         params.append(status)
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-    params += [limit, offset]
+    if search:
+        conditions.append("(src_path LIKE ? ESCAPE '!' OR dst_path LIKE ? ESCAPE '!'"
+                          " OR detail LIKE ? ESCAPE '!')")
+        params.extend([_search_pattern(search)] * 3)
+    return (" WHERE " + " AND ".join(conditions) if conditions else ""), params
+
+
+def list_logs(task_id=None, status=None, limit=100, offset=0, search=None):
+    conn = get_conn()
+    where, params = _logs_filter(task_id, status, search)
     with _lock:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM logs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset]).fetchall()]
+
+
+def count_logs(task_id=None, status=None, search=None) -> int:
+    where, params = _logs_filter(task_id, status, search)
+    with _lock:
+        return get_conn().execute("SELECT COUNT(*) FROM logs" + where, params).fetchone()[0]

@@ -2544,6 +2544,84 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db.queue_stats().get("failed", 0), 0)
         self.assertEqual(db.queue_stats()["pending"], 1005)
 
+    def test_queue_search_filters_entire_database_and_paginates(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="search"))
+        for index in range(210):
+            name = f"video-{index}.mp4"
+            db.enqueue(task_id, str(self.src / name), name, str(self.dst / name), 5)
+        for name in ("旧片_100%.mp4", "bang!.mp4"):
+            db.enqueue(task_id, str(self.src / name), name, str(self.dst / name), 5)
+        special = db.list_queue(search="旧片_100%")
+        db.set_status(special[0]["id"], "failed")
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            response = client.get("/api/queue", params={"search": "video-0", "limit": 10,
+                                                         "with_total": "true"}, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["total"], 1)
+            self.assertEqual(response.json()["items"][0]["rel_path"], "video-0.mp4")
+            for needle in ("_100%", "bang!"):
+                response = client.get("/api/queue", params={"search": needle, "with_total": "true"},
+                                      headers=headers)
+                self.assertEqual(response.json()["total"], 1)
+            response = client.get("/api/queue", params={"status": "failed", "search": "%",
+                                                         "with_total": "true"}, headers=headers)
+            self.assertEqual(response.json()["total"], 1)
+            self.assertEqual(len(response.json()["items"]), 1)
+            second = client.get("/api/queue", params={"limit": 50, "offset": 200,
+                                                        "with_total": "true"}, headers=headers)
+            self.assertEqual(second.json()["total"], 212)
+            self.assertEqual(len(second.json()["items"]), 12)
+            self.assertIsInstance(client.get("/api/queue", headers=headers).json(), list)
+            self.assertEqual(client.get("/api/queue", params={"search": "x" * 257},
+                                        headers=headers).status_code, 422)
+            self.assertEqual(client.get("/api/queue", params={"search": "video"}).status_code, 401)
+
+    def test_logs_search_combines_task_result_keyword_and_pagination(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        first = db.create_task(dict(self.task, name="first"))
+        other_src = self.root / "other-src"
+        other_dst = self.root / "other-dst"
+        other_src.mkdir()
+        other_dst.mkdir()
+        second = db.create_task(dict(self.task, name="second", src_dir=str(other_src),
+                                     dst_dir=str(other_dst)))
+        for index in range(105):
+            db.add_log(first, None, f"/tmp/other-{index}.mp4", "/tmp/out.mp4", 5, 1,
+                       "success", "普通")
+        db.add_log(first, None, "/tmp/片名_90%.mp4", "/tmp/target.mp4", 5, 1,
+                   "failed", "NAS 问题!")
+        db.add_log(second, None, "/tmp/片名_90%.mp4", "/tmp/target.mp4", 5, 1,
+                   "failed", "NAS 问题!")
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            filtered = client.get("/api/logs", params={"task_id": first, "status": "failed",
+                                                        "search": "_90%", "with_total": "true"},
+                                  headers=headers)
+            self.assertEqual(filtered.status_code, 200)
+            self.assertEqual(filtered.json()["total"], 1)
+            self.assertEqual(filtered.json()["items"][0]["detail"], "NAS 问题!")
+            detail = client.get("/api/logs", params={"search": "问题!", "with_total": "true"},
+                                headers=headers)
+            self.assertEqual(detail.json()["total"], 2)
+            no_match = client.get("/api/logs", params={"search": "%", "status": "success",
+                                                        "with_total": "true"}, headers=headers)
+            self.assertEqual(no_match.json()["total"], 0)
+            page = client.get("/api/logs", params={"limit": 50, "offset": 100,
+                                                    "with_total": "true"}, headers=headers)
+            self.assertEqual(page.json()["total"], 107)
+            self.assertEqual(len(page.json()["items"]), 7)
+            self.assertIsInstance(client.get("/api/logs", headers=headers).json(), list)
+            self.assertEqual(client.get("/api/logs", params={"search": "x" * 257},
+                                        headers=headers).status_code, 422)
+
     def test_config_cache_tracks_replaced_file_even_if_directory_sync_fails(self):
         path = self.root / "settings.json"
         previous_path, previous_cache = config.CONFIG_PATH, config._cache

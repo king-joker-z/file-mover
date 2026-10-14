@@ -379,10 +379,17 @@ def api_sync_now(task_id: int, request_id: UUID = None, backfill_nfo: bool = Fal
 
 @app.get("/api/queue")
 def api_queue(status: Optional[str] = None, limit: int = 200,
-              offset: int = 0):
+              offset: int = 0, search: Optional[str] = None,
+              with_total: bool = False):
     if not 1 <= limit <= 1000 or offset < 0:
         raise HTTPException(422, "limit 必须在 1-1000，offset 不得为负数")
-    return db.list_queue(status, limit, offset)
+    if search is not None and len(search) > 256:
+        raise HTTPException(422, "搜索词不能超过 256 字符")
+    search = search.strip() if search else None
+    items = db.list_queue(status, limit, offset, search=search)
+    if with_total:
+        return {"items": items, "total": db.count_queue(status, search)}
+    return items
 
 
 @app.post("/api/queue/{queue_id}/retry")
@@ -420,10 +427,17 @@ def api_clear_queue(status: Optional[str] = None):
 
 @app.get("/api/logs")
 def api_logs(task_id: Optional[int] = None, status: Optional[str] = None,
-             limit: int = 100, offset: int = 0):
+             limit: int = 100, offset: int = 0, search: Optional[str] = None,
+             with_total: bool = False):
     if not 1 <= limit <= 1000 or offset < 0:
         raise HTTPException(422, "limit 必须在 1-1000，offset 不得为负数")
-    return db.list_logs(task_id, status, limit, offset)
+    if search is not None and len(search) > 256:
+        raise HTTPException(422, "搜索词不能超过 256 字符")
+    search = search.strip() if search else None
+    items = db.list_logs(task_id, status, limit, offset, search=search)
+    if with_total:
+        return {"items": items, "total": db.count_logs(task_id, status, search)}
+    return items
 
 
 @app.delete("/api/logs")

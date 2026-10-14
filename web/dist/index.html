@@ -36,6 +36,7 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .tag.done{background:#e0f5ec;color:var(--ok)}
 .tag.failed{background:#fde5e5;color:var(--err)}
 .tag.conflict{background:#fdeecd;color:var(--warn)}
+.tag.accounting_pending{background:#e1f5f3;color:#087f79}
 .filters{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .filters button{border:1px solid var(--border);background:#fff;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px}
 .filters button.active{border-color:var(--primary);color:var(--primary)}
@@ -71,6 +72,9 @@ body{background:radial-gradient(circle at 90% -15%,#dce9ff 0,transparent 42%),va
 .scan-panel{padding:24px}.scan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:14px}.scan-card{min-width:0;border:1px solid var(--border);border-radius:13px;background:linear-gradient(150deg,#fff,#fafcff);padding:18px;display:flex;flex-direction:column;min-height:270px;transition:transform .18s,box-shadow .18s}.scan-card:hover{transform:translateY(-2px);box-shadow:0 10px 26px #24477914}.scan-card-top{display:flex;justify-content:space-between;align-items:center}.scan-symbol{width:30px;height:30px;border-radius:9px;background:#eaf1ff;color:var(--primary);font-size:22px;text-align:center;line-height:28px}.scan-state{font-weight:600;border-radius:20px;padding:4px 9px}.scan-state.scheduled{background:#e7f8f1;color:var(--ok)}.scan-state.manual,.scan-state.scanning{background:#e8f0ff;color:var(--primary)}.scan-state.cooldown{background:#fff2df;color:var(--warn)}.scan-state.disabled{background:#edf0f5;color:var(--muted)}.scan-card h3{font-size:17px;line-height:1.4;margin:13px 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scan-path{color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scan-path span{color:var(--primary);margin:0 3px}.scan-divider{height:1px;background:var(--border);margin:16px 0 12px}.scan-caption{font-size:11px;color:var(--muted)}.countdown{font-size:27px;font-weight:750;letter-spacing:-.035em;font-variant-numeric:tabular-nums;margin:3px 0;color:var(--text)}.scan-detail{font-size:11px;color:var(--muted);margin-bottom:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scan-trigger{margin-top:auto;width:100%;padding:10px}.scan-card .sync-error:not(:empty),.scan-card .sync-status:not(:empty){max-width:none;white-space:normal;margin-top:8px}
 .btn{border-radius:8px;font-weight:600;transition:transform .15s,filter .15s,background .15s}.btn:not(:disabled):hover{filter:brightness(.94);transform:translateY(-1px)}.btn.gray{background:#eef3fa;color:#345270}.btn.red{background:#d85460}.btn.green{background:#128965}.btn:focus-visible,.tabs button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
 th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f7f9fc;color:#62758b;font-weight:700}tr:last-child td{border-bottom:none}tr:hover td{background:#fbfcff}table{min-width:700px}.panel:has(table){overflow-x:auto}.filters button{border-radius:8px;padding:7px 12px}.filters button.active{background:#eaf1ff}.field{min-width:190px}form input,form select{border-radius:8px;padding:10px 12px;background:#fff;color:var(--text)}form input:focus,form select:focus{border-color:var(--primary);outline:3px solid #2563eb20}form .row{gap:16px;margin-bottom:18px}.current{font-size:14px;color:var(--text);font-weight:600;margin-bottom:6px}.log-detail{line-height:1.6}.empty{padding:42px 20px;background:#f8fafd;border-radius:10px;grid-column:1/-1}
+.insight-grid{display:grid;grid-template-columns:minmax(290px,.85fr) minmax(0,1.15fr);gap:20px}.insight-grid .panel{min-width:0}.donut-layout{display:flex;align-items:center;gap:25px;min-height:190px}.donut{width:164px;aspect-ratio:1;border-radius:50%;flex:none;background:conic-gradient(#dfe7f2 0 100%);display:grid;place-items:center;position:relative}.donut:before{content:"";position:absolute;inset:19px;background:white;border-radius:50%}.donut-center{position:relative;text-align:center}.donut-center strong{display:block;font-size:26px;line-height:1.15;font-variant-numeric:tabular-nums}.donut-center span{font-size:11px;color:var(--muted)}.chart-legend{display:grid;gap:7px;flex:1}.legend-row{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.legend-row b{margin-left:auto;color:var(--text);font-variant-numeric:tabular-nums}.legend-dot{width:9px;height:9px;border-radius:3px;flex:none}.stage-bars{display:grid;gap:17px;padding:8px 0}.stage-row{display:grid;grid-template-columns:88px minmax(0,1fr) 50px;gap:12px;align-items:center;font-size:12px}.stage-track{height:10px;background:#eef2f7;border-radius:10px;overflow:hidden}.stage-fill{display:block;height:100%;border-radius:inherit;min-width:0;transition:width .25s}.stage-row b{text-align:right;font-variant-numeric:tabular-nums}.settings-intro{margin-bottom:20px}.settings-intro h2{font-size:26px;letter-spacing:-.03em;margin:4px 0}.settings-intro p{font-size:13px;color:var(--muted)}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.settings-card{margin:0;min-width:0}.settings-card .row{margin-top:18px}.settings-option{display:flex;gap:12px;align-items:flex-start;padding:14px;border:1px solid var(--border);border-radius:11px;margin-top:10px;cursor:pointer;transition:border-color .15s,background .15s}.settings-option:hover{border-color:#b6c9f2;background:#f9fbff}.settings-option input{width:17px;height:17px;flex:none;accent-color:var(--primary);margin-top:2px}.settings-option b{display:block;font-size:13px}.settings-option small{display:block;font-size:11px;color:var(--muted);line-height:1.5;margin-top:3px}.settings-note{background:#eef8f3;color:#137154;padding:12px;border-radius:10px;font-size:12px;margin-top:12px}.settings-save{position:sticky;bottom:12px;z-index:2;display:flex;align-items:center;gap:12px;padding:14px 18px;background:#fff;border:1px solid var(--border);border-radius:14px;box-shadow:0 12px 30px #1b3d6825;margin-top:18px}.settings-save .btn{min-width:120px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}.toolbar input,.toolbar select{border:1px solid var(--border);border-radius:8px;padding:9px 11px;font:inherit;background:#fff;color:var(--text);min-height:37px}.toolbar input{flex:1;min-width:180px}.toolbar select{min-width:130px}.toolbar .hint{font-size:11px;color:var(--muted)}.pager{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:14px;font-size:12px;color:var(--muted)}.pager .btn{font-size:12px}.table-wrap{overflow-x:auto}td.path-cell{overflow-wrap:anywhere;max-width:420px}.stat.red:before{background:var(--err)}
+@media(max-width:850px){.insight-grid,.settings-grid{grid-template-columns:1fr}}
+@media(max-width:600px){.donut-layout{gap:12px}.donut{width:125px}.donut:before{inset:15px}.donut-center strong{font-size:22px}.settings-save{bottom:0}.toolbar input{min-width:100%}}
 @media(max-width:850px){.container{padding:18px 16px 40px}.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.panel-hint{display:none}}
 @media(max-width:570px){.site-header{margin-bottom:18px}.brand-copy h1 span{display:none}.tabs button{padding:9px 12px}.dash-intro{align-items:flex-start}.dash-intro h2{font-size:23px}.dash-intro p{max-width:235px}.live-badge{font-size:10px}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{padding:14px;min-height:96px}.stat .num{font-size:25px}.panel{padding:16px}.scan-panel{padding:16px}.scan-grid{grid-template-columns:minmax(0,1fr)}.field,.field.small{min-width:100%;flex:1}form .row{gap:11px}}
 </style>
@@ -94,9 +98,13 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
       <div class="stat green"><div class="num" id="s-moved">0</div><div class="lbl">今日已迁移</div></div>
       <div class="stat"><div class="num" id="s-pending">0</div><div class="lbl">待迁移</div></div>
       <div class="stat"><div class="num" id="s-transferring">0</div><div class="lbl">正在迁移</div></div>
-      <div class="stat orange"><div class="num" id="s-failed">0</div><div class="lbl">失败</div></div>
+      <div class="stat red"><div class="num" id="s-failed">0</div><div class="lbl">失败</div></div>
       <div class="stat orange"><div class="num" id="s-conflict">0</div><div class="lbl">冲突</div></div>
-      <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">累计完成</div></div>
+      <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">队列已完成</div></div>
+    </div>
+    <div class="insight-grid">
+      <section class="panel"><div class="panel-heading"><div><span class="eyebrow">QUEUE MIX</span><h2>队列状态分布</h2><p>当前全部队列条目，不含今日迁移计数</p></div></div><div class="donut-layout"><div class="donut" id="queue-donut" role="img" aria-label="队列状态分布"><div class="donut-center"><strong id="queue-total">—</strong><span>队列总数</span></div></div><div class="chart-legend" id="queue-legend"></div></div></section>
+      <section class="panel"><div class="panel-heading"><div><span class="eyebrow">WORKLOAD</span><h2>当前待处理</h2><p>待迁移、进行中及异常项的相对数量</p></div></div><div class="stage-bars" id="stage-bars"></div></section>
     </div>
     <div class="panel scan-panel"><div class="panel-heading"><div><span class="eyebrow">SCAN SCHEDULE</span><h2>扫描计划</h2><p>按配置展示下一次扫描；倒计时每秒更新，可单独立即扫描源目录；历史目标 NFO 巡检需在任务管理中手动确认。</p></div><span class="panel-hint">手动扫描不会中断正在进行的迁移</span></div><div id="dash-scan-list" class="scan-grid"><div class="empty">加载扫描计划中…</div></div></div>
     <div class="panel"><div class="panel-heading"><div><span class="eyebrow">SYSTEM STATUS</span><h2>运行状态</h2></div></div><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div><button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button></div>
@@ -157,26 +165,31 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
   <!-- 队列 -->
   <div id="tab-queue" style="display:none">
     <div class="panel">
+      <div class="panel-heading"><div><span class="eyebrow">TRANSFER QUEUE</span><h2>迁移队列</h2><p>按状态与路径查找全部队列记录</p></div></div>
+      <div class="toolbar"><label for="queue-search" class="hint">搜索文件</label><input id="queue-search" type="search" placeholder="文件名 / 相对路径 / 源或目标路径" autocomplete="off" maxlength="256"></div>
       <div class="filters" id="queue-filters">
         <button data-s="" class="active">全部</button>
-        <button data-s="pending">pending</button>
-        <button data-s="transferring">transferring</button>
-        <button data-s="done">done</button>
-        <button data-s="failed">failed</button>
-        <button data-s="conflict">conflict</button>
+        <button data-s="pending">待迁移</button>
+        <button data-s="transferring">迁移中</button>
+        <button data-s="done">已完成</button>
+        <button data-s="failed">失败</button>
+        <button data-s="conflict">冲突</button>
+        <button data-s="accounting_pending">待记账</button>
         <button class="btn small gray" style="margin-left:auto" onclick="clearQueue('done')">清除已完成</button>
         <button class="btn small gray" onclick="clearQueue('failed')">清除失败</button>
         <button class="btn small gray" onclick="clearQueue('conflict')">清除冲突</button>
         <button class="btn small red" onclick="clearQueue('all')">清空全部</button>
         <button class="btn small red" onclick="retryFailed()">重试全部失败项</button>
       </div>
-      <div id="queue-list"></div>
+      <div id="queue-list"></div><div class="pager" id="queue-pager"></div>
     </div>
   </div>
 
   <!-- 日志 -->
   <div id="tab-logs" style="display:none">
-    <div class="panel"><h2>迁移日志 <button class="btn small red" style="float:right" onclick="clearLogs()">清空日志</button></h2><div id="log-list"></div></div>
+    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">ACTIVITY</span><h2>迁移日志</h2><p>按结果、任务及关键字查找历史记录</p></div><button class="btn small red" onclick="clearLogs()">清空全部日志</button></div>
+      <div class="toolbar"><label for="log-search" class="hint">搜索日志</label><input id="log-search" type="search" placeholder="源/目标路径、详情" autocomplete="off" maxlength="256"><select id="log-status" aria-label="日志结果"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option><option value="conflict">冲突</option></select><select id="log-task" aria-label="所属任务"><option value="">全部任务</option></select></div>
+      <div id="log-list"></div><div class="pager" id="log-pager"></div></div>
   </div>
 
   <!-- 文件浏览 -->
@@ -193,26 +206,28 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
 
   <!-- 设置 -->
   <div id="tab-settings" style="display:none">
-    <div class="panel">
-      <h2>全局设置（保存后下一周期生效）</h2>
-      <form id="settings-form">
-        <div class="row">
-          <div class="field small"><label>全局扫描间隔（秒）</label><input id="g-scan" type="number" min="1"></div>
-          <div class="field small"><label>采样间隔（秒）</label><input id="g-stable-s" type="number" min="0" max="3600"></div>
-<div class="field small"><label>文件静默期（秒，立即同步也生效）</label><input id="g-quiet-s" type="number" min="0" max="86400"></div>
-          <div class="field small"><label>最大重试次数</label><input id="g-retries" type="number" min="0"></div>
-        </div>
-        <div class="row" style="gap:24px">
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-stable"> 双采样检测（静默期保护始终启用）</label>
-          <span class="log-detail">安全迁移与完整性校验：始终启用（复制后进行 hash/读回校验；源文件按任务策略处理）</span>
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-empty"> 清理迁移后的空目录</label>
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-nfo"> nfo 预处理（迁移前修正：actor 数字UID name→role）</label>
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="g-douyin"> 抖音 nfo 自动生成（无 nfo 的视频按文件名生成简易 nfo）</label>
-        </div>
-        <button class="btn" type="submit">保存设置</button>
-        <span id="settings-msg" style="color:var(--ok);margin-left:12px;font-size:13px"></span>
-      </form>
-    </div>
+    <div class="settings-intro"><span class="eyebrow">PREFERENCES / 全局配置</span><h2>设置与安全策略</h2><p>按用途调整扫描节奏与文件处理方式；保存后从下一周期开始生效。</p></div>
+    <form id="settings-form">
+      <div class="settings-grid">
+        <section class="panel settings-card"><span class="eyebrow">01 / SCHEDULING</span><h2>扫描与重试</h2><p class="log-detail">控制定时扫描和异常后的重试频率。</p>
+          <div class="row"><div class="field small"><label for="g-scan">全局扫描间隔 · 秒</label><input id="g-scan" type="number" min="1" required></div><div class="field small"><label for="g-retries">最大重试次数</label><input id="g-retries" type="number" min="0" required></div></div>
+          <div class="settings-note">任务单独设置的扫描间隔优先于此处的全局值。</div>
+        </section>
+        <section class="panel settings-card"><span class="eyebrow">02 / FILE SAFETY</span><h2>文件稳定性</h2><p class="log-detail">避免未写完的文件过早进入迁移队列。</p>
+          <div class="row"><div class="field small"><label for="g-stable-s">采样间隔 · 秒</label><input id="g-stable-s" type="number" min="0" max="3600" required></div><div class="field small"><label for="g-quiet-s">文件静默期 · 秒</label><input id="g-quiet-s" type="number" min="0" max="86400" required></div></div>
+          <label class="settings-option"><input type="checkbox" id="g-stable"><span><b>双采样检测</b><small>额外检查文件大小是否稳定；静默期保护始终启用，包括立即同步。</small></span></label>
+          <div class="settings-note">安全迁移及完整性校验始终启用：复制后 hash / 读回校验，再按任务策略处理源文件。</div>
+        </section>
+        <section class="panel settings-card"><span class="eyebrow">03 / HOUSEKEEPING</span><h2>目录整理</h2><p class="log-detail">迁移完成后的本地目录处理。</p>
+          <label class="settings-option"><input type="checkbox" id="g-empty"><span><b>清理空目录</b><small>仅清理迁移后留下的空目录。</small></span></label>
+        </section>
+        <section class="panel settings-card"><span class="eyebrow">04 / METADATA</span><h2>NFO 元数据</h2><p class="log-detail">这些选项作用于迁移前的文件，不会自动巡检历史目标目录。</p>
+          <label class="settings-option"><input type="checkbox" id="g-nfo"><span><b>NFO 预处理</b><small>修正 actor 数字 UID 的 name → role。</small></span></label>
+          <label class="settings-option"><input type="checkbox" id="g-douyin"><span><b>抖音 NFO 自动生成</b><small>无 NFO 的视频按文件名生成简易信息。</small></span></label>
+        </section>
+      </div>
+      <div class="settings-save"><button class="btn" type="submit">保存设置</button><span class="log-detail">更改在下一周期生效</span><span id="settings-msg" role="status" style="margin-left:auto;font-size:13px"></span></div>
+    </form>
   </div>
 </div>
 
@@ -229,7 +244,7 @@ $$(".tabs button").forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==="browse")browseTo(browseRel);
   if(b.dataset.tab==="tasks")loadTasks();
   if(b.dataset.tab==="queue")loadQueue();
-  if(b.dataset.tab==="logs")loadLogs();
+  if(b.dataset.tab==="logs"){loadLogTasks();loadLogs();}
   if(b.dataset.tab==="settings")loadSettings();
 });
 
@@ -301,6 +316,31 @@ function renderScanSchedules(){
   tickScanCountdowns();
   scanSchedules.forEach(s=>updateSyncBtn(s.id));
 }
+const chartSeries=[
+  {key:"pending",label:"待迁移",color:"#3b82f6"},{key:"transferring",label:"迁移中",color:"#805ee8"},
+  {key:"accounting_pending",label:"待记账",color:"#13a6a0"},{key:"failed",label:"失败",color:"#d64752"},
+  {key:"conflict",label:"冲突",color:"#dd9730"},{key:"done",label:"已完成",color:"#0e9f6e"}
+];
+function renderQueueCharts(d){
+  if(d.pending==null || d.transferring==null || d.failed==null || d.conflict==null || d.done==null){
+    $("#queue-total").textContent="—";$("#queue-donut").style.background="#dfe7f2";
+    $("#queue-donut").setAttribute("aria-label","队列统计暂不可用");
+    $("#queue-legend").textContent="状态暂不可用";$("#stage-bars").textContent="状态暂不可用";
+    return;
+  }
+  const series=chartSeries.map(item=>({...item,value:Math.max(0,Number(d[item.key])||0)}));
+  const total=series.reduce((sum,item)=>sum+item.value,0);
+  const donut=$("#queue-donut");
+  let from=0;
+  donut.style.background=total?`conic-gradient(${series.filter(item=>item.value).map(item=>{
+    const start=from;from+=item.value/total*100;return `${item.color} ${start}% ${from}%`;
+  }).join(",")})`:"#dfe7f2";
+  donut.setAttribute("aria-label",total?series.filter(item=>item.value).map(item=>`${item.label} ${item.value}`).join("，"):"队列为空");
+  $("#queue-total").textContent=total.toLocaleString("zh-CN");
+  $("#queue-legend").innerHTML=series.map(item=>`<div class="legend-row"><span class="legend-dot" style="background:${item.color}"></span>${item.label}<b>${item.value.toLocaleString("zh-CN")}</b></div>`).join("");
+  const active=series.filter(item=>item.key!=="done"),max=Math.max(1,...active.map(item=>item.value));
+  $("#stage-bars").innerHTML=active.map(item=>`<div class="stage-row"><span>${item.label}</span><div class="stage-track"><span class="stage-fill" style="width:${item.value/max*100}%;background:${item.color}"></span></div><b>${item.value.toLocaleString("zh-CN")}</b></div>`).join("");
+}
 async function loadDash(){
   if(dashBusy)return;
   dashBusy=true;
@@ -320,6 +360,7 @@ async function loadDash(){
     $("#s-moved").textContent=d.moved_today??"—";$("#s-pending").textContent=d.pending??"—";
     $("#s-transferring").textContent=d.transferring??"—";
     $("#s-failed").textContent=d.failed??"—";$("#s-conflict").textContent=d.conflict??"—";$("#s-done").textContent=d.done??"—";
+    renderQueueCharts(d);
     $("#current-file").textContent=d.current_file?("迁移中: "+d.current_file):"空闲";
     const h=Math.floor(d.uptime_seconds/3600),m=Math.floor(d.uptime_seconds%3600/60);
     $("#uptime").textContent=`已运行 ${h}小时${m}分钟 · 全局扫描间隔 ${d.settings?.scan_interval??"—"}s`;
@@ -341,6 +382,7 @@ async function loadDash(){
     $("#uptime").textContent="";$("#status-warnings").textContent="";
     $("#exclude-error-dir").style.display="none";
     $("#dash-scan-list").innerHTML='<div class="empty">扫描计划加载失败：'+esc(e.message)+'</div>';scanSchedules=[];
+    renderQueueCharts({});
   }
   finally{dashBusy=false;}
 }
@@ -653,19 +695,38 @@ async function delTask(id){
   }catch(e){alert("删除任务失败: "+e.message);}
 }
 
-async function loadQueue(){
-  try{
-    const items=await api("/api/queue?status="+curQueueFilter+"&limit=200");
-    if(!items.length){$("#queue-list").innerHTML='<div class="empty">'+(curQueueFilter?"当前筛选状态没有队列项，请切换到「全部」查看":"队列为空")+'</div>';return;}
-    $("#queue-list").innerHTML=`<table><tr><th>ID</th><th>文件</th><th>大小</th><th>状态</th><th>重试</th><th>时间</th><th></th></tr>`+
-      items.map(q=>`<tr><td>${q.id}</td><td>${esc(q.rel_path)}</td><td>${fmtSize(q.size)}</td>
-        <td><span class="tag ${q.status}">${q.status}</span></td><td>${q.retries}</td><td>${q.updated_at}</td>
-        <td>${["failed","conflict"].includes(q.status)?`<button class="btn small" onclick="retryOne(${q.id})">重试</button>`:""}</td></tr>`).join("")+"</table>";
-  }catch(e){$("#queue-list").innerHTML='<div class="empty">队列加载失败：'+esc(e.message)+'</div>';}
+const queueStatusLabels={pending:"待迁移",transferring:"迁移中",accounting_pending:"待记账",done:"已完成",failed:"失败",conflict:"冲突"};
+const PAGE_SIZE=50;
+let queuePage=0,logPage=0,queueRequestId=0,logRequestId=0;
+function renderPager(id,page,total,change){
+  const pages=Math.ceil(total/PAGE_SIZE),box=$(id);
+  box.innerHTML=total?`<span>共 ${total.toLocaleString("zh-CN")} 条 · 第 ${page+1} / ${pages} 页</span><button class="btn small gray" data-page="prev" ${page===0?"disabled":""}>上一页</button><button class="btn small gray" data-page="next" ${page>=pages-1?"disabled":""}>下一页</button>`:"";
+  box.querySelector('[data-page="prev"]')?.addEventListener("click",()=>change(page-1));
+  box.querySelector('[data-page="next"]')?.addEventListener("click",()=>change(page+1));
 }
+function debounceSearch(input,callback){
+  let timer;
+  input.addEventListener("input",()=>{clearTimeout(timer);timer=setTimeout(callback,300);});
+}
+async function loadQueue(){
+  const requestId=++queueRequestId,page=queuePage;
+  const params=new URLSearchParams({status:curQueueFilter,search:$("#queue-search").value.trim(),limit:PAGE_SIZE,offset:page*PAGE_SIZE,with_total:"true"});
+  try{
+    const {items,total}=await api("/api/queue?"+params);
+    if(requestId!==queueRequestId)return;
+    if(!items.length && total && page>0){queuePage=Math.ceil(total/PAGE_SIZE)-1;return loadQueue();}
+    if(!items.length)$("#queue-list").innerHTML='<div class="empty">'+(params.get("search")||curQueueFilter?"未找到匹配的队列项，请调整搜索或状态":"队列为空")+'</div>';
+    else $("#queue-list").innerHTML=`<div class="table-wrap"><table><tr><th>ID</th><th>文件</th><th>大小</th><th>状态</th><th>重试</th><th>时间</th><th></th></tr>`+
+      items.map(q=>`<tr><td>${q.id}</td><td class="path-cell" title="${esc(q.src_path)}">${esc(q.rel_path)}</td><td>${fmtSize(q.size)}</td>
+        <td><span class="tag ${esc(q.status)}">${queueStatusLabels[q.status]||esc(q.status)}</span></td><td>${q.retries}</td><td>${esc(q.updated_at)}</td>
+        <td>${["failed","conflict"].includes(q.status)?`<button class="btn small" onclick="retryOne(${q.id})">重试</button>`:""}</td></tr>`).join("")+"</table></div>";
+    renderPager("#queue-pager",page,total,p=>{queuePage=p;loadQueue();$("#tab-queue").scrollIntoView({behavior:"smooth"});});
+  }catch(e){if(requestId!==queueRequestId)return;$("#queue-list").innerHTML='<div class="empty">队列加载失败：'+esc(e.message)+'</div>';$("#queue-pager").innerHTML="";}
+}
+debounceSearch($("#queue-search"),()=>{queuePage=0;loadQueue();});
 $$("#queue-filters button[data-s]").forEach(b=>b.onclick=()=>{
   $$("#queue-filters button[data-s]").forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  curQueueFilter=b.dataset.s;loadQueue();
+  curQueueFilter=b.dataset.s;queuePage=0;loadQueue();
 });
 async function retryOne(id){
   try{await api(`/api/queue/${id}/retry`,{method:"POST"});loadQueue();loadDash();}
@@ -692,16 +753,33 @@ async function retryFailed(){
   }catch(e){loadQueue();alert("批量重试失败: "+e.message);}
 }
 
-async function loadLogs(){
+async function loadLogTasks(){
   try{
-    const logs=await api("/api/logs?limit=100");
-    if(!logs.length){$("#log-list").innerHTML='<div class="empty">暂无日志</div>';return;}
-    $("#log-list").innerHTML=`<table><tr><th>时间</th><th>文件</th><th>结果</th><th>耗时</th><th>详情</th></tr>`+
-      logs.map(l=>`<tr><td>${l.created_at}</td><td>${esc(l.src_path)}</td>
-        <td><span class="tag ${l.result==="success"?"done":l.result==="failed"?"failed":"conflict"}">${l.result}</span></td>
-        <td>${l.duration_ms}ms</td><td class="log-detail">${esc(l.detail)}</td></tr>`).join("")+"</table>";
-  }catch(e){$("#log-list").innerHTML='<div class="empty">日志加载失败：'+esc(e.message)+'</div>';}
+    const tasks=await api("/api/tasks"),select=$("#log-task"),chosen=select.value;
+    select.innerHTML='<option value="">全部任务</option>'+tasks.map(t=>`<option value="${t.id}">${esc(t.name)}</option>`).join("");
+    if([...select.options].some(o=>o.value===chosen))select.value=chosen;
+  }catch(_){/* 任务暂不可用时保持现有选择，不影响日志搜索。 */}
 }
+async function loadLogs(){
+  const requestId=++logRequestId,page=logPage;
+  const params=new URLSearchParams({limit:PAGE_SIZE,offset:page*PAGE_SIZE,with_total:"true"});
+  if($("#log-search").value.trim())params.set("search",$("#log-search").value.trim());
+  if($("#log-status").value)params.set("status",$("#log-status").value);
+  if($("#log-task").value)params.set("task_id",$("#log-task").value);
+  try{
+    const {items,total}=await api("/api/logs?"+params);
+    if(requestId!==logRequestId)return;
+    if(!items.length && total && page>0){logPage=Math.ceil(total/PAGE_SIZE)-1;return loadLogs();}
+    if(!items.length)$("#log-list").innerHTML='<div class="empty">'+(params.has("search")||params.has("status")||params.has("task_id")?"未找到匹配的日志":"暂无日志")+'</div>';
+    else $("#log-list").innerHTML=`<div class="table-wrap"><table><tr><th>时间</th><th>文件</th><th>结果</th><th>耗时</th><th>详情</th></tr>`+
+      items.map(l=>`<tr><td>${esc(l.created_at)}</td><td class="path-cell" title="${esc(l.dst_path)}">${esc(l.src_path)}</td>
+        <td><span class="tag ${l.result==="success"?"done":l.result==="failed"?"failed":"conflict"}">${{success:"成功",failed:"失败",conflict:"冲突"}[l.result]||esc(l.result)}</span></td>
+        <td>${l.duration_ms}ms</td><td class="log-detail path-cell">${esc(l.detail)}</td></tr>`).join("")+"</table></div>";
+    renderPager("#log-pager",page,total,p=>{logPage=p;loadLogs();$("#tab-logs").scrollIntoView({behavior:"smooth"});});
+  }catch(e){if(requestId!==logRequestId)return;$("#log-list").innerHTML='<div class="empty">日志加载失败：'+esc(e.message)+'</div>';$("#log-pager").innerHTML="";}
+}
+debounceSearch($("#log-search"),()=>{logPage=0;loadLogs();});
+["#log-status","#log-task"].forEach(id=>$(id).addEventListener("change",()=>{logPage=0;loadLogs();}));
 
 async function loadSettings(){
   try{
@@ -720,8 +798,8 @@ $("#settings-form").onsubmit=async e=>{
     remove_empty_dirs:$("#g-empty").checked,
     nfo_fix_enabled:$("#g-nfo").checked,
     douyin_nfo_enabled:$("#g-douyin").checked})});
-    $("#settings-msg").textContent="已保存 ✓";loadDash();setTimeout(()=>$("#settings-msg").textContent="",2000);
-  }catch(err){$("#settings-msg").textContent="保存失败: "+err.message;}
+    $("#settings-msg").style.color="var(--ok)";$("#settings-msg").textContent="已保存 ✓";loadDash();setTimeout(()=>$("#settings-msg").textContent="",2000);
+  }catch(err){$("#settings-msg").style.color="var(--err)";$("#settings-msg").textContent="保存失败: "+err.message;}
 };
 
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
