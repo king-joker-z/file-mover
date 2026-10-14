@@ -93,11 +93,12 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
     <div class="cards">
       <div class="stat green"><div class="num" id="s-moved">0</div><div class="lbl">今日已迁移</div></div>
       <div class="stat"><div class="num" id="s-pending">0</div><div class="lbl">待迁移</div></div>
+      <div class="stat"><div class="num" id="s-transferring">0</div><div class="lbl">正在迁移</div></div>
       <div class="stat orange"><div class="num" id="s-failed">0</div><div class="lbl">失败</div></div>
       <div class="stat orange"><div class="num" id="s-conflict">0</div><div class="lbl">冲突</div></div>
       <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">累计完成</div></div>
     </div>
-    <div class="panel scan-panel"><div class="panel-heading"><div><span class="eyebrow">SCAN SCHEDULE</span><h2>扫描计划</h2><p>按配置展示下一次扫描；倒计时每秒更新，可单独立即触发全量扫描。</p></div><span class="panel-hint">手动扫描不会中断正在进行的迁移</span></div><div id="dash-scan-list" class="scan-grid"><div class="empty">加载扫描计划中…</div></div></div>
+    <div class="panel scan-panel"><div class="panel-heading"><div><span class="eyebrow">SCAN SCHEDULE</span><h2>扫描计划</h2><p>按配置展示下一次扫描；倒计时每秒更新，可单独立即扫描源目录；历史目标 NFO 巡检需在任务管理中手动确认。</p></div><span class="panel-hint">手动扫描不会中断正在进行的迁移</span></div><div id="dash-scan-list" class="scan-grid"><div class="empty">加载扫描计划中…</div></div></div>
     <div class="panel"><div class="panel-heading"><div><span class="eyebrow">SYSTEM STATUS</span><h2>运行状态</h2></div></div><div class="current" id="current-file">空闲</div><div class="log-detail" id="uptime"></div><div class="status-warnings" id="status-warnings" role="status"></div><button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button></div>
   </div>
 
@@ -242,16 +243,18 @@ function setApiToken(){
   return !!value.trim();
 }
 async function api(path,opts={}){
+  const {onAuthChallenge,...requestOpts}=opts;
   async function send(){
-    const headers=new Headers(opts.headers||{}),token=sessionStorage.getItem("filemover_api_token");
+    const headers=new Headers(requestOpts.headers||{}),token=sessionStorage.getItem("filemover_api_token");
     if(token)headers.set("Authorization","Bearer "+token);
-    return fetch(path,{...opts,headers,credentials:"same-origin"});
+    return fetch(path,{...requestOpts,headers,credentials:"same-origin"});
   }
   let r=await send();
   if(r.status===401 && !tokenPromptDismissed){
+    onAuthChallenge?.("start");
     sessionStorage.removeItem("filemover_api_token");
     if(!tokenPrompt)tokenPrompt=Promise.resolve().then(()=>setApiToken()).finally(()=>{tokenPrompt=null;});
-    if(await tokenPrompt)r=await send();
+    if(await tokenPrompt){onAuthChallenge?.("resume");r=await send();}
   }
   if(!r.ok){
     const body=await r.json().catch(()=>({}));
@@ -283,10 +286,11 @@ function renderScanSchedules(){
   const box=$("#dash-scan-list");
   if(!scanSchedules.length){box.innerHTML='<div class="empty">暂无任务 · 前往任务管理创建第一个迁移任务</div>';return;}
   box.innerHTML=scanSchedules.map(s=>{
-    const label={disabled:"已停用",manual:"手动扫描",scanning:"定时扫描",cooldown:"故障冷却",scheduled:"运行中"}[s.status]||"等待中";
+    const label=s.status==="manual"&&s.backfill_nfo?"历史 NFO 巡检":
+      ({disabled:"已停用",manual:"手动扫描",scanning:"定时扫描",cooldown:"故障冷却",scheduled:"运行中"}[s.status]||"等待中");
     const active=s.status==="manual"||s.status==="scanning";
-    const detail=active?`${s.current||"扫描准备中"} · 已发现 ${s.scanned} · 新入队 ${s.enqueued}`:
-      s.status==="cooldown"?"源目录故障后等待重试":`扫描间隔 ${s.interval_seconds} 秒 · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
+    const detail=active?`${s.current||"扫描准备中"} · ${s.backfill_nfo&&s.backfill_total?`历史视频已检查 ${s.backfill_checked}/${s.backfill_total} · `:""}源目录已发现 ${s.scanned} · 新入队 ${s.enqueued}`:
+      s.status==="cooldown"?"挂载 I/O 故障后等待重试":`扫描间隔 ${s.interval_seconds} 秒 · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
     return `<article class="scan-card"><div class="scan-card-top"><div class="scan-symbol" aria-hidden="true">↻</div><span class="tag scan-state ${esc(s.status)}">${label}</span></div>
       <h3 title="${esc(s.name)}">${esc(s.name)}</h3><div class="scan-path" title="${esc(s.src_dir)}">${esc(s.src_dir)} <span>→</span> ${esc(s.dst_dir)}</div>
       <div class="scan-divider"></div><div class="scan-caption">${s.status==="cooldown"?"下次尝试":s.status==="disabled"?"扫描状态":"距下次扫描"}</div>
@@ -303,16 +307,19 @@ async function loadDash(){
   try{
     const d=await api("/api/dashboard");
     serverClockOffset=Date.now()/1000-d.server_time;
-    scanSchedules=d.scan_schedules||[];
+    const schedulesAvailable=Array.isArray(d.scan_schedules);
+    scanSchedules=schedulesAvailable?d.scan_schedules:[];
     scanSchedules.forEach(s=>{
-      if(s.status==="manual" && !syncUI[s.id]?.running){
-        syncUI[s.id]={running:true,starting:false,scanned:s.scanned,enqueued:s.enqueued,current:s.current||"",error:null,finished:false};
+      if(s.status==="manual" && s.request_id && syncUI[s.id]?.requestId!==s.request_id){
+        syncUI[s.id]={running:true,starting:false,scanned:s.scanned,enqueued:s.enqueued,current:s.current||"",error:null,finished:false,requestId:s.request_id,backfillNfo:!!s.backfill_nfo};
         pollSyncProgress();
       }
     });
-    renderScanSchedules();
-    $("#s-moved").textContent=d.moved_today;$("#s-pending").textContent=d.pending;
-    $("#s-failed").textContent=d.failed;$("#s-conflict").textContent=d.conflict;$("#s-done").textContent=d.done;
+    if(schedulesAvailable)renderScanSchedules();
+    else $("#dash-scan-list").innerHTML='<div class="empty">任务列表暂不可用，请稍后重试；已有任务未被清空</div>';
+    $("#s-moved").textContent=d.moved_today??"—";$("#s-pending").textContent=d.pending??"—";
+    $("#s-transferring").textContent=d.transferring??"—";
+    $("#s-failed").textContent=d.failed??"—";$("#s-conflict").textContent=d.conflict??"—";$("#s-done").textContent=d.done??"—";
     $("#current-file").textContent=d.current_file?("迁移中: "+d.current_file):"空闲";
     const h=Math.floor(d.uptime_seconds/3600),m=Math.floor(d.uptime_seconds%3600/60);
     $("#uptime").textContent=`已运行 ${h}小时${m}分钟 · 全局扫描间隔 ${d.settings?.scan_interval??"—"}s`;
@@ -322,11 +329,19 @@ async function loadDash(){
     if(d.worker_alive===false)warnings.push("迁移线程已停止，请重启服务");
     if(d.last_scan_error)warnings.push("最近扫描异常: "+d.last_scan_error);
     if(d.accounting_pending>0)warnings.push(`待补偿记账: ${d.accounting_pending} 项`);
+    if(d.last_worker_error)warnings.push("最近迁移异常: "+d.last_worker_error);
+    if(d.last_accounting_error)warnings.push(d.last_accounting_error);
     $("#status-warnings").textContent=warnings.join("\n");
     const excludeBtn=$("#exclude-error-dir");
     excludeBtn.style.display=d.last_scan_error_path && d.last_scan_error_task_id!=null && d.last_scan_error?.includes("枚举目录失败")?"":"none";
     excludeBtn.onclick=()=>prepareExcludeDir(d.last_scan_error_task_id,d.last_scan_error_path);
-  }catch(e){$("#current-file").textContent=e.message;$("#status-warnings").textContent="";$("#exclude-error-dir").style.display="none";$("#dash-scan-list").innerHTML='<div class="empty">扫描计划加载失败：'+esc(e.message)+'</div>';scanSchedules=[];}
+  }catch(e){
+    $("#current-file").textContent="状态加载失败: "+e.message;
+    ["#s-moved","#s-pending","#s-transferring","#s-failed","#s-conflict","#s-done"].forEach(id=>$(id).textContent="—");
+    $("#uptime").textContent="";$("#status-warnings").textContent="";
+    $("#exclude-error-dir").style.display="none";
+    $("#dash-scan-list").innerHTML='<div class="empty">扫描计划加载失败：'+esc(e.message)+'</div>';scanSchedules=[];
+  }
   finally{dashBusy=false;}
 }
 
@@ -358,19 +373,22 @@ async function loadTasks(){
       tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td>
         <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.filename_nfo_enabled?" · NFO补全":""}</td>
-        <td><label class="switch"><input type="checkbox" ${t.enabled?"checked":""} onchange="toggleTask(${t.id})"><span class="slider"></span></label></td>
+        <td><label class="switch"><input type="checkbox" aria-label="启用任务 ${esc(t.name)}" ${t.enabled?"checked":""} onchange="toggleTask(${t.id},this)"><span class="slider"></span></label></td>
         <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
         <button class="btn small green" data-sync-id="${t.id}" onclick="syncNow(${t.id})">立即同步</button>
+        <button class="btn small gray" data-backfill-id="${t.id}" onclick="syncNow(${t.id},true)" title="逐个校验历史目标视频，缺 NFO 时读取整段视频，可能产生大量远端 I/O">补齐历史 NFO…</button>
         <span class="sync-error" data-sync-error="${t.id}" role="alert"></span>
         <span class="sync-status" data-sync-status="${t.id}" role="status"></span>
         <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table>";
     tasks.forEach(t=>updateSyncBtn(t.id));
-  }catch(e){}
+  }catch(e){$("#task-list").innerHTML='<div class="empty">任务加载失败：'+esc(e.message)+'</div>';}
 }
 
 async function editTask(id){
-  const t = (await api("/api/tasks")).find(x=>x.id===id);
-  if(!t) return;
+  let t;
+  try{t=(await api("/api/tasks")).find(x=>x.id===id);}
+  catch(e){alert("读取任务失败: "+e.message);return;}
+  if(!t){alert("任务已不存在，请刷新列表");return;}
   editingTaskId = id;
   $("#f-name").value=t.name; $("#f-src").value=t.src_dir; $("#f-dst").value=t.dst_dir;
   $("#f-interval").value=t.interval_seconds; $("#f-scan").value=t.scan_interval;
@@ -394,8 +412,10 @@ function resetFormMode(){
 let pickerKind = null;
 let pickerSelRel = "";    // 选中的相对路径
 let pickerSelAbs = "";    // 选中的绝对路径（展示用）
+let pickerRequestId = 0;
 
 function openPicker(kind) {
+  const requestId=++pickerRequestId;
   pickerKind = kind;
   pickerSelRel = ""; pickerSelAbs = "";
   $("#picker-sel").textContent = "";
@@ -403,12 +423,15 @@ function openPicker(kind) {
   const tree = $("#picker-tree");
   tree.innerHTML = '<div class="empty">加载中…</div>';
   api("/api/dirs").then(d => {
+    if(requestId!==pickerRequestId)return;
     tree.innerHTML = "";
     d.dirs.forEach(n => tree.appendChild(makeNode(d.rel ? d.rel + "/" + n : n, n)));
-  }).catch(e => tree.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>');
+  }).catch(e => {
+    if(requestId===pickerRequestId)tree.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
+  });
 }
 
-function closePicker() { $("#picker-mask").style.display = "none"; }
+function closePicker() { ++pickerRequestId; pickerKind=null; $("#picker-mask").style.display = "none"; }
 
 function makeNode(rel, name) {
   const row = document.createElement("div");
@@ -446,6 +469,7 @@ function makeNode(rel, name) {
   arrow.onclick = (ev) => { ev.stopPropagation(); toggle(); };
 
   row.onclick = () => {
+    const requestId=++pickerRequestId;
     pickerSelRel = rel; pickerSelAbs = "";
     const tree = $("#picker-tree");
     tree.querySelectorAll(".dir-item.sel").forEach(x => x.classList.remove("sel"));
@@ -453,9 +477,12 @@ function makeNode(rel, name) {
     $("#picker-sel").textContent = "已选: /" + rel;
     // 顺手预取绝对路径用于回填
     api("/api/dirs?rel=" + encodeURIComponent(rel)).then(d => {
+      if(requestId!==pickerRequestId || pickerSelRel!==rel)return;
       pickerSelAbs = d.path;
       $("#picker-sel").textContent = "已选: " + d.path;
-    }).catch(() => {});
+    }).catch(e => {
+      if(requestId===pickerRequestId)$("#picker-sel").textContent = "目录读取失败: " + e.message;
+    });
   };
 
   row.appendChild(childBox);
@@ -493,17 +520,44 @@ $("#task-form").onsubmit=async e=>{
   }catch(err){ alert("保存失败: "+err.message); return; }
   e.target.reset(); resetFormMode(); loadTasks(); loadDash();
 };
-async function toggleTask(id){await api(`/api/tasks/${id}/toggle`,{method:"POST"});loadTasks();loadDash();}
-async function syncNow(id){
+async function toggleTask(id,checkbox){
+  checkbox.disabled=true;
+  try{
+    const result=await api(`/api/tasks/${id}/toggle`,{method:"POST"});
+    checkbox.checked=!!result.enabled;
+    loadTasks();loadDash();
+  }catch(e){
+    checkbox.checked=!checkbox.checked;
+    alert("切换任务状态失败: "+e.message);
+  }finally{checkbox.disabled=false;}
+}
+function newSyncRequestId(){
+  // 局域网 HTTP 地址不是安全上下文，randomUUID 可能不可用；getRandomValues 仍可使用。
+  const bytes=crypto.getRandomValues(new Uint8Array(16));
+  bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;
+  const hex=Array.from(bytes,b=>b.toString(16).padStart(2,"0")).join("");
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+async function syncNow(id, backfillNfo=false){
   if(syncUI[id]?.running) return;
+  if(backfillNfo && !confirm("补齐历史 NFO 会逐个检查已迁移视频的目标目录；对缺少 NFO 的视频会完整读回并校验哈希，可能产生大量远端 I/O，且会等待当前迁移完成。确认继续？"))return;
   const previous=syncUI[id]?.resetTimer;
   if(previous)clearTimeout(previous);
-  const st=syncUI[id]={running:true, starting:true, scanned:0, enqueued:0, error:null, finished:false};
+  const requestId=newSyncRequestId();
+  const st=syncUI[id]={running:true, starting:true, scanned:0, enqueued:0, error:null, finished:false,requestId,backfillNfo};
   updateSyncBtn(id);
-  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),15000);
+  const controller=new AbortController();
+  let timeout=setTimeout(()=>controller.abort(),15000);
   try{
-    await api(`/api/tasks/${id}/sync-now`,{method:"POST",signal:controller.signal});
+    const accepted=await api(`/api/tasks/${id}/sync-now?request_id=${requestId}${backfillNfo?"&backfill_nfo=true":""}`,{
+      method:"POST",signal:controller.signal,
+      onAuthChallenge:phase=>{
+        clearTimeout(timeout);
+        if(phase==="resume")timeout=setTimeout(()=>controller.abort(),15000);
+      }
+    });
     if(syncUI[id]!==st) return;
+    st.requestId=accepted.request_id||requestId;
     st.starting=false;
     pollSyncProgress();
     loadDash();
@@ -515,13 +569,13 @@ async function syncNow(id){
     if(e.name==="AbortError"){
       try{
         const p=await api(`/api/tasks/${id}/sync-progress`,{signal:AbortSignal.timeout(10000)});
-        if(syncUI[id]===st && (p.running||p.done)){
+        if(syncUI[id]===st && p.request_id===requestId && (p.running||p.done)){
           st.running=!!p.running;st.scanned=p.scanned||0;st.enqueued=p.enqueued||0;
-          st.current=p.current||"";st.error=p.error||null;st.finished=!!p.done&&!st.error;
+          st.current=p.current||"";st.backfillNfo=!!p.backfill_nfo;st.error=p.error||null;st.finished=!!p.done&&!st.error;
           if(st.running)pollSyncProgress();
-          updateSyncBtn(id);
-        }
-      }catch(_){}
+        }else if(syncUI[id]===st)st.error="未确认本次请求已受理，请检查扫描计划后重试";
+      }catch(_){if(syncUI[id]===st)st.error="无法查询提交结果，请检查扫描计划后重试";}
+      updateSyncBtn(id);
     }
     loadDash();
   }finally{clearTimeout(timeout);}
@@ -532,12 +586,16 @@ function updateSyncBtn(id){
   document.querySelectorAll(`button[data-sync-id="${id}"]`).forEach(btn=>{
     const dashboard=btn.classList.contains("scan-trigger");
     btn.title=st?.error||st?.current||"";
-    if(st?.running){btn.textContent=st.starting?"提交中…":`已发现 ${st.scanned} · 新入队 ${st.enqueued}`;btn.disabled=true;}
+    if(st?.running){btn.textContent=st.starting?"提交中…":st.backfillNfo?"历史 NFO 巡检中…":`已发现 ${st.scanned} · 新入队 ${st.enqueued}`;btn.disabled=true;}
     else if(unavailable){btn.textContent=dashboard?(schedule.enabled?"冷却中":"任务已停用"):"立即同步";btn.disabled=true;}
     else if(schedule?.status==="scanning"){btn.textContent="定时扫描中…";btn.disabled=true;}
     else if(st?.error){btn.textContent=dashboard?"重试扫描":"重试同步";btn.disabled=false;}
     else if(st?.finished){btn.textContent=`✓ 新入队 ${st.enqueued}`;btn.disabled=false;}
     else{btn.textContent=dashboard?"立即扫描":"立即同步";btn.disabled=false;}
+  });
+  document.querySelectorAll(`button[data-backfill-id="${id}"]`).forEach(btn=>{
+    btn.disabled=!!st?.running||!!unavailable||schedule?.status==="scanning";
+    btn.textContent=st?.running&&st.backfillNfo?"历史 NFO 巡检中…":"补齐历史 NFO…";
   });
   document.querySelectorAll(`[data-sync-error="${id}"]`).forEach(el=>el.textContent=st?.error||"");
   document.querySelectorAll(`[data-sync-status="${id}"]`).forEach(el=>el.textContent=st?.running && !st.starting?st.current||"":"");
@@ -560,8 +618,13 @@ function pollSyncProgress(){
         try{
           const p=await api(`/api/tasks/${id}/sync-progress`,{signal:AbortSignal.timeout(10000)});
           if(syncUI[id]!==st)continue;
+          if(p.request_id!==st.requestId){
+            st.running=false;st.error="无法确认本次扫描状态，请检查扫描计划";
+            updateSyncBtn(id);
+            continue;
+          }
           st.scanned=p.scanned||0;st.enqueued=p.enqueued||0;
-          st.current=p.current||"";st.error=p.error||null;st.pollFailures=0;
+          st.current=p.current||"";st.backfillNfo=!!p.backfill_nfo;st.error=p.error||null;st.pollFailures=0;
           st.running=!!p.running;
           st.finished=!st.running && !st.error;
           updateSyncBtn(id);
@@ -582,37 +645,51 @@ function pollSyncProgress(){
     }
   },500);
 }
-async function delTask(id){if(confirm("确认删除该任务及其队列？")){await api(`/api/tasks/${id}`,{method:"DELETE"});delete syncUI[id];loadTasks();loadDash();}}
+async function delTask(id){
+  if(!confirm("确认删除该任务及其队列？"))return;
+  try{
+    await api(`/api/tasks/${id}`,{method:"DELETE"});
+    delete syncUI[id];loadTasks();loadDash();
+  }catch(e){alert("删除任务失败: "+e.message);}
+}
 
 async function loadQueue(){
   try{
     const items=await api("/api/queue?status="+curQueueFilter+"&limit=200");
-    if(!items.length){$("#queue-list").innerHTML='<div class="empty">队列为空</div>';return;}
+    if(!items.length){$("#queue-list").innerHTML='<div class="empty">'+(curQueueFilter?"当前筛选状态没有队列项，请切换到「全部」查看":"队列为空")+'</div>';return;}
     $("#queue-list").innerHTML=`<table><tr><th>ID</th><th>文件</th><th>大小</th><th>状态</th><th>重试</th><th>时间</th><th></th></tr>`+
       items.map(q=>`<tr><td>${q.id}</td><td>${esc(q.rel_path)}</td><td>${fmtSize(q.size)}</td>
         <td><span class="tag ${q.status}">${q.status}</span></td><td>${q.retries}</td><td>${q.updated_at}</td>
         <td>${["failed","conflict"].includes(q.status)?`<button class="btn small" onclick="retryOne(${q.id})">重试</button>`:""}</td></tr>`).join("")+"</table>";
-  }catch(e){}
+  }catch(e){$("#queue-list").innerHTML='<div class="empty">队列加载失败：'+esc(e.message)+'</div>';}
 }
 $$("#queue-filters button[data-s]").forEach(b=>b.onclick=()=>{
   $$("#queue-filters button[data-s]").forEach(x=>x.classList.remove("active"));b.classList.add("active");
   curQueueFilter=b.dataset.s;loadQueue();
 });
-async function retryOne(id){await api(`/api/queue/${id}/retry`,{method:"POST"});loadQueue();}
+async function retryOne(id){
+  try{await api(`/api/queue/${id}/retry`,{method:"POST"});loadQueue();loadDash();}
+  catch(e){alert("重试失败: "+e.message);}
+}
 async function clearQueue(scope){
   const names={done:"已完成",failed:"失败",conflict:"冲突",all:"全部"};
   if(!confirm(`确认清除${names[scope]}队列条目？`))return;
   const q=scope==="all"?"?status=all":scope==="done"?"":`?status=${scope}`;
-  await api(`/api/queue${q}`,{method:"DELETE"});loadQueue();loadDash();
+  try{await api(`/api/queue${q}`,{method:"DELETE"});loadQueue();loadDash();}
+  catch(e){alert("清除队列失败: "+e.message);}
 }
 async function clearLogs(){
   if(!confirm("确认清空全部日志？"))return;
-  await api("/api/logs",{method:"DELETE"});loadLogs();
+  try{await api("/api/logs",{method:"DELETE"});loadLogs();}
+  catch(e){alert("清空日志失败: "+e.message);}
 }
 async function retryFailed(){
-  const items=await api("/api/queue?status=failed&limit=500");
-  if(items.length){await api("/api/queue/retry-batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(items.map(i=>i.id))});}
-  loadQueue();
+  if(!confirm("确认重试全部失败队列条目？"))return;
+  try{
+    const result=await api("/api/queue/retry-failed",{method:"POST"});
+    loadQueue();loadDash();
+    if(!result.retried)alert("当前没有失败项");
+  }catch(e){loadQueue();alert("批量重试失败: "+e.message);}
 }
 
 async function loadLogs(){
@@ -623,7 +700,7 @@ async function loadLogs(){
       logs.map(l=>`<tr><td>${l.created_at}</td><td>${esc(l.src_path)}</td>
         <td><span class="tag ${l.result==="success"?"done":l.result==="failed"?"failed":"conflict"}">${l.result}</span></td>
         <td>${l.duration_ms}ms</td><td class="log-detail">${esc(l.detail)}</td></tr>`).join("")+"</table>";
-  }catch(e){}
+  }catch(e){$("#log-list").innerHTML='<div class="empty">日志加载失败：'+esc(e.message)+'</div>';}
 }
 
 async function loadSettings(){
@@ -633,7 +710,7 @@ async function loadSettings(){
     $("#g-retries").value=s.max_retries;
     $("#g-stable").checked=s.stable_check;$("#g-empty").checked=s.remove_empty_dirs;
     $("#g-nfo").checked=s.nfo_fix_enabled!==false;$("#g-douyin").checked=!!s.douyin_nfo_enabled;
-  }catch(e){}
+  }catch(e){$("#settings-msg").textContent="设置加载失败: "+e.message;}
 }
 $("#settings-form").onsubmit=async e=>{
   e.preventDefault();
@@ -694,7 +771,8 @@ function browseTo(rel){
   });
 }
 function browseUp(){browseTo(browseNavRel.split("/").slice(0,-1).join("/"));}
-loadDash();setInterval(loadDash,3000);setInterval(tickScanCountdowns,1000);
+loadDash();setInterval(()=>{if(!document.hidden)loadDash();},3000);setInterval(tickScanCountdowns,1000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)loadDash();});
 </script>
 </body>
 </html>

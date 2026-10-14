@@ -109,8 +109,9 @@ def _fd_digest(fd: int) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None):
-    """在固定的目录描述符内原子发布并读回，避免父目录软链替换。"""
+def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None,
+                    overwrite: bool = False):
+    """在固定的目录描述符内原子发布并读回；非覆盖策略不得抢占并发创建的目标。"""
     if root is None:
         root = os.path.dirname(dst)
     name = os.path.basename(dst)
@@ -142,6 +143,34 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                                               dir_fd=parent_fd))
             if (size, digest) != (expected_size, expected_hash):
                 raise IOError("临时文件内容校验失败，源文件已保留")
+            if not overwrite:
+                # 硬链接的 EEXIST 检查与发布不可分割；rename 也不得覆盖外部新文件。
+                try:
+                    os.link(tmp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                            follow_symlinks=False)
+                except OSError as exc:
+                    if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+                        raise
+                    # 某些网盘不支持硬链接：排他创建仍保护已有文件，但不保证可见性原子化。
+                    exclusive_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                           0o600, dir_fd=parent_fd)
+                    try:
+                        with os.fdopen(exclusive_fd, "wb") as destination:
+                            with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
+                                                   dir_fd=parent_fd), "rb") as saved:
+                                for chunk in iter(lambda: saved.read(1 << 20), b""):
+                                    destination.write(chunk)
+                            destination.flush()
+                            os.fsync(destination.fileno())
+                    except OSError as write_exc:
+                        raise IOError(f"目标写入不完整，源已保留；请核查 {dst}: {write_exc}") from write_exc
+                size, digest = _fd_digest(os.open(name, os.O_RDONLY | os.O_NOFOLLOW,
+                                                  dir_fd=parent_fd))
+                os.unlink(tmp, dir_fd=parent_fd)
+                created = False
+                if (size, digest) != (expected_size, expected_hash):
+                    raise IOError("目标文件读回校验失败，源文件已保留")
+                return expected_hash
             # overwrite 时先为旧目标建立同目录硬链接；无法原子固定旧目标时拒绝覆盖。
             # 复制备份无法消除最后一次校验与 os.replace 间的竞争，不能作为安全回退。
             # 在发布后读回失败时保留备份，不能让旧目标和源文件同时失去保障。
@@ -186,8 +215,8 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     pass
 
 
-def _write_nfo(dst: str, content: bytes, root: str = None):
-    _write_verified(dst, content=content, root=root)
+def _write_nfo(dst: str, content: bytes, root: str = None, overwrite: bool = False):
+    _write_verified(dst, content=content, root=root, overwrite=overwrite)
 
 
 def _mount_identity(path: str):
@@ -273,6 +302,20 @@ def _paths_overlap(first: str, second: str) -> bool:
     return os.path.commonpath((a, b)) in (a, b)
 
 
+_TRANSIENT_IO_ERRNOS = {errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY}
+
+
+def _failed_io(item: dict, detail: str, exc: OSError) -> Tuple[str, str]:
+    """将挂载瞬时错误保留为结构化状态，供调度器暂停任务而不消耗重试次数。"""
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, OSError) and cause.errno in _TRANSIENT_IO_ERRNOS:
+            item["_transient_io"] = True
+            break
+        cause = cause.__cause__
+    return "failed", f"{detail}: {exc}"
+
+
 def transfer(item: dict, task: dict) -> Tuple[str, str]:
     """执行迁移，返回 (success/failed/conflict, detail)。"""
     src, dst = item["src_path"], item["dst_path"]
@@ -289,7 +332,9 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             return "failed", "目标路径不在任务目标目录中"
         if os.path.exists(dst) and os.path.exists(src) and os.path.samefile(src, dst):
             return "failed", "源与目标为同一文件，已拒绝迁移"
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        return _failed_io(item, "路径校验失败", exc)
+    except ValueError as exc:
         return "failed", f"路径校验失败: {exc}"
 
     cfg = config.get()
@@ -299,7 +344,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
     except FileNotFoundError:
         return "failed", "源文件不存在（可能已被移动或删除）"
     except OSError as exc:
-        return "failed", f"源路径状态读取失败: {exc}"
+        return _failed_io(item, "源路径状态读取失败", exc)
     is_nfo = src.lower().endswith(".nfo")
     if not stat.S_ISREG(source_info.st_mode):
         return "failed", "源不是普通文件，已保留"
@@ -313,7 +358,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             if applied:
                 detail_extra = " +nfo:" + ",".join(applied)
         except OSError as exc:
-            return "failed", f"NFO 预处理失败: {exc}"
+            return _failed_io(item, "NFO 预处理失败", exc)
 
     try:
         resolved = _resolve_conflict(dst, policy)
@@ -335,12 +380,12 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                 else:
                     _sha256(dst)
     except OSError as exc:
-        return "failed", f"源或目标读取失败，未写入: {exc}"
+        return _failed_io(item, "源或目标读取失败，未写入", exc)
     if resolved is None:
         try:
             target_matches = is_nfo and _verified_nfo(dst, content)
         except OSError as exc:
-            return "failed", f"NFO 目标读回失败，未覆盖: {exc}"
+            return _failed_io(item, "NFO 目标读回失败，未覆盖", exc)
         if target_matches:
             target_hash = hashlib.sha256(content).hexdigest()
             source_hash = hashlib.sha256(raw).hexdigest()
@@ -351,7 +396,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                         src, dst, source_info, task["dst_dir"], target_device,
                         (len(raw), source_hash), (len(content), target_hash))
                 except OSError as exc:
-                    return "failed", f"NFO 源文件删除失败: {exc}"
+                    return _failed_io(item, "NFO 源文件删除失败", exc)
                 if not deleted:
                     return "failed", reason
                 if cfg.get("remove_empty_dirs"):
@@ -369,7 +414,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             try:
                 matching_hash = _matching_digest(src, dst)
             except OSError as exc:
-                return "failed", f"目标或源文件读回失败，未删除或覆盖: {exc}"
+                return _failed_io(item, "目标或源文件读回失败，未删除或覆盖", exc)
             if matching_hash is None:
                 return "conflict", f"目标已存在: {dst}（策略 skip）"
             if task.get("after_action", "delete") == "delete":
@@ -382,7 +427,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                     if not deleted:
                         return "failed", reason
                 except OSError as exc:
-                    return "failed", f"源文件删除失败: {exc}"
+                    return _failed_io(item, "源文件删除失败", exc)
                 if cfg.get("remove_empty_dirs"):
                     _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
             item["_verified_target"] = (_size(dst), matching_hash, True,
@@ -398,7 +443,7 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
             target_device = _mount_identity(task["dst_dir"])
             wrote_target = not _verified_nfo(final_dst, content)
             if wrote_target:
-                _write_nfo(final_dst, content, root=task["dst_dir"])
+                _write_nfo(final_dst, content, root=task["dst_dir"], overwrite=how == "overwrite")
             if not _verified_nfo(final_dst, content):
                 raise IOError("NFO 目标文件读回校验失败，源文件已保留")
             item["dst_path"] = final_dst
@@ -421,7 +466,8 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
         # 挂载可能在 close 后丢写，读回校验失败时绝不能删除源文件。
         target_device = _mount_identity(task["dst_dir"])
         source_stat = os.lstat(src)
-        source_hash = _write_verified(final_dst, source=src, root=task["dst_dir"])
+        source_hash = _write_verified(final_dst, source=src, root=task["dst_dir"],
+                                      overwrite=how == "overwrite")
         item["dst_path"] = final_dst
         current_stat = os.lstat(src)
         identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
@@ -443,14 +489,14 @@ def transfer(item: dict, task: dict) -> Tuple[str, str]:
                 if not deleted:
                     return "failed", reason
             except OSError as exc:
-                return "failed", f"源文件删除失败: {exc}"
+                return _failed_io(item, "源文件删除失败", exc)
             if cfg.get("remove_empty_dirs"):
                 _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
         item["_verified_target"] = (source_stat.st_size, source_hash, True,
                                      source_stat.st_size, source_hash)
         return "success", detail
     except OSError as exc:
-        return "failed", f"迁移失败，源文件已保留: {exc}"
+        return _failed_io(item, "迁移失败，源文件已保留", exc)
     except Exception as exc:
         return "failed", f"迁移失败，源文件已保留: {exc}"
 

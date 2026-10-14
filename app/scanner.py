@@ -1,4 +1,5 @@
 """扫描源目录 → 稳定性检测 → 入队"""
+import errno
 import hashlib
 import logging
 import os
@@ -78,7 +79,7 @@ def _stable(path: str, wait: int) -> bool:
 
 def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[dict] = None,
               on_dir=None, force_full: bool = False) -> dict:
-    """每轮完整枚举源目录；force_full 仅控制历史视频的 NFO 补齐。"""
+    """每轮完整枚举源目录；force_full 仅供显式历史 NFO 补齐请求使用。"""
     token = _scan_samples.set(None)
     try:
         return _scan_task(task, progress=progress, on_dir=on_dir, force_full=force_full)
@@ -103,7 +104,7 @@ def _within_destination(path: str, destination: str) -> bool:
 
 def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int,
                            progress: Optional[dict] = None):
-    """仅在全量扫描中巡检已迁移视频；每个目标目录只枚举一次。"""
+    """仅在用户显式请求时巡检已迁移视频；每个目标目录只枚举一次。"""
     if progress is not None:
         progress["current"] = "检查历史视频 NFO"
     grouped = {}
@@ -113,6 +114,9 @@ def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int,
                 or not _within_destination(dst, task["dst_dir"])):
             continue
         grouped.setdefault(os.path.dirname(dst), []).append((rel, dst, size, digest))
+    if progress is not None:
+        progress["backfill_total"] = sum(len(videos) for videos in grouped.values())
+        progress["backfill_checked"] = 0
     for directory, videos in grouped.items():
         try:
             names = os.listdir(directory)
@@ -122,7 +126,9 @@ def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int,
                         if os.path.splitext(name)[1].casefold() == ".nfo"}
         for rel, dst, size, expected_digest in videos:
             if progress is not None:
-                progress["current"] = f"检查历史视频 NFO: {dst}"
+                progress["backfill_checked"] += 1
+                progress["current"] = (f"检查历史视频 NFO ({progress['backfill_checked']}/"
+                                       f"{progress['backfill_total']}): {dst}")
             stem = os.path.splitext(os.path.basename(dst))[0].casefold()
             if stem in existing_nfo:
                 continue
@@ -202,14 +208,10 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
         progress["current"] = "检查源目录状态"
     try:
         source_info = os.stat(src)
-    except FileNotFoundError:
-        logger.warning("扫描跳过：task_id=%s 源目录不存在=%s", task["id"], src)
-        return stats
     except OSError as error:
         raise _scan_io_error("读取源目录状态失败", src, error) from error
     if not stat.S_ISDIR(source_info.st_mode):
-        logger.warning("扫描跳过：task_id=%s 源路径不是目录=%s", task["id"], src)
-        return stats
+        raise NotADirectoryError(errno.ENOTDIR, "源路径不是目录，已暂停迁移", src)
     includes = _parse_patterns(task.get("include_patterns"))
     if progress is not None:
         progress["current"] = "检查目标挂载"

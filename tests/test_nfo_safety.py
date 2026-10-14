@@ -1,5 +1,7 @@
 """NFO 扫描与迁移数据安全回归测试（仅使用临时目录）。"""
+import asyncio
 import errno
+import json
 import os
 import sqlite3
 import threading
@@ -109,7 +111,7 @@ class NfoSafetyTests(unittest.TestCase):
         src = self.source()
         item = {"src_path": str(src), "dst_path": str(self.dst / src.name),
                 "rel_path": src.name}
-        with patch.object(transfer.os, "replace", side_effect=OSError("remote unavailable")):
+        with patch.object(transfer.os, "link", side_effect=OSError("remote unavailable")):
             result, _ = transfer.transfer(item, self.task)
         self.assertEqual(result, "failed")
         self.assertEqual(src.read_bytes(), b"<title>new</title>")
@@ -295,6 +297,24 @@ class NfoSafetyTests(unittest.TestCase):
                     scanner.scan_task(self.task)
         self.assertFalse(db.list_queue())
 
+    def test_missing_source_root_cannot_clear_scan_circuit_breaker(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        task = db.get_task(task_id)
+        worker = scheduler.Scheduler()
+        worker._scan_retry_at[task_id] = time.time() - 1
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        source.unlink()
+        self.src.rmdir()
+        with self.assertRaises(FileNotFoundError):
+            scanner.scan_task(task)
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker.sync_now(task_id)
+            worker._process_sync_requests()
+        self.assertIn(task_id, worker._scan_retry_at)
+        self.assertIsNotNone(worker.sync_progress[task_id]["error"])
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+
     def test_source_root_eio_is_not_reported_as_empty_successful_scan(self):
         with patch.object(scanner.os, "stat", side_effect=OSError(errno.EIO, "unreadable root")):
             with self.assertRaises(OSError) as error:
@@ -391,6 +411,83 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertGreater(worker._scan_retry_at[task_id], failures[0] + 59)
 
+    def test_scheduled_scan_retries_at_cooldown_even_with_long_interval(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, scan_interval=86400))
+        worker = scheduler.Scheduler()
+        worker.last_scan_ts[task_id] = time.time()
+        worker._scan_retry_at[task_id] = time.time() - 1
+        calls = []
+
+        def scan(*args, **kwargs):
+            calls.append(time.time())
+            return {"enqueued": 0}
+
+        def stop_after_scan(timeout):
+            worker._stop.set()
+            return False
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", side_effect=scan),
+              patch.object(worker._scan_wake, "wait", side_effect=stop_after_scan)):
+            worker._scan_loop()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(task_id, worker._scan_retry_at)
+
+    def test_scan_waits_for_active_transfer_before_enumeration(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        started, release, scanned = threading.Event(), threading.Event(), threading.Event()
+
+        def busy_transfer(*args):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return "failed", "temporary error"
+
+        def scan(*args, **kwargs):
+            scanned.set()
+            return {"enqueued": 0}
+
+        task = db.get_task(task_id)
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(transfer, "transfer", side_effect=busy_transfer),
+              patch.object(scanner, "scan_task", side_effect=scan)):
+            uploading = threading.Thread(target=worker._work_once)
+            scanning = threading.Thread(target=worker._run_scan, args=(task,))
+            uploading.start()
+            self.assertTrue(started.wait(2))
+            scanning.start()
+            try:
+                self.assertTrue(worker._scan_io_waiting.wait(2))
+                self.assertFalse(scanned.wait(0.05))
+                self.assertEqual(db.list_queue()[0]["status"], "transferring")
+            finally:
+                release.set()
+                uploading.join(2)
+                scanning.join(2)
+        self.assertFalse(uploading.is_alive())
+        self.assertFalse(scanning.is_alive())
+        self.assertTrue(scanned.is_set())
+        self.assertTrue(source.exists())
+
+    def test_failed_scan_blocks_pending_transfer_before_releasing_io_lock(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        task = db.get_task(task_id)
+        worker.last_scan_ts[task_id] = time.time()
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", side_effect=OSError(errno.EIO, "source I/O")),
+              patch.object(transfer, "transfer", side_effect=AssertionError("must not transfer"))):
+            with self.assertRaises(OSError):
+                worker._run_scan(task)
+            worker._work_once()
+        self.assertIn(task_id, worker._scan_retry_at)
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+        self.assertTrue(source.exists())
+
     def test_sync_progress_reports_enumeration_before_scan_finishes(self):
         source = self.source("nested/video.mp4", b"video")
         progress = {}
@@ -438,7 +535,11 @@ class NfoSafetyTests(unittest.TestCase):
 
     def test_dashboard_scan_schedules_track_manual_scans_and_cooldown(self):
         task_id = db.create_task(dict(self.task, name="scheduled", enabled=True, scan_interval=120))
-        disabled_id = db.create_task(dict(self.task, name="paused", enabled=False))
+        other_src, other_dst = self.root / "paused-src", self.root / "paused-dst"
+        other_src.mkdir()
+        other_dst.mkdir()
+        disabled_id = db.create_task(dict(self.task, name="paused", enabled=False,
+                                          src_dir=str(other_src), dst_dir=str(other_dst)))
         worker = scheduler.Scheduler()
         worker.last_scan_ts[task_id] = time.time() - 20
         schedules = {item["id"]: item for item in worker.stats()["scan_schedules"]}
@@ -460,7 +561,26 @@ class NfoSafetyTests(unittest.TestCase):
         worker._scan_retry_at[task_id] = time.time() + 60
         schedules = {item["id"]: item for item in worker.stats()["scan_schedules"]}
         self.assertEqual(schedules[task_id]["status"], "cooldown")
-        self.assertAlmostEqual(schedules[task_id]["next_scan_at"] - time.time(), 120, delta=2)
+        self.assertAlmostEqual(schedules[task_id]["next_scan_at"] - time.time(), 60, delta=2)
+
+    def test_dashboard_reports_partial_data_without_faking_empty_queue(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        with patch.object(config, "get", side_effect=OSError("config unavailable")):
+            snapshot = worker.stats()
+        self.assertEqual(snapshot["pending"], 1)
+        self.assertEqual(snapshot["scan_schedules"][0]["id"], task_id)
+        self.assertIn("config unavailable", snapshot["stats_error"])
+        with patch.object(db, "queue_stats", side_effect=OSError("database busy")):
+            snapshot = worker.stats()
+        self.assertIsNone(snapshot["pending"])
+        self.assertEqual(snapshot["scan_schedules"][0]["id"], task_id)
+        with patch.object(db, "list_tasks", side_effect=OSError("database busy")):
+            snapshot = worker.stats()
+        self.assertIsNone(snapshot["scan_schedules"])
+        self.assertEqual(snapshot["pending"], 1)
 
     def test_dashboard_reports_active_scheduled_scan_stage(self):
         task_id = db.create_task(dict(self.task, name="scheduled", enabled=True))
@@ -506,19 +626,42 @@ class NfoSafetyTests(unittest.TestCase):
             time.sleep(0.01)
         return False
 
-    def test_sync_now_forces_nfo_backfill_scan(self):
+    def test_sync_now_scans_source_without_history_unless_explicitly_requested(self):
         worker = scheduler.Scheduler()
-        task_id = db.create_task(dict(self.task, name="test"))
+        task_id = db.create_task(dict(self.task, name="test", filename_nfo_enabled=True))
         task = db.get_task(task_id)
         scanner.scan_task(task)
         self.source("video.mp4", b"new")
-        with patch.object(worker, "_task_paths_safe", return_value=True), \
-                patch.object(scanner, "scan_task", wraps=scanner.scan_task) as scan:
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "_backfill_migrated_nfo") as backfill,
+              patch.object(scanner, "scan_task", wraps=scanner.scan_task) as scan):
             self.assertTrue(worker.sync_now(task_id)["ok"])
             worker._process_sync_requests()
-        self.assertTrue(scan.call_args.kwargs["force_full"])
-        self.assertEqual(worker.sync_progress[task_id]["enqueued"], 1)
-        self.assertTrue(worker.sync_progress[task_id]["done"])
+            self.assertFalse(scan.call_args.kwargs["force_full"])
+            backfill.assert_not_called()
+            self.assertEqual(worker.sync_progress[task_id]["enqueued"], 2)
+            self.assertTrue(worker.sync_progress[task_id]["done"])
+            self.assertTrue(worker.sync_now(task_id, backfill_nfo=True)["ok"])
+            worker._process_sync_requests()
+            self.assertTrue(scan.call_args.kwargs["force_full"])
+            backfill.assert_called_once()
+            self.assertTrue(worker.sync_progress[task_id]["backfill_nfo"])
+
+    def test_regular_scan_never_reads_historical_remote_videos(self):
+        self.settings["douyin_nfo_enabled"] = True
+        task_id = db.create_task(dict(self.task, name="test"))
+        target = self.dst / "old.mp4"
+        target.write_bytes(b"video")
+        db.record_migrated(task_id, target.name, 5, str(target))
+        worker = scheduler.Scheduler()
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "_backfill_migrated_nfo") as backfill):
+            worker._run_scan(db.get_task(task_id))
+            worker.sync_now(task_id)
+            worker._process_sync_requests()
+        backfill.assert_not_called()
+        self.assertFalse(target.with_suffix(".nfo").exists())
+        self.assertEqual(worker.sync_progress[task_id]["enqueued"], 0)
 
     def test_scan_applies_changed_filter(self):
         self.task["exclude_patterns"] = "*.mp4"
@@ -1363,6 +1506,104 @@ class NfoSafetyTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), content)
                 self.assertEqual(target.read_bytes(), b"prior")
 
+    def test_skip_and_rename_cannot_overwrite_target_created_during_copy(self):
+        for policy in ("skip", "rename"):
+            for name in ("movie.mp4", "movie.nfo"):
+                with self.subTest(policy=policy, name=name):
+                    source = self.source(name, b"new")
+                    target = self.dst / name
+                    if policy == "rename":
+                        target.write_bytes(b"old")
+                        competing = self.dst / f"{target.stem}(1){target.suffix}"
+                    else:
+                        competing = target
+                    real_link = os.link
+
+                    def create_before_publish(src, dst, **kwargs):
+                        if dst == competing.name and kwargs.get("dst_dir_fd") is not None:
+                            competing.write_bytes(b"external")
+                        return real_link(src, dst, **kwargs)
+
+                    with patch.object(transfer.os, "link", side_effect=create_before_publish):
+                        result, _ = transfer.transfer(
+                            {"src_path": str(source), "dst_path": str(target), "rel_path": name},
+                            dict(self.task, conflict_policy=policy))
+                    self.assertEqual(result, "failed")
+                    self.assertEqual(competing.read_bytes(), b"external")
+                    self.assertEqual(source.read_bytes(), b"new")
+                    self.assertFalse(list(self.dst.glob(".fm-*.moving")))
+                    source.unlink()
+                    if target.exists():
+                        target.unlink()
+                    if competing.exists():
+                        competing.unlink()
+
+    def test_rule_change_keeps_history_but_uses_new_destination(self):
+        task_id = db.create_task(dict(self.task, name="test", path_rule="flatten"))
+        source = self.source("sub/movie.mp4", b"new")
+        old = self.dst / "movie.mp4"
+        old.write_bytes(b"old")
+        db.record_migrated(task_id, "sub/movie.mp4", 3, str(old))
+        db.update_task(task_id, {"path_rule": "keep_structure"})
+        self.assertEqual(db.get_task(task_id)["rule_epoch"], 1)
+        self.assertIsNone(db.get_migrated_dst(task_id, "sub/movie.mp4"))
+        self.assertEqual(db.list_migrated_videos(task_id, {".mp4"})[0][1], str(old))
+        scanner.scan_task(db.get_task(task_id), skip_stable_check=True)
+        self.assertEqual(db.list_queue()[0]["dst_path"], str(self.dst / "sub/movie.mp4"))
+        self.assertEqual(old.read_bytes(), b"old")
+        # 同相对路径、同大小的新文件完成迁移也不得删除旧世代的补齐凭证。
+        new_target = self.dst / "sub/movie.mp4"
+        new_target.parent.mkdir()
+        new_target.write_bytes(b"new")
+        db.record_migrated(task_id, "sub/movie.mp4", 3, str(new_target))
+        self.assertEqual({row[1] for row in db.list_migrated_videos(task_id, {".mp4"})},
+                         {str(old), str(new_target)})
+        db._conn.close()
+        db._conn = None
+        self.assertEqual({row[1] for row in db.list_migrated_videos(task_id, {".mp4"})},
+                         {str(old), str(new_target)})
+
+    def test_non_overwrite_fallback_when_mount_has_no_hardlinks(self):
+        for name in ("movie.mp4", "movie.nfo"):
+            with self.subTest(name=name):
+                source = self.source(name, b"new")
+                target = self.dst / name
+                with patch.object(transfer.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "no link")):
+                    result, detail = transfer.transfer(
+                        {"src_path": str(source), "dst_path": str(target), "rel_path": name},
+                        dict(self.task, after_action="keep"))
+                self.assertEqual(result, "success", detail)
+                self.assertEqual(target.read_bytes(), b"new")
+                source.unlink()
+                target.unlink()
+
+    def test_startup_existing_queue_waits_for_successful_scan(self):
+        task_id = db.create_task(dict(self.task, name="test", scan_interval=86400))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        db.set_scan_failure(task_id, time.time() + 60)
+        worker = scheduler.Scheduler()
+        with (patch.object(worker, "_scan_loop"), patch.object(worker, "_work_loop")):
+            worker.start()
+        self.assertIn(task_id, worker._scan_retry_at)
+        worker.stop()
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._work_once()
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+        self.assertTrue(source.exists())
+        db.clear_scan_failure(task_id)
+        restarted = scheduler.Scheduler()
+        with (patch.object(restarted, "_scan_loop"), patch.object(restarted, "_work_loop")):
+            restarted.start()
+        self.assertIn(task_id, restarted._scan_retry_at)
+        restarted.stop()
+        with patch.object(restarted, "_task_paths_safe", return_value=True):
+            restarted._work_once()
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+        restarted._scan_succeeded(task_id)
+        self.assertNotIn(task_id, restarted._scan_retry_at)
+        self.assertFalse(db.list_scan_failures())
+
     def test_unsupported_hardlink_rejects_overwrite_without_claiming_backup(self):
         for code in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
             with self.subTest(errno=code):
@@ -1515,6 +1756,22 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(protected.read_bytes(), b"private")
 
+    def test_database_rejects_overlapping_task_even_after_api_precheck(self):
+        db.create_task(dict(self.task, name="first"))
+        nested = self.src / "nested"
+        nested.mkdir()
+        with self.assertRaisesRegex(ValueError, "重叠"):
+            db.create_task(dict(self.task, name="second", src_dir=str(nested),
+                                dst_dir=str(self.root / "another-dst")))
+        self.assertEqual(len(db.list_tasks()), 1)
+
+    def test_atomic_toggle_applies_every_request(self):
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(db.toggle_task, (task_id, task_id)))
+        self.assertEqual(set(results), {False, True})
+        self.assertEqual(db.get_task(task_id)["enabled"], 1)
+
     def test_editing_task_name_keeps_pending_queue(self):
         task_id = db.create_task(dict(self.task, name="old"))
         source = self.source("movie.mp4", b"video")
@@ -1618,7 +1875,7 @@ class NfoSafetyTests(unittest.TestCase):
             self.assertEqual(worker.stats()["last_scan_error"], "任务 1: scan failed")
         with patch.object(config, "get", side_effect=OSError("stats config unavailable")):
             snapshot = worker.stats()
-        self.assertEqual(snapshot["stats_error"], "stats config unavailable")
+        self.assertIn("stats config unavailable", snapshot["stats_error"])
         self.assertEqual(snapshot["last_scan_error"], "任务 1: scan failed")
         worker._threads = [threading.Thread(name="fm-scanner")]
         self.assertFalse(worker.sync_now(2)["ok"])
@@ -1716,6 +1973,21 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db.list_queue()[0]["status"], "done")
         self.assertEqual(restarted.stats()["accounting_pending"], 0)
 
+    def test_destination_eio_during_copy_pauses_without_exhausting_retries(self):
+        task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        self.settings["max_retries"] = 0
+        worker = scheduler.Scheduler()
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(transfer, "_write_verified", side_effect=OSError(errno.EIO, "cloud unavailable"))):
+            worker._work_once()
+        row = db.list_queue()[0]
+        self.assertEqual((row["status"], row["retries"]), ("failed", 0))
+        self.assertIn(task_id, worker._scan_retry_at)
+        self.assertIn(task_id, db.list_scan_failures())
+        self.assertTrue(source.exists())
+
     def test_source_eio_during_work_remains_retryable_not_conflict(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
         source = self.source("movie.mp4", b"video")
@@ -1761,6 +2033,49 @@ class NfoSafetyTests(unittest.TestCase):
         with patch.object(worker, "_task_paths_safe", return_value=True):
             worker._work_once()
         self.assertEqual(db.list_queue()[0]["status"], "done")
+
+    def test_pending_queue_updates_destination_after_scan_rule_changes(self):
+        task_id = db.create_task(dict(self.task, name="test"))
+        source = self.source("movie.mp4", b"video")
+        old_dst = str(self.dst / source.name)
+        new_dst = str(self.dst / "new" / source.name)
+        self.assertTrue(db.enqueue(task_id, str(source), source.name, old_dst, 5))
+        self.assertTrue(db.enqueue(task_id, str(source), source.name, new_dst, 5))
+        item = db.list_queue()[0]
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(item["dst_path"], new_dst)
+
+    def test_pretransfer_database_failure_releases_claim(self):
+        task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(db, "get_task", side_effect=sqlite3.OperationalError("database is locked"))):
+            with self.assertRaises(sqlite3.OperationalError):
+                worker._work_once()
+        self.assertEqual(db.list_queue()[0]["status"], "pending")
+        self.assertTrue(source.exists())
+        self.assertFalse(worker._unstarted_claims)
+
+    def test_pretransfer_claim_retries_release_after_database_recovers(self):
+        task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(db, "get_task", side_effect=sqlite3.OperationalError("database is locked")),
+              patch.object(db, "release_unstarted_claim", side_effect=sqlite3.OperationalError("database is locked"))):
+            with self.assertRaises(sqlite3.OperationalError):
+                worker._work_once()
+        queue_id = db.list_queue()[0]["id"]
+        self.assertEqual(db.list_queue()[0]["status"], "transferring")
+        self.assertEqual(worker._unstarted_claims, {queue_id})
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._work_once()
+        self.assertFalse(worker._unstarted_claims)
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+        self.assertFalse(source.exists())
 
     def test_credential_write_failure_keeps_transferring_for_manual_review(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
@@ -1848,11 +2163,16 @@ class NfoSafetyTests(unittest.TestCase):
               patch.object(worker, "_task_paths_safe", return_value=True),
               patch.object(db, "complete_accounting", side_effect=OSError("busy"))):
             worker._work_once()
-        db.delete_task(task_id)
-        scheduler.Scheduler()._retry_accounting()
-        self.assertIsNone(db.get_migrated_dst(task_id, source.name))
+        with self.assertRaisesRegex(ValueError, "待记账"):
+            db.delete_task(task_id)
+        self.assertIsNotNone(db.get_task(task_id))
+        self.assertEqual(db.list_accounting_pending()[0]["task_id"], task_id)
         self.assertEqual(target.read_bytes(), b"video")
-        self.assertFalse(db.list_accounting_pending())
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._retry_accounting()
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+        db.delete_task(task_id)
+        self.assertIsNone(db.get_task(task_id))
 
     def test_identical_regular_skip_delete_without_symlink_completes_accounting(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
@@ -1890,7 +2210,7 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db.list_queue()[0]["status"], "done")
         self.assertTrue(db.migrated_destination_matches(task_id, source.name, str(target)))
 
-    def test_deleted_task_after_claim_cleans_orphan_without_transfer(self):
+    def test_deleted_task_after_claim_is_rejected_before_transfer(self):
         task_id = db.create_task(dict(self.task, name="test", interval_seconds=0))
         source = self.source("movie.mp4", b"video")
         db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
@@ -1899,16 +2219,17 @@ class NfoSafetyTests(unittest.TestCase):
 
         def delete_after_claim(ids):
             item = original_take(ids)
-            db.delete_task(task_id)  # transferring 行在删除任务时仍留在队列
+            with self.assertRaisesRegex(ValueError, "正在迁移"):
+                db.delete_task(task_id)
             return item
 
         with (patch.object(worker, "_task_paths_safe", return_value=True),
-              patch.object(db, "take_next_pending", side_effect=delete_after_claim),
-              patch.object(transfer, "transfer") as attempt):
+              patch.object(db, "take_next_pending", side_effect=delete_after_claim)):
             worker._work_once()
-        attempt.assert_not_called()
-        self.assertFalse(db.list_queue())
-        self.assertEqual(source.read_bytes(), b"video")
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+        self.assertFalse(source.exists())
+        self.assertTrue(db.migrated_destination_matches(task_id, source.name,
+                                                        str(self.dst / source.name)))
 
     def test_full_scan_backfills_douyin_nfo_after_source_deletion(self):
         self.settings["douyin_nfo_enabled"] = True
@@ -2114,14 +2435,21 @@ class NfoSafetyTests(unittest.TestCase):
 
     def test_task_interval_does_not_block_other_task_and_waits_for_deadline(self):
         first_id = db.create_task(dict(self.task, name="first", interval_seconds=60))
-        second_id = db.create_task(dict(self.task, name="second", interval_seconds=0))
-        sources = [self.source(name, b"video") for name in ("a.mp4", "b.mp4", "c.mp4")]
+        other_src, other_dst = self.root / "other-src", self.root / "other-dst"
+        other_src.mkdir()
+        other_dst.mkdir()
+        second_id = db.create_task(dict(self.task, name="second", interval_seconds=0,
+                                        src_dir=str(other_src), dst_dir=str(other_dst)))
+        sources = [self.source(name, b"video") for name in ("a.mp4", "b.mp4")]
+        sources.append(other_src / "c.mp4")
+        sources[-1].write_bytes(b"video")
         db.enqueue(first_id, str(sources[0]), sources[0].name, str(self.dst / sources[0].name), 5)
         db.enqueue(first_id, str(sources[1]), sources[1].name, str(self.dst / sources[1].name), 5)
-        db.enqueue(second_id, str(sources[2]), sources[2].name, str(self.dst / sources[2].name), 5)
+        db.enqueue(second_id, str(sources[2]), sources[2].name, str(other_dst / sources[2].name), 5)
         worker = scheduler.Scheduler()
         tasks = [dict(self.task, id=first_id, enabled=True, interval_seconds=60),
-                 dict(self.task, id=second_id, enabled=True, interval_seconds=0)]
+                 dict(self.task, id=second_id, src_dir=str(other_src), dst_dir=str(other_dst),
+                      enabled=True, interval_seconds=0)]
         with (patch.object(db, "list_tasks", return_value=tasks),
               patch.object(worker, "_task_paths_safe", return_value=True),
               patch.object(worker._work_wake, "wait", return_value=False) as wait):
@@ -2150,8 +2478,9 @@ class NfoSafetyTests(unittest.TestCase):
 
     def test_health_probe_is_public_and_independent_of_dashboard(self):
         from fastapi.testclient import TestClient
-        from app.main import app
+        from app.main import app, healthz
 
+        self.assertTrue(asyncio.iscoroutinefunction(healthz))
         with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
             with patch.object(scheduler.scheduler, "stats", side_effect=RuntimeError("db unavailable")):
                 client = TestClient(app)
@@ -2196,6 +2525,46 @@ class NfoSafetyTests(unittest.TestCase):
                   patch.object(worker_thread, "is_alive", return_value=True)):
                 response = client.get("/readyz")
                 self.assertEqual((response.status_code, response.json()), (200, {"status": "ok"}))
+
+    def test_retry_failed_is_atomic_and_does_not_skip_pagination_changes(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="test"))
+        for index in range(1005):
+            db.enqueue(task_id, str(self.src / f"{index}.mp4"), f"{index}.mp4",
+                       str(self.dst / f"{index}.mp4"), 5)
+        for item in db.list_queue(limit=1010):
+            db.set_status(item["id"], "failed")
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            response = TestClient(app).post("/api/queue/retry-failed",
+                                            headers={"Authorization": "Bearer test-token"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["retried"], 1005)
+        self.assertEqual(db.queue_stats().get("failed", 0), 0)
+        self.assertEqual(db.queue_stats()["pending"], 1005)
+
+    def test_config_cache_tracks_replaced_file_even_if_directory_sync_fails(self):
+        path = self.root / "settings.json"
+        previous_path, previous_cache = config.CONFIG_PATH, config._cache
+        self.addCleanup(setattr, config, "CONFIG_PATH", previous_path)
+        self.addCleanup(setattr, config, "_cache", previous_cache)
+        config.CONFIG_PATH, config._cache = str(path), None
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_directory_sync(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError(errno.EIO, "directory sync failed")
+            return real_fsync(fd)
+
+        with patch.object(config.os, "fsync", side_effect=fail_directory_sync):
+            with self.assertRaises(OSError):
+                config.update({"scan_interval": 42})
+        self.assertEqual(config._cache["scan_interval"], 42)
+        self.assertEqual(json.loads(path.read_text())["scan_interval"], 42)
 
     def test_browse_parent_navigation_and_io_errors_are_not_missing_directories(self):
         from fastapi.testclient import TestClient
@@ -2251,7 +2620,63 @@ class NfoSafetyTests(unittest.TestCase):
             response = client.post(f"/api/tasks/{task_id}/sync-now",
                                    headers={"Authorization": "Bearer test-token"})
         self.assertEqual(response.status_code, 200)
-        sync.assert_called_once_with(task_id)
+        sync.assert_called_once_with(task_id, None)
+
+    def test_history_nfo_backfill_requires_explicit_api_parameter(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        with (patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}),
+              patch.object(scheduler.scheduler, "sync_now",
+                           return_value={"ok": True, "message": "历史 NFO 补齐已触发"}) as sync):
+            response = TestClient(app).post(
+                f"/api/tasks/{task_id}/sync-now?backfill_nfo=true",
+                headers={"Authorization": "Bearer test-token"})
+        self.assertEqual(response.status_code, 200)
+        sync.assert_called_once_with(task_id, None, backfill_nfo=True)
+
+    def test_non_ascii_api_token_returns_unauthorized(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            response = TestClient(app).get("/api/dashboard",
+                                           headers={"Authorization": "Bearer \u00e9".encode("utf-8")})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "需要有效的 API Token")
+
+    def test_sync_request_id_distinguishes_new_scan_from_stale_progress(self):
+        worker = scheduler.Scheduler()
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        old_id = "00000000-0000-4000-8000-000000000001"
+        new_id = "00000000-0000-4000-8000-000000000002"
+        self.assertEqual(worker.sync_now(task_id, old_id)["request_id"], old_id)
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._process_sync_requests()
+        self.assertTrue(worker.sync_progress[task_id]["done"])
+        self.assertEqual(worker.sync_now(task_id, new_id)["request_id"], new_id)
+        self.assertFalse(worker.sync_progress[task_id]["done"])
+        self.assertEqual(worker.sync_now(task_id, old_id)["request_id"], new_id)
+        self.assertEqual(worker.stats()["scan_schedules"][0]["request_id"], new_id)
+
+    def test_delete_task_api_rejects_pending_accounting(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="test", enabled=True))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        item = db.take_next_pending([task_id])
+        with db._lock, db.get_conn():
+            db.get_conn().execute("UPDATE queue SET status='accounting_pending' WHERE id=?",
+                                  (item["id"],))
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            response = TestClient(app).delete(f"/api/tasks/{task_id}",
+                                              headers={"Authorization": "Bearer test-token"})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("待记账", response.json()["detail"])
+        self.assertIsNotNone(db.get_task(task_id))
 
     def test_sync_now_api_returns_503_when_scheduler_rejects_request(self):
         from fastapi.testclient import TestClient
@@ -2267,7 +2692,7 @@ class NfoSafetyTests(unittest.TestCase):
                                    headers={"Authorization": "Bearer test-token"})
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {"detail": "scanner unavailable"})
-        sync.assert_called_once_with(task_id)
+        sync.assert_called_once_with(task_id, None)
 
     def test_stable_quiet_seconds_config_bounds(self):
         for value in (0, 86400):

@@ -6,6 +6,7 @@ import os
 import stat
 from contextlib import asynccontextmanager
 from time import monotonic
+from uuid import UUID
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit
@@ -33,7 +34,7 @@ app = FastAPI(title="File Mover", lifespan=lifespan)
 
 
 @app.get("/healthz", include_in_schema=False)
-def healthz():
+async def healthz():
     """仅供容器探针确认 HTTP 服务可响应，不访问配置或数据库。"""
     return {"status": "ok"}
 
@@ -187,7 +188,8 @@ async def authorize_api(request: Request, call_next):
         token = os.environ.get("FILEMOVER_API_TOKEN")
         if token:
             supplied = request.headers.get("authorization", "")
-            if not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+            if not supplied.startswith("Bearer ") or not hmac.compare_digest(
+                    supplied[7:].encode("utf-8"), token.encode("utf-8")):
                 return JSONResponse({"detail": "需要有效的 API Token"}, status_code=401,
                                     headers={"WWW-Authenticate": "Bearer"})
         elif not _local_request(request):
@@ -235,6 +237,8 @@ def api_dirs(rel: Optional[str] = None):
 @app.get("/api/browse")
 def api_browse(rel: Optional[str] = None, limit: int = 500):
     """文件级浏览：列出目录下条目并标注类型。"""
+    if not 1 <= limit <= 1000:
+        raise HTTPException(422, "limit 必须在 1-1000")
     import pathlib
     root = pathlib.Path(MOUNT_ROOT).resolve()
     if str(root) == "/":
@@ -263,7 +267,7 @@ def api_browse(rel: Optional[str] = None, limit: int = 500):
     except OSError as exc:
         raise HTTPException(503, f"读取目录失败: {target} ({exc})") from exc
     items = []
-    for p in children:
+    for p in children[:limit]:
         try:
             info = p.lstat()
             t = "dir" if stat.S_ISDIR(info.st_mode) and not p.is_symlink() else (
@@ -272,7 +276,7 @@ def api_browse(rel: Optional[str] = None, limit: int = 500):
         except OSError:
             t, size = "other", 0
         items.append({"name": p.name, "type": t, "size": size})
-    return {"rel": rel, "path": str(target), "root": str(root), "items": items[:limit]}
+    return {"rel": rel, "path": str(target), "root": str(root), "items": items}
 
 
 # ---------- dashboard ----------
@@ -292,7 +296,10 @@ def api_list_tasks():
 @app.post("/api/tasks")
 def api_create_task(data: TaskIn):
     _validate_task(data)
-    task_id = db.create_task(data.model_dump())
+    try:
+        task_id = db.create_task(data.model_dump())
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(409, str(exc)) from exc
     logger.info("任务创建：task_id=%s 名称=%s 源=%s 目标=%s", task_id, data.name,
                 data.src_dir, data.dst_dir)
     scheduler.wake_scan()
@@ -310,7 +317,7 @@ def api_update_task(task_id: int, data: TaskIn):
         payload.pop("enabled")  # 编辑表单不提交启停状态，必须经 toggle 显式切换
     try:
         db.update_task(task_id, payload)
-    except ValueError as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         raise HTTPException(409, str(exc)) from exc
     logger.info("任务更新：task_id=%s 名称=%s 源=%s 目标=%s", task_id, data.name,
                 data.src_dir, data.dst_dir)
@@ -320,32 +327,33 @@ def api_update_task(task_id: int, data: TaskIn):
 
 @app.delete("/api/tasks/{task_id}")
 def api_delete_task(task_id: int):
-    db.delete_task(task_id)
+    try:
+        db.delete_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     logger.info("任务删除：task_id=%s", task_id)
     return {"ok": True}
 
 
 @app.post("/api/tasks/{task_id}/toggle")
 def api_toggle_task(task_id: int):
-    task = db.get_task(task_id)
-    if not task:
+    enabled = db.toggle_task(task_id)
+    if enabled is None:
         raise HTTPException(404, "任务不存在")
-    db.update_task(task_id, {"enabled": 0 if task["enabled"] else 1})
-    logger.info("任务启停变更：task_id=%s 启用=%s", task_id, not task["enabled"])
+    logger.info("任务启停变更：task_id=%s 启用=%s", task_id, enabled)
     scheduler.wake_scan()
-    return {"ok": True, "enabled": not task["enabled"]}
+    return {"ok": True, "enabled": enabled}
 
 
 @app.get("/api/tasks/{task_id}/sync-progress")
 def api_sync_progress(task_id: int):
-    """轮询立即同步的扫描进度"""
-    return scheduler.sync_progress.get(task_id, {"running": False, "done": True})
+    """轮询立即同步的扫描进度；没有扫描记录时不报告为成功。"""
+    return scheduler.sync_progress.get(task_id, {"running": False, "done": False})
 
 
 @app.post("/api/tasks/{task_id}/sync-now")
-def api_sync_now(task_id: int):
-    """立即全量扫描指定任务：跳过周期调度，立刻扫描源目录。
-    普通文件入队迁移（含重复下载检测）。返回扫描统计。"""
+def api_sync_now(task_id: int, request_id: UUID = None, backfill_nfo: bool = False):
+    """立即扫描源目录；仅显式请求时附带历史目标 NFO 巡检。"""
     started = monotonic()
     logger.info("立即同步请求：task_id=%s", task_id)
     task = db.get_task(task_id)
@@ -356,12 +364,15 @@ def api_sync_now(task_id: int):
         logger.warning("立即同步请求拒绝：task_id=%s 任务已停用", task_id)
         raise HTTPException(400, "任务已停用，请先启用")
     # 路径校验可能访问响应缓慢的挂载目录，交由扫描线程执行并通过进度报告错误。
-    result = scheduler.sync_now(task_id)
+    request_key = str(request_id) if request_id else None
+    result = (scheduler.sync_now(task_id, request_key, backfill_nfo=True) if backfill_nfo
+              else scheduler.sync_now(task_id, request_key))
     if not result["ok"]:
         raise HTTPException(503, result["message"])
     logger.info("立即同步请求已受理：task_id=%s 耗时=%.1fs 状态=%s",
                 task_id, monotonic() - started, result.get("message"))
-    return {"ok": True, "message": result.get("message", "全量扫描已触发")}
+    return {"ok": True, "message": result.get("message", "源目录扫描已触发"),
+            "request_id": result.get("request_id")}
 
 
 # ---------- queue ----------
@@ -386,6 +397,15 @@ def api_retry_batch(ids: list[int]):
     db.retry_queue(ids)
     logger.info("批量重试队列：数量=%d", len(ids))
     return {"ok": True}
+
+
+@app.post("/api/queue/retry-failed")
+def api_retry_failed():
+    # 单事务处理所有失败项，不使用变化中的 offset 分页。
+    count = db.retry_failed_batch()
+    logger.info("重试全部失败队列：数量=%d", count)
+    scheduler.wake_scan()
+    return {"ok": True, "retried": count}
 
 
 @app.delete("/api/queue")

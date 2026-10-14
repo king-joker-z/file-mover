@@ -6,13 +6,13 @@ import os
 import stat
 import threading
 import time
+from uuid import uuid4
 from . import db, config, scanner, transfer
 
 logger = logging.getLogger("uvicorn.error")
 
 
 class Scheduler:
-    FULL_SCAN_INTERVAL = 24 * 60 * 60  # 每日补齐历史目标视频的 NFO
     HEARTBEAT_INTERVAL = 15  # 慢挂载无返回时持续报告所在阶段
 
     def __init__(self):
@@ -22,9 +22,11 @@ class Scheduler:
         self._work_wake = threading.Event()
         self._sync_requests = set()
         self._scan_lock = threading.Lock()
+        # 慢挂载上避免枚举目录与文件迁移同时进行；扫描请求在当前文件结束后优先执行。
+        self._io_lock = threading.Lock()
+        self._scan_io_waiting = threading.Event()
         self._requests_lock = threading.Lock()
         self.last_scan_ts = {1: time.time()}  # 防启动即触发; 各任务扫描时自动覆盖
-        self._last_full_scan = {}
         self._scan_retry_at = {}  # task_id -> 扫描失败后允许再次尝试的墙上时间
         self._path_warning_at = {}  # 对每秒调用的路径校验故障限速，防止刷满容器日志
         self._last_scan_phase = None  # 扫描线程被其他前置步骤阻塞时的心跳阶段
@@ -46,6 +48,7 @@ class Scheduler:
         self.last_accounting_error = None
         self._accounting_blocked = set()  # 安全校验失败不在每次轮询重读网盘
         self._accounting_retry_at = {}  # 数据库暂不可用时限速重试
+        self._unstarted_claims = set()  # DB 故障期间待释放的迁移前认领
 
     # ---------- 生命周期 ----------
 
@@ -54,13 +57,17 @@ class Scheduler:
         db.reset_stuck_transferring()
         self._stop.clear()
         self.last_scan_success_at = None
-        self._last_full_scan.clear()
         self._scan_retry_at.clear()
+        self._scan_retry_at.update(db.list_scan_failures())
+        # 重启时旧队列必须先经过一次成功扫描，不能让 worker 抢在 scanner 前迁移。
+        for task_id in db.tasks_requiring_startup_scan():
+            self._scan_retry_at.setdefault(task_id, 0)
         self._path_warning_at.clear()
         self._last_scan_phase = None
         self._last_work_phase = None
         self._active_scan_task_id = None
         self._active_scan_state = None
+        self._scan_io_waiting.clear()
         now = time.time()
         tasks = db.list_tasks()
         for task in tasks:
@@ -86,9 +93,8 @@ class Scheduler:
         self._scan_wake.set()
         self._work_wake.set()
 
-    def sync_now(self, task_id: int):
-        """请求立即全量扫描：由唯一的 _scan_loop 线程优先执行（无并发扫描）。
-        进度通过 self.sync_progress /api/sync-progress 暴露给 UI 轮询。"""
+    def sync_now(self, task_id: int, request_id: str = None, *, backfill_nfo: bool = False):
+        """请求立即扫描源目录；历史目标 NFO 巡检仅由显式操作触发。"""
         with self._requests_lock:
             if self._stop.is_set() or (self._threads and not any(
                     t.name == "fm-scanner" and t.is_alive() for t in self._threads)):
@@ -97,14 +103,17 @@ class Scheduler:
             prog = self.sync_progress.get(task_id)
             if prog and prog.get("running"):
                 logger.info("立即同步已在执行：task_id=%s 阶段=%s", task_id, prog.get("current"))
-                return {"ok": True, "message": "扫描进行中"}
+                return {"ok": True, "message": "扫描进行中", "request_id": prog["request_id"]}
+            request_id = request_id or str(uuid4())
             self.sync_progress[task_id] = {"running": True, "scanned": 0, "enqueued": 0,
                                            "current": "等待扫描线程", "done": False,
-                                           "error": None}
+                                           "error": None, "request_id": request_id,
+                                           "backfill_nfo": backfill_nfo}
             self._sync_requests.add(task_id)
         logger.info("立即同步已排队：task_id=%s", task_id)
         self._scan_wake.set()
-        return {"ok": True, "message": "全量扫描已触发"}
+        message = "历史 NFO 补齐已触发" if backfill_nfo else "源目录扫描已触发"
+        return {"ok": True, "message": message, "request_id": request_id}
 
     def _run_scan(self, task, *, manual=False, force_full=False, progress=None):
         """统一记录扫描生命周期；慢挂载的阻塞操作每 15 秒报告一次当前阶段。"""
@@ -127,14 +136,22 @@ class Scheduler:
         self._active_scan_state = state
         reporter.start()
         try:
-            state["current"] = "检查任务目录"
-            if not self._task_paths_safe(task):
-                raise ValueError("任务目录重叠或与其他任务冲突，已拒绝扫描")
-            state["current"] = "扫描准备中"
-            result = scanner.scan_task(
-                task, skip_stable_check=manual, progress=state,
-                on_dir=lambda root, n: state.__setitem__("scanned", state.get("scanned", 0) + n),
-                force_full=force_full)
+            self._scan_io_waiting.set()
+            state["current"] = "等待当前文件迁移完成"
+            with self._io_lock:
+                try:
+                    state["current"] = "检查任务目录"
+                    if not self._task_paths_safe(task):
+                        raise ValueError("任务目录重叠或与其他任务冲突，已拒绝扫描")
+                    state["current"] = "扫描准备中"
+                    result = scanner.scan_task(
+                        task, skip_stable_check=manual, progress=state,
+                        on_dir=lambda root, n: state.__setitem__("scanned", state.get("scanned", 0) + n),
+                        force_full=force_full)
+                except Exception:
+                    # 故障熔断必须在释放 I/O 锁前生效，否则迁移线程可能抢到下一文件。
+                    self._pause_task_for_scan(task_id)
+                    raise
             enqueued = result.get("enqueued", 0) if isinstance(result, dict) else state.get("enqueued", 0)
             logger.info("扫描完成：task_id=%s 模式=%s 已发现=%s 新入队=%s 耗时=%.1fs",
                         task_id, mode, state.get("scanned", 0), enqueued,
@@ -146,6 +163,7 @@ class Scheduler:
                          state.get("enqueued", 0), time.monotonic() - started)
             raise
         finally:
+            self._scan_io_waiting.clear()
             finished.set()
             self._active_scan_task_id = None
             self._active_scan_state = None
@@ -173,18 +191,17 @@ class Scheduler:
                 if task and task.get("enabled"):
                     with self._scan_lock:
                         self._last_scan_phase = None  # 扫描自身的心跳会报告更准确的目录阶段
-                        self._run_scan(task, manual=True, force_full=True, progress=prog)
-                        self._last_full_scan[task_id] = time.time()
+                        self._run_scan(task, manual=True, force_full=prog["backfill_nfo"],
+                                       progress=prog)
                         self.last_scan_success_at = time.time()
                         self._scan_succeeded(task_id)
-                        self._scan_retry_at.pop(task_id, None)
                 else:
                     prog["error"] = "任务不存在或已停用"
                     logger.warning("立即同步跳过：task_id=%s 任务不存在或已停用", task_id)
             except Exception as e:
                 logger.error("立即同步失败：task_id=%s 阶段=%s", task_id, prog.get("current"))
                 self._scan_failed(e, task_id)
-                self._scan_retry_at[task_id] = time.time() + 60
+                self._pause_task_for_scan(task_id)
                 prog["error"] = str(e)
             finally:
                 self.last_scan_ts[task_id] = time.time()
@@ -199,19 +216,28 @@ class Scheduler:
         if today != self._today:
             self._today = today
             self.moved_today = 0
+        errors = []
         try:
             cfg = config.get()
-            q = db.queue_stats()
-            tasks = db.list_tasks()
-            stats_error = None
         except Exception as exc:
-            cfg, q, tasks = None, {}, []
-            stats_error = str(exc)
+            cfg = None
+            errors.append(f"配置读取失败: {exc}")
+        try:
+            q = db.queue_stats()
+        except Exception as exc:
+            q = None
+            errors.append(f"队列统计失败: {exc}")
+        try:
+            tasks = db.list_tasks()
+        except Exception as exc:
+            tasks = None
+            errors.append(f"任务列表失败: {exc}")
+        stats_error = "；".join(errors) if errors else None
         now = time.time()
         schedules = []
-        for task in tasks:
+        for task in tasks or []:
             task_id = task["id"]
-            interval = task.get("scan_interval") or cfg["scan_interval"]
+            interval = task.get("scan_interval") or (cfg or config.DEFAULTS)["scan_interval"]
             last = self.last_scan_ts.get(task_id)
             retry_at = self._scan_retry_at.get(task_id, 0)
             progress = self.sync_progress.get(task_id, {})
@@ -230,9 +256,14 @@ class Scheduler:
                 "id": task_id, "name": task["name"], "enabled": bool(task.get("enabled")),
                 "src_dir": task["src_dir"], "dst_dir": task["dst_dir"],
                 "interval_seconds": interval, "last_scan_at": last,
-                "next_scan_at": max((last + interval) if last is not None else now, retry_at)
+                "next_scan_at": (retry_at if task_id in self._scan_retry_at else
+                                 (last + interval) if last is not None else now)
                 if task.get("enabled") else None,
-                "status": status, "current": progress.get("current") if running else
+                "status": status, "request_id": progress.get("request_id") if running else None,
+                "backfill_nfo": bool(progress.get("backfill_nfo")) if running else False,
+                "backfill_checked": progress.get("backfill_checked", 0) if running else 0,
+                "backfill_total": progress.get("backfill_total", 0) if running else 0,
+                "current": progress.get("current") if running else
                 (self._active_scan_state.get("current") if status == "scanning"
                  and self._active_scan_state else None),
                 "scanned": progress.get("scanned", 0) if running else
@@ -244,13 +275,13 @@ class Scheduler:
             })
         return {
             "server_time": now,
-            "scan_schedules": schedules,
+            "scan_schedules": schedules if tasks is not None else None,
             "moved_today": self.moved_today,
-            "pending": q.get("pending", 0),
-            "transferring": q.get("transferring", 0),
-            "failed": q.get("failed", 0),
-            "conflict": q.get("conflict", 0),
-            "done": q.get("done", 0),
+            "pending": q.get("pending", 0) if q is not None else None,
+            "transferring": q.get("transferring", 0) if q is not None else None,
+            "failed": q.get("failed", 0) if q is not None else None,
+            "conflict": q.get("conflict", 0) if q is not None else None,
+            "done": q.get("done", 0) if q is not None else None,
             "current_file": self.current_file,
             "uptime_seconds": int(time.time() - self.started_at),
             "settings": cfg,
@@ -262,7 +293,7 @@ class Scheduler:
             "last_scan_error_path": self._last_scan_error_path,
             "last_scan_success_at": self.last_scan_success_at,
             "last_worker_error": self.last_worker_error,
-            "accounting_pending": q.get("accounting_pending", 0),
+            "accounting_pending": q.get("accounting_pending", 0) if q is not None else None,
             "last_accounting_error": self.last_accounting_error,
             "stats_error": stats_error,
         }
@@ -297,26 +328,21 @@ class Scheduler:
                         if not task.get("enabled"):
                             continue
                         interval = task.get("scan_interval") or cfg["scan_interval"]
-                        if (now - self.last_scan_ts.get(task["id"], 0) < interval
-                                or now < self._scan_retry_at.get(task["id"], 0)):
+                        retry_at = self._scan_retry_at.get(task["id"])
+                        if ((retry_at is not None and now < retry_at) or
+                                (retry_at is None and now - self.last_scan_ts.get(task["id"], 0) < interval)):
                             continue
                         if self._sync_requests or not self._scan_lock.acquire(timeout=0.1):
                             break
                         try:
                             self._last_scan_phase = None  # 由扫描自身的心跳报告具体阶段
-                            full = (time.time() - self._last_full_scan.get(task["id"], 0)
-                                    >= self.FULL_SCAN_INTERVAL)
-                            self._run_scan(task, force_full=full)
-                            if full:
-                                self._last_full_scan[task["id"]] = time.time()
+                            self._run_scan(task)
                             self.last_scan_success_at = time.time()
                             self._scan_succeeded(task["id"])
                         except Exception as exc:
                             self._scan_failed(exc, task["id"])
                             # 不依赖用户设置的扫描间隔，持续 EIO 最多每分钟重试一次。
-                            self._scan_retry_at[task["id"]] = time.time() + 60
-                        else:
-                            self._scan_retry_at.pop(task["id"], None)
+                            self._pause_task_for_scan(task["id"])
                         finally:
                             self.last_scan_ts[task["id"]] = time.time()
                             self._scan_lock.release()
@@ -338,6 +364,11 @@ class Scheduler:
                         prog.update(running=False, done=True, error="扫描线程已退出，请重启服务")
                 self._sync_requests.clear()
 
+    def _pause_task_for_scan(self, task_id):
+        retry_at = time.time() + 60
+        self._scan_retry_at[task_id] = retry_at
+        db.set_scan_failure(task_id, retry_at)
+
     def _scan_failed(self, exc, task_id=None):
         logger.error("扫描故障：task_id=%s 错误=%s", task_id, exc,
                      exc_info=(type(exc), exc, exc.__traceback__))
@@ -347,6 +378,9 @@ class Scheduler:
         self._last_scan_error_path = exc.filename if isinstance(exc, OSError) else None
 
     def _scan_succeeded(self, task_id):
+        # 只有成功扫描且清理凭证已落盘，重启后才能继续迁移。
+        db.clear_scan_failure(task_id)
+        self._scan_retry_at.pop(task_id, None)
         # 仅同一任务的成功扫描可解除它的旧告警，其他任务的成功不能掩盖故障。
         if self._last_scan_error_task_id == task_id:
             logger.info("扫描故障已恢复：task_id=%s", task_id)
@@ -535,6 +569,23 @@ class Scheduler:
             self._log(item, 0, 'success', '目标哈希复核通过，记账补偿完成')
 
     def _work_once(self):
+        if self._scan_io_waiting.is_set():
+            self._stop.wait(0.1)
+            return
+        with self._io_lock:
+            if self._scan_io_waiting.is_set():
+                return
+            idle_timeout = self._work_once_locked()
+        if idle_timeout is not None:
+            self._work_wake.wait(timeout=idle_timeout)
+            self._work_wake.clear()
+
+    def _work_once_locked(self):
+        for queue_id in tuple(self._unstarted_claims):
+            self._last_work_phase = (f"回退迁移前认领 {queue_id}", time.monotonic())
+            restored = db.release_unstarted_claim(queue_id)
+            self._unstarted_claims.discard(queue_id)
+            logger.info("迁移前认领已处理：queue_id=%s 回退数=%s", queue_id, restored)
         self._last_work_phase = ("检查待补偿记账", time.monotonic())
         self._retry_accounting()
         self._last_work_phase = ("读取任务列表", time.monotonic())
@@ -554,18 +605,27 @@ class Scheduler:
             self.current_file = None
             deadlines = [deadline for tid, deadline in self._next_eligible.items()
                          if tid in task_map and task_map[tid].get("enabled") and deadline > now]
-            self._work_wake.wait(timeout=min(1, max(0, min(deadlines) - now)) if deadlines else 1)
-            self._work_wake.clear()
-            return
+            return min(1, max(0, min(deadlines) - now)) if deadlines else 1
         self._last_work_phase = (f"检查队列项 {item['id']}", time.monotonic())
-        task = task_map.get(item["task_id"])
-        if task is None or db.get_task(item["task_id"]) is None:
-            logger.warning("孤儿队列清理：task_id=%s queue_id=%s", item["task_id"], item["id"])
-            db.cleanup_orphan_queue(item["id"])
-            return
-        if not task.get("enabled") or not self._in_run_window(task):
-            db.set_status(item["id"], "pending")
-            return
+        try:
+            task = task_map.get(item["task_id"])
+            if task is None or db.get_task(item["task_id"]) is None:
+                logger.warning("孤儿队列清理：task_id=%s queue_id=%s", item["task_id"], item["id"])
+                db.cleanup_orphan_queue(item["id"])
+                return
+            if not task.get("enabled") or not self._in_run_window(task):
+                db.set_status(item["id"], "pending")
+                return
+        except Exception:
+            # 尚未开始传输，可安全释放认领；传输后的异常不可用同一策略处理。
+            self._unstarted_claims.add(item["id"])
+            try:
+                db.release_unstarted_claim(item["id"])
+            except Exception:
+                logger.exception("迁移前认领回退失败：queue_id=%s，待数据库恢复后重试", item["id"])
+            else:
+                self._unstarted_claims.discard(item["id"])
+            raise
 
         self._last_work_phase = None
         self.current_file = item["rel_path"]
@@ -630,13 +690,13 @@ class Scheduler:
             elif result == "conflict":
                 db.set_status(item["id"], "conflict")
             elif result == "failed":
-                if transient_source_io:
-                    # 源目录 EIO 不消耗迁移重试额度，需成功扫描后才恢复同任务写入。
+                if transient_source_io or item.get("_transient_io"):
+                    # 源/目标挂载 EIO 不消耗迁移重试额度，需成功扫描后才恢复写入。
                     logger.warning("迁移暂停并等待扫描恢复：task_id=%s queue_id=%s 源=%s",
                                    task["id"], item["id"], item["src_path"])
-                    self._scan_retry_at[task["id"]] = time.time() + 60
+                    self._pause_task_for_scan(task["id"])
                     db.set_status(item["id"], "failed", next_retry_at=time.time() + 60)
-                    detail += "；源目录故障，60s 后限速探测恢复"
+                    detail += "；挂载 I/O 故障，60s 后限速探测恢复"
                     self._log(item, duration_ms, "failed", detail)
                     return
                 retries = item.get("retries", 0) + 1

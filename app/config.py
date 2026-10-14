@@ -92,6 +92,8 @@ def update(data: dict) -> dict:
                 os.fsync(f.fileno())
             os.replace(temp_path, CONFIG_PATH)
             temp_path = None
+            # 替换后即使目录 fsync 报错，同进程也必须与可见文件保持一致。
+            _cache = cfg
             directory_fd = os.open(directory, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)
@@ -100,5 +102,4 @@ def update(data: dict) -> dict:
         finally:
             if temp_path is not None:
                 os.unlink(temp_path)
-        _cache = cfg
         return dict(cfg)
