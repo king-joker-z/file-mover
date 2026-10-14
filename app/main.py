@@ -286,6 +286,16 @@ def dashboard():
     return scheduler.stats()
 
 
+# ---------- upload rounds ----------
+
+@app.get("/api/rounds")
+def api_upload_rounds(task_id: Optional[int] = None, limit: int = 50, offset: int = 0):
+    if not 1 <= limit <= 200 or offset < 0 or (task_id is not None and task_id < 1):
+        raise HTTPException(422, "limit 必须在 1-200，offset 不得为负数，task_id 必须为正整数")
+    return {"items": db.list_upload_rounds(task_id, limit, offset),
+            "total": db.count_upload_rounds(task_id)}
+
+
 # ---------- tasks ----------
 
 @app.get("/api/tasks")

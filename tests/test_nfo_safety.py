@@ -533,6 +533,121 @@ class NfoSafetyTests(unittest.TestCase):
                             for c in warning.call_args_list))
         self.assertTrue(worker.sync_progress[1]["done"])
 
+    def test_upload_round_counts_duration_history_and_retry(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="round test", enabled=True))
+        task = db.get_task(task_id)
+        for name in ("clip.mp4", "clip.nfo", "clip-poster.JPG", "readme.txt"):
+            self.source(name, b"data")
+        worker = scheduler.Scheduler()
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._run_scan(task)
+        rounds = db.list_upload_rounds(task_id)
+        self.assertEqual(len(rounds), 1)
+        first = rounds[0]
+        self.assertEqual((first['total'], first['video_count'], first['nfo_count'],
+                          first['image_count'], first['other_count']), (4, 1, 1, 1, 1))
+        self.assertIsNone(first['started_at'])
+        items = {q['rel_path']: q for q in db.list_queue()}
+        db.take_next_pending([task_id])
+        self.assertIsNotNone(db.list_upload_rounds(task_id)[0]['started_at'])
+        db.set_status(items['clip.mp4']['id'], 'done')
+        db.set_status(items['clip.nfo']['id'], 'failed', next_retry_at=time.time() + 20)
+        db.set_status(items['clip-poster.JPG']['id'], 'conflict')
+        self.assertIsNone(db.list_upload_rounds(task_id)[0]['finished_at'])
+        db.set_status(items['readme.txt']['id'], 'done')
+        db.set_status(items['clip.nfo']['id'], 'failed')
+        done = db.list_upload_rounds(task_id)[0]
+        self.assertIsNotNone(done['finished_at'])
+        self.assertEqual((done['success_count'], done['failed_count'], done['conflict_count']),
+                         (2, 1, 1))
+        db.clear_queue('done')
+        self.assertEqual(db.list_upload_rounds(task_id)[0], done)
+        db.retry_queue([items['clip.nfo']['id']])
+        fresh = db.list_upload_rounds(task_id)[0]
+        self.assertNotEqual(fresh['id'], done['id'])
+        self.assertEqual((fresh['total'], fresh['failed_count']), (1, 0))
+        self.assertEqual(db.list_upload_rounds(task_id)[1], done)
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            client = TestClient(app)
+            response = client.get(f'/api/rounds?task_id={task_id}&limit=1',
+                                  headers={"Authorization": "Bearer test-token"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()['total'], 2)
+            self.assertEqual(response.json()['items'][0]['id'], fresh['id'])
+            dashboard = worker.stats()['scan_schedules'][0]
+            self.assertEqual(dashboard['round']['id'], fresh['id'])
+            self.assertEqual(client.get('/api/rounds?limit=201',
+                                        headers={"Authorization": "Bearer test-token"}).status_code, 422)
+
+    def test_upload_round_persists_across_restart_and_includes_new_scan_files(self):
+        task_id = db.create_task(dict(self.task, name="restart", enabled=True))
+        task = db.get_task(task_id)
+        self.source('a.mp4', b'video')
+        scanner.scan_task(task)
+        first = db.list_upload_rounds(task_id)[0]
+        item = db.take_next_pending([task_id])
+        self.assertEqual(item['rel_path'], 'a.mp4')
+        db._conn.close()
+        db._conn = None
+        db.reset_stuck_transferring()
+        persisted = db.list_upload_rounds(task_id)[0]
+        self.assertEqual(persisted['id'], first['id'])
+        self.assertIsNotNone(persisted['started_at'])
+        self.assertIsNone(persisted['finished_at'])
+        self.source('b.jpg', b'image')
+        scanner.scan_task(task)
+        current = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((current['id'], current['total'], current['image_count']),
+                         (first['id'], 2, 1))
+        for entry in db.list_queue():
+            db.set_status(entry['id'], 'done')
+        self.assertIsNotNone(db.list_upload_rounds(task_id)[0]['finished_at'])
+        db.delete_task(task_id)
+        self.assertEqual(db.list_upload_rounds(task_id)[0]['task_name'], 'restart')
+
+    def test_upload_round_reused_queue_item_and_automatic_retry(self):
+        task_id = db.create_task(dict(self.task, name='reuse', enabled=True))
+        path = self.source('film.mp4', b'old')
+        db.enqueue(task_id, str(path), path.name, str(self.dst / path.name), 3)
+        original = db.list_queue()[0]
+        claimed = db.take_next_pending([task_id])
+        self.assertEqual(claimed['id'], original['id'])
+        db.set_status(original['id'], 'failed', next_retry_at=time.time() - 1)
+        self.assertIsNone(db.list_upload_rounds(task_id)[0]['finished_at'])
+        db.take_next_pending([task_id])
+        db.set_status(original['id'], 'done')
+        done = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((done['total'], done['success_count'], done['failed_count']), (1, 1, 0))
+        path.write_bytes(b'new data')
+        self.assertTrue(db.enqueue(task_id, str(path), path.name, str(self.dst / path.name), 8))
+        current = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((current['total'], current['success_count'], current['failed_count']),
+                         (1, 0, 0))
+        self.assertNotEqual(current['id'], done['id'])
+        self.assertEqual(db.list_upload_rounds(task_id)[1], done)
+
+    def test_upload_round_scan_failure_and_empty_scan(self):
+        task_id = db.create_task(dict(self.task, name="round failure", enabled=True))
+        task = db.get_task(task_id)
+        worker = scheduler.Scheduler()
+        with patch.object(worker, '_task_paths_safe', return_value=True):
+            worker._run_scan(task)
+        self.assertEqual(db.count_upload_rounds(task_id), 0)
+        self.source('movie.mp4', b'video')
+        with patch.object(worker, '_task_paths_safe', return_value=True):
+            worker._run_scan(task)
+            with patch.object(scanner, 'scan_task', side_effect=OSError('scan failed')):
+                with self.assertRaises(OSError):
+                    worker._run_scan(task)
+        self.assertEqual(db.count_upload_rounds(task_id), 1)
+        self.assertEqual(db.list_upload_rounds(task_id)[0]['scanning'], 0)
+        item = db.list_queue()[0]
+        db.set_status(item['id'], 'done')
+        self.assertIsNotNone(db.list_upload_rounds(task_id)[0]['finished_at'])
+
     def test_dashboard_scan_schedules_track_manual_scans_and_cooldown(self):
         task_id = db.create_task(dict(self.task, name="scheduled", enabled=True, scan_interval=120))
         other_src, other_dst = self.root / "paused-src", self.root / "paused-dst"

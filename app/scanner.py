@@ -84,7 +84,12 @@ def scan_task(task: dict, skip_stable_check: bool = False, progress: Optional[di
     try:
         return _scan_task(task, progress=progress, on_dir=on_dir, force_full=force_full)
     finally:
-        _scan_samples.reset(token)
+        try:
+            # 独立扫描在入队后也要解除 scanning；源目录读取失败时不触碰数据库。
+            if db._conn is not None:
+                db.finish_round_scan(task['id'])
+        finally:
+            _scan_samples.reset(token)
 
 
 def compute_dst(dst_dir: str, rel_path: str, path_rule: str, date_str: str) -> str:
@@ -404,7 +409,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                         continue
                 except FileNotFoundError:
                     pass  # 目标缺失则正常迁移；I/O 错误必须上抛。
-            if db.enqueue(task["id"], full, rel, dst, size):
+            if db.enqueue(task["id"], full, rel, dst, size, scanning=True):
                 _bump("enqueued")
 
     if force_full and (filename_nfo_enabled or douyin_nfo_enabled):

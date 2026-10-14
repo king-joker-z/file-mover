@@ -151,6 +151,25 @@ def _init_schema(conn: sqlite3.Connection):
             task_id INTEGER PRIMARY KEY,
             retry_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS upload_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            task_name TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            started_at REAL,
+            finished_at REAL,
+            scanning INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_rounds_task ON upload_rounds(task_id, id DESC);
+        CREATE TABLE IF NOT EXISTS upload_round_files (
+            round_id INTEGER NOT NULL,
+            queue_id INTEGER NOT NULL,
+            file_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_at REAL,
+            PRIMARY KEY (round_id, queue_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_round_files_queue ON upload_round_files(queue_id, round_id);
         """
     )
     conn.commit()
@@ -298,8 +317,13 @@ def update_task(task_id: int, data: dict):
             conn.execute("UPDATE tasks SET rule_epoch=rule_epoch+1 WHERE id=?", (task_id,))
         if changed:
             # 路径/规则变化时清理旧队列，下一轮按新配置重新扫描。
+            conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                         " WHERE round_id IN (SELECT id FROM upload_rounds WHERE task_id=?"
+                         " AND finished_at IS NULL) AND status NOT IN ('done','transferring','accounting_pending')",
+                         (task_id,))
             conn.execute("DELETE FROM queue WHERE task_id=? AND status NOT IN ('transferring','accounting_pending')",
                          (task_id,))
+            _finish_rounds(conn, task_id)
 
 
 def toggle_task(task_id: int) -> bool | None:
@@ -321,6 +345,13 @@ def delete_task(task_id: int):
         conn.execute("DELETE FROM queue WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM migrated_files WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM scan_failures WHERE task_id=?", (task_id,))
+        # 历史轮次保留任务名称快照，删除任务不抹去历史。
+        conn.execute("UPDATE upload_rounds SET scanning=0 WHERE task_id=? AND finished_at IS NULL",
+                     (task_id,))
+        conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                     " WHERE round_id IN (SELECT id FROM upload_rounds WHERE task_id=? AND finished_at IS NULL)"
+                     " AND status NOT IN ('done','conflict')", (task_id,))
+        _finish_rounds(conn, task_id)
 
 
 def tasks_requiring_startup_scan() -> set[int]:
@@ -350,19 +381,123 @@ def clear_scan_failure(task_id: int):
         conn.execute("DELETE FROM scan_failures WHERE task_id=?", (task_id,))
 
 
+# ---------- upload rounds ----------
+
+def _file_type(rel_path: str) -> str:
+    from .douyin_nfo import VIDEO_EXTS, POSTER_EXTS
+    ext = os.path.splitext(rel_path)[1].lower()
+    return ('video' if ext in VIDEO_EXTS else 'nfo' if ext == '.nfo' else
+            'image' if ext in POSTER_EXTS else 'other')
+
+
+def _active_round(conn, task_id):
+    return conn.execute("SELECT id FROM upload_rounds WHERE task_id=? AND finished_at IS NULL"
+                        " ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+
+
+def _attach_round_file(conn, task_id, queue_id, rel_path, scanning=False):
+    row = _active_round(conn, task_id)
+    if row is None:
+        name = conn.execute("SELECT name FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if name is None:
+            return
+        row_id = conn.execute("INSERT INTO upload_rounds (task_id, task_name, created_at, scanning)"
+                              " VALUES (?,?,?,?)", (task_id, name[0], time.time(), int(scanning))).lastrowid
+    else:
+        row_id = row[0]
+    current = conn.execute("SELECT status, next_retry_at FROM queue WHERE id=?",
+                           (queue_id,)).fetchone()
+    conn.execute("INSERT OR IGNORE INTO upload_round_files"
+                 " (round_id, queue_id, file_type, status, retry_at) VALUES (?,?,?,?,?)",
+                 (row_id, queue_id, _file_type(rel_path), current['status'], current['next_retry_at']))
+
+
+def _finish_rounds(conn, task_id=None):
+    where = " AND task_id=?" if task_id is not None else ""
+    conn.execute("UPDATE upload_rounds SET finished_at=? WHERE finished_at IS NULL"
+                 " AND scanning=0" + where + " AND NOT EXISTS ("
+                 "SELECT 1 FROM upload_round_files f WHERE f.round_id=upload_rounds.id"
+                 " AND (f.status IN ('pending','transferring','accounting_pending')"
+                 " OR (f.status='failed' AND f.retry_at IS NOT NULL)))",
+                 (time.time(), task_id) if task_id is not None else (time.time(),))
+
+
+def mark_round_scanning(task_id: int):
+    conn = get_conn()
+    with _lock, conn:
+        conn.execute("UPDATE upload_rounds SET scanning=1 WHERE task_id=? AND finished_at IS NULL",
+                     (task_id,))
+
+
+def finish_round_scan(task_id: int):
+    conn = get_conn()
+    with _lock, conn:
+        conn.execute("UPDATE upload_rounds SET scanning=0 WHERE task_id=? AND finished_at IS NULL",
+                     (task_id,))
+        _finish_rounds(conn, task_id)
+
+
+def _round_status(conn, queue_id, status, retry_at=None):
+    conn.execute("UPDATE upload_round_files SET status=?, retry_at=? WHERE queue_id=?"
+                 " AND round_id IN (SELECT id FROM upload_rounds WHERE finished_at IS NULL)",
+                 (status, retry_at, queue_id))
+
+
+_ROUND_COUNTS = ("SELECT r.*, COUNT(f.queue_id) total,"
+                 " SUM(CASE WHEN f.file_type='video' THEN 1 ELSE 0 END) video_count,"
+                 " SUM(CASE WHEN f.file_type='nfo' THEN 1 ELSE 0 END) nfo_count,"
+                 " SUM(CASE WHEN f.file_type='image' THEN 1 ELSE 0 END) image_count,"
+                 " SUM(CASE WHEN f.file_type='other' THEN 1 ELSE 0 END) other_count,"
+                 " SUM(CASE WHEN f.status='done' THEN 1 ELSE 0 END) success_count,"
+                 " SUM(CASE WHEN f.status='failed' THEN 1 ELSE 0 END) failed_count,"
+                 " SUM(CASE WHEN f.status='conflict' THEN 1 ELSE 0 END) conflict_count,"
+                 " SUM(CASE WHEN f.status='cancelled' THEN 1 ELSE 0 END) cancelled_count"
+                 " FROM upload_rounds r LEFT JOIN upload_round_files f ON f.round_id=r.id")
+
+
+def list_upload_rounds(task_id=None, limit=50, offset=0):
+    where = ' WHERE r.task_id=?' if task_id is not None else ''
+    params = (task_id,) if task_id is not None else ()
+    with _lock:
+        conn = get_conn()
+        rows = conn.execute(_ROUND_COUNTS + where +
+                            " GROUP BY r.id ORDER BY r.id DESC LIMIT ? OFFSET ?",
+                            (*params, limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def latest_upload_rounds():
+    # 仪表盘仅按每任务最新一轮聚合，不扫描全部历史文件。
+    with _lock:
+        rows = get_conn().execute(
+            _ROUND_COUNTS + " WHERE r.id=(SELECT MAX(id) FROM upload_rounds"
+            " WHERE task_id=r.task_id) GROUP BY r.id").fetchall()
+        return {row['task_id']: dict(row) for row in rows}
+
+
+def count_upload_rounds(task_id=None):
+    with _lock:
+        if task_id is None:
+            return get_conn().execute('SELECT COUNT(*) FROM upload_rounds').fetchone()[0]
+        return get_conn().execute('SELECT COUNT(*) FROM upload_rounds WHERE task_id=?',
+                                  (task_id,)).fetchone()[0]
+
+
 # ---------- queue ----------
 
-def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int) -> bool:
+def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int,
+            *, scanning=False) -> bool:
     """现存文件不受完成记录阻挡；在途和待记账条目仍由工作线程独占。"""
     conn = get_conn()
     with _lock, conn:
         row = conn.execute("SELECT id, status, src_path, dst_path, size FROM queue"
                            " WHERE task_id=? AND rel_path=?", (task_id, rel_path)).fetchone()
         if row is None:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO queue (task_id, src_path, rel_path, dst_path, size,"
                 " status, created_at, updated_at) VALUES (?,?,?,?,?,'pending',?,?)",
                 (task_id, src_path, rel_path, dst_path, size, now_str(), now_str()))
+            _attach_round_file(conn, task_id, cur.lastrowid, rel_path, scanning)
             return True
         changed = (row["src_path"] != src_path or row["dst_path"] != dst_path
                    or row["size"] != size)
@@ -373,7 +508,12 @@ def enqueue(task_id: int, src_path: str, rel_path: str, dst_path: str, size: int
                 " retries=0, next_retry_at=NULL, verified_size=NULL, verified_sha256=NULL,"
                 " verified_trusted=0, source_size=NULL, source_sha256=NULL, updated_at=? WHERE id=?",
                 (src_path, dst_path, size, now_str(), row["id"]))
+            _attach_round_file(conn, task_id, row['id'], rel_path, scanning)
+            _round_status(conn, row['id'], 'pending')
             return True
+        # 升级旧库时已存在的待处理队列，在下一次扫描时纳入本轮。
+        if row['status'] in ('pending', 'failed', 'transferring', 'accounting_pending'):
+            _attach_round_file(conn, task_id, row['id'], rel_path, scanning)
         return False
 
 
@@ -402,6 +542,10 @@ def take_next_pending(eligible_task_ids=None, claim=True):
         if row and claim:
             conn.execute("UPDATE queue SET status='transferring', next_retry_at=NULL, updated_at=?"
                          " WHERE id=?", (now_str(), row["id"]))
+            conn.execute("UPDATE upload_rounds SET started_at=? WHERE id IN ("
+                         "SELECT round_id FROM upload_round_files WHERE queue_id=?)"
+                         " AND started_at IS NULL AND finished_at IS NULL", (time.time(), row['id']))
+            _round_status(conn, row['id'], 'transferring')
         return dict(row) if row else None
 
 
@@ -412,6 +556,8 @@ def set_status(queue_id: int, status: str, retries=None,
         conn.execute("UPDATE queue SET status=?, retries=COALESCE(?,retries),"
                      " next_retry_at=?, updated_at=? WHERE id=?",
                      (status, retries, next_retry_at, now_str(), queue_id))
+        _round_status(conn, queue_id, status, next_retry_at)
+        _finish_rounds(conn)
 
 def persist_accounting_pending(queue_id: int, item: dict, credential: tuple):
     """只有在途且任务仍存在时，落盘读回凭证；失败时保持 transferring。"""
@@ -429,6 +575,7 @@ def persist_accounting_pending(queue_id: int, item: dict, credential: tuple):
              now_str(), queue_id, item['task_id'], item['src_path'], item['rel_path']))
         if cur.rowcount != 1:
             raise ValueError("任务或在途队列已变化，需人工核查")
+        _round_status(conn, queue_id, 'accounting_pending')
 
 
 def list_accounting_pending():
@@ -470,6 +617,8 @@ def complete_accounting(item: dict):
                       epoch))
         conn.execute("UPDATE queue SET status='done', updated_at=? WHERE id=?",
                      (now_str(), item['id']))
+        _round_status(conn, item['id'], 'done')
+        _finish_rounds(conn, item['task_id'])
 
 
 def cleanup_orphan_queue(queue_id: int):
@@ -478,17 +627,24 @@ def cleanup_orphan_queue(queue_id: int):
     with _lock, conn:
         conn.execute("DELETE FROM queue WHERE id=? AND task_id NOT IN (SELECT id FROM tasks)",
                      (queue_id,))
+        _round_status(conn, queue_id, 'cancelled')
+        _finish_rounds(conn)
 
 
 def release_unstarted_claim(queue_id: int) -> int:
     """只回退尚未执行传输的认领；已开始传输但缺凭证的条目不得自动重试。"""
     conn = get_conn()
     with _lock, conn:
-        conn.execute("DELETE FROM queue WHERE id=? AND status='transferring'"
-                     " AND task_id NOT IN (SELECT id FROM tasks)", (queue_id,))
+        orphan = conn.execute("DELETE FROM queue WHERE id=? AND status='transferring'"
+                              " AND task_id NOT IN (SELECT id FROM tasks)", (queue_id,))
+        if orphan.rowcount:
+            _round_status(conn, queue_id, 'cancelled')
+            _finish_rounds(conn)
         cur = conn.execute("UPDATE queue SET status='pending', next_retry_at=NULL, updated_at=?"
                            " WHERE id=? AND status='transferring'",
                            (now_str(), queue_id))
+        if cur.rowcount:
+            _round_status(conn, queue_id, 'pending')
         return cur.rowcount
 
 
@@ -497,9 +653,17 @@ def reset_stuck_transferring():
     conn = get_conn()
     with _lock, conn:
         conn.execute("DELETE FROM queue WHERE task_id NOT IN (SELECT id FROM tasks)")
+        conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                     " WHERE round_id IN (SELECT id FROM upload_rounds WHERE finished_at IS NULL"
+                     " AND task_id NOT IN (SELECT id FROM tasks))"
+                     " AND status NOT IN ('done','conflict')")
         # 无凭证的中断转存不能仅凭目标存在自动补记；重新从源路径迁移。
         conn.execute("UPDATE queue SET status='pending', updated_at=? WHERE status='transferring'",
                      (now_str(),))
+        conn.execute("UPDATE upload_round_files SET status='pending' WHERE status='transferring'"
+                     " AND round_id IN (SELECT id FROM upload_rounds WHERE finished_at IS NULL)")
+        conn.execute("UPDATE upload_rounds SET scanning=0 WHERE finished_at IS NULL")
+        _finish_rounds(conn)
 
 
 def queue_stats():
@@ -548,14 +712,24 @@ def retry_queue(ids):
             "UPDATE queue SET status='pending', next_retry_at=NULL, retries=0, updated_at=?"
             " WHERE id=? AND status NOT IN ('transferring','accounting_pending')",
             [(now_str(), i) for i in ids])
+        for queue_id in ids:
+            row = conn.execute("SELECT task_id, rel_path FROM queue WHERE id=? AND status='pending'",
+                               (queue_id,)).fetchone()
+            if row:
+                _attach_round_file(conn, row['task_id'], queue_id, row['rel_path'])
+                _round_status(conn, queue_id, 'pending')
 
 
 def retry_failed_batch() -> int:
     """同一事务重试全部失败项；并发状态变化不会导致分页漏项。"""
     conn = get_conn()
     with _lock, conn:
+        rows = conn.execute("SELECT id, task_id, rel_path FROM queue WHERE status='failed'").fetchall()
         cur = conn.execute("UPDATE queue SET status='pending', next_retry_at=NULL, retries=0,"
                            " updated_at=? WHERE status='failed'", (now_str(),))
+        for row in rows:
+            _attach_round_file(conn, row['task_id'], row['id'], row['rel_path'])
+            _round_status(conn, row['id'], 'pending')
         return cur.rowcount
 
 
@@ -564,11 +738,17 @@ def clear_queue(status=None) -> int:
     conn = get_conn()
     with _lock, conn:
         if status == "all":
-            cur = conn.execute("DELETE FROM queue WHERE status NOT IN ('transferring','accounting_pending')")
+            where, params = "status NOT IN ('transferring','accounting_pending')", ()
         elif status:
-            cur = conn.execute("DELETE FROM queue WHERE status=? AND status NOT IN ('transferring','accounting_pending')", (status,))
+            where, params = "status=? AND status NOT IN ('transferring','accounting_pending')", (status,)
         else:
-            cur = conn.execute("DELETE FROM queue WHERE status='done'")
+            where, params = "status='done'", ()
+        conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                     " WHERE status NOT IN ('done','conflict') AND queue_id IN"
+                     f" (SELECT id FROM queue WHERE {where}) AND round_id IN"
+                     " (SELECT id FROM upload_rounds WHERE finished_at IS NULL)", params)
+        cur = conn.execute(f"DELETE FROM queue WHERE {where}", params)
+        _finish_rounds(conn)
         return cur.rowcount
 
 

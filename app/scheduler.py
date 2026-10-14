@@ -134,6 +134,7 @@ class Scheduler:
                     task_id, mode, task["src_dir"], task["dst_dir"], force_full)
         self._active_scan_task_id = task_id
         self._active_scan_state = state
+        db.mark_round_scanning(task_id)
         reporter.start()
         try:
             self._scan_io_waiting.set()
@@ -163,8 +164,11 @@ class Scheduler:
                          state.get("enqueued", 0), time.monotonic() - started)
             raise
         finally:
-            self._scan_io_waiting.clear()
-            finished.set()
+            try:
+                db.finish_round_scan(task_id)
+            finally:
+                self._scan_io_waiting.clear()
+                finished.set()
             self._active_scan_task_id = None
             self._active_scan_state = None
 
@@ -232,6 +236,11 @@ class Scheduler:
         except Exception as exc:
             tasks = None
             errors.append(f"任务列表失败: {exc}")
+        try:
+            rounds = db.latest_upload_rounds() if tasks is not None else {}
+        except Exception as exc:
+            rounds = {}
+            errors.append(f"轮次统计失败: {exc}")
         stats_error = "；".join(errors) if errors else None
         now = time.time()
         schedules = []
@@ -254,6 +263,7 @@ class Scheduler:
                 status = "scheduled"
             schedules.append({
                 "id": task_id, "name": task["name"], "enabled": bool(task.get("enabled")),
+                "round": rounds.get(task_id),
                 "src_dir": task["src_dir"], "dst_dir": task["dst_dir"],
                 "interval_seconds": interval, "last_scan_at": last,
                 "next_scan_at": (retry_at if task_id in self._scan_retry_at else
