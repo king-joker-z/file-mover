@@ -533,6 +533,60 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(db._repair_cancelled_round_files(conn), 0)
         self.assertEqual(db.list_upload_rounds(task_id)[0]["cancelled_count"], 1)
 
+    def test_eio_failure_reports_migrated_after_successful_retry(self):
+        task_id = db.create_task(dict(self.task, name="eio state", enabled=True))
+        path = self.source("bad.jpg", b"payload")
+        db.enqueue(task_id, str(path), "bad.jpg", str(self.dst / "bad.jpg"), 7)
+        item_id = db.list_queue()[0]["id"]
+        db.set_status(item_id, "failed", next_retry_at=time.time() + 60)
+        self.assertTrue(db.record_eio_failure(task_id, item_id, "bad.jpg", "source", "EIO"))
+        record = db.list_eio_failures(task_id)[0]
+        self.assertFalse(record["migrated"])
+        self.assertFalse(record["busy"])  # 自动排除时队列项已移除，等待规则变更
+        # 重试：移除规则并重新扫描后文件重新入队，处于处理中状态
+        db.update_exclude_patterns(task_id, [])
+        db.enqueue(task_id, str(path), "bad.jpg", str(self.dst / "bad.jpg"), 7)
+        record = db.list_eio_failures(task_id)[0]
+        self.assertTrue(record["busy"])
+        self.assertFalse(record["migrated"])
+        # 迁移成功：队列完成且迁移凭证落库后，故障不再是待重试状态
+        item_id = db.list_queue(search="bad.jpg")[0]["id"]
+        db.set_status(item_id, "done")
+        db.record_migrated(task_id, "bad.jpg", 7)
+        record = db.list_eio_failures(task_id)[0]
+        self.assertTrue(record["migrated"])
+        self.assertFalse(record["busy"])
+
+    def test_round_files_api_lists_details_with_status_filter(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="round detail", enabled=True))
+        for name in ("a.mp4", "b.mp4"):
+            source = self.source(name, b"data")
+            db.enqueue(task_id, str(source), name, str(self.dst / name), 5)
+        db.set_status(db.list_queue(search="a.mp4")[0]["id"], "done")
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            round_id = db.list_upload_rounds(task_id)[0]["id"]
+            all_files = client.get(f"/api/rounds/{round_id}/files", headers=headers)
+            self.assertEqual(all_files.status_code, 200)
+            payload = all_files.json()
+            self.assertEqual(payload["total"], 2)
+            self.assertEqual(payload["round"]["success_count"], 1)
+            done_only = client.get(f"/api/rounds/{round_id}/files",
+                                   params={"status": "done"}, headers=headers)
+            self.assertEqual(done_only.json()["total"], 1)
+            self.assertEqual(done_only.json()["items"][0]["rel_path"], "a.mp4")
+            # 分页参数校验与不存在的轮次
+            self.assertEqual(client.get(f"/api/rounds/{round_id}/files",
+                                        params={"limit": 0},
+                                        headers=headers).status_code, 422)
+            self.assertEqual(client.get("/api/rounds/99999/files",
+                                        headers=headers).status_code, 404)
+        self.assertEqual(client.get(f"/api/rounds/{round_id}/files").status_code, 403)
+
     def test_missing_source_root_cannot_clear_scan_circuit_breaker(self):
         task_id = db.create_task(dict(self.task, name="test", enabled=True))
         task = db.get_task(task_id)

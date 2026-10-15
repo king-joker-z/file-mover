@@ -226,6 +226,7 @@ def _migrate_schema(conn: sqlite3.Connection):
             migrated_at TEXT NOT NULL,
             UNIQUE(task_id, rel_path, size))""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_migrated_lookup ON migrated_files(task_id, rel_path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_task_rel ON queue(task_id, rel_path)")
     migrated_cols = [r[1] for r in conn.execute("PRAGMA table_info(migrated_files)").fetchall()]
     if "dst_path" not in migrated_cols:
         conn.execute("ALTER TABLE migrated_files ADD COLUMN dst_path TEXT")
@@ -523,13 +524,20 @@ def list_eio_failures(task_id=None, limit=200, offset=0):
     where = ' WHERE e.task_id=?' if task_id is not None else ''
     params = (task_id,) if task_id is not None else ()
     with _lock:
-        rows = get_conn().execute("SELECT e.*, t.name task_name, t.exclude_patterns"
-                                  " FROM eio_failures e LEFT JOIN tasks t ON t.id=e.task_id"
-                                  + where + " ORDER BY e.last_at DESC LIMIT ? OFFSET ?",
-                                  (*params, limit, offset)).fetchall()
+        rows = get_conn().execute(
+            "SELECT e.*, t.name task_name, t.exclude_patterns,"
+            # 迁移凭证存在说明该路径最终已成功；队列仍有未完成/失败项说明还在处理。
+            " EXISTS(SELECT 1 FROM migrated_files m WHERE m.task_id=e.task_id"
+            "   AND m.rel_path=e.rel_path) AS migrated,"
+            " EXISTS(SELECT 1 FROM queue q WHERE q.task_id=e.task_id"
+            "   AND q.rel_path=e.rel_path AND q.status IN"
+            "   ('pending','transferring','accounting_pending','failed')) AS busy"
+            " FROM eio_failures e LEFT JOIN tasks t ON t.id=e.task_id"
+            + where + " ORDER BY e.last_at DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset)).fetchall()
     return [dict(row, active=bool(row['auto_excluded'] and row['task_name']
-                                  and './' + row['rel_path'] in [p.strip() for p in
-                                      (row['exclude_patterns'] or '').split(',')]))
+                          and './' + row['rel_path'] in [p.strip() for p in
+                              (row['exclude_patterns'] or '').split(',')]))
             for row in rows]
 
 
@@ -625,7 +633,46 @@ def list_upload_rounds(task_id=None, limit=50, offset=0):
         rows = conn.execute(_ROUND_COUNTS + where +
                             " GROUP BY r.id ORDER BY r.id DESC LIMIT ? OFFSET ?",
                             (*params, limit, offset)).fetchall()
-        return [dict(row) for row in rows]
+    return [dict(row) for row in rows]
+
+
+def get_round(round_id: int):
+    with _lock:
+        row = get_conn().execute(_ROUND_COUNTS + " WHERE r.id=? GROUP BY r.id",
+                                 (round_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_round_files(round_id: int, status=None, limit=50, offset=0):
+    """轮次文件明细；队列项已删除的记录保留轮次侧状态供审计。"""
+    where = " WHERE f.round_id=?"
+    params: list = [round_id]
+    if status == "active":
+        where += " AND f.status IN ('pending','transferring','accounting_pending')"
+    elif status:
+        where += " AND f.status=?"
+        params.append(status)
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT f.file_type, f.status AS round_status, f.retry_at, f.queue_id,"
+            " q.rel_path, q.src_path, q.dst_path, q.size, q.retries, q.updated_at"
+            " FROM upload_round_files f LEFT JOIN queue q ON q.id=f.queue_id"
+            + where + " ORDER BY (q.rel_path IS NULL), q.rel_path LIMIT ? OFFSET ?",
+            (*params, limit, offset)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_round_files(round_id: int, status=None) -> int:
+    where = " WHERE f.round_id=?"
+    params: list = [round_id]
+    if status == "active":
+        where += " AND f.status IN ('pending','transferring','accounting_pending')"
+    elif status:
+        where += " AND f.status=?"
+        params.append(status)
+    with _lock:
+        return get_conn().execute(
+            "SELECT COUNT(*) FROM upload_round_files f" + where, params).fetchone()[0]
 
 
 def latest_upload_rounds():

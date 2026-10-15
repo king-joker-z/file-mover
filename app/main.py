@@ -327,6 +327,20 @@ def api_upload_rounds(task_id: Optional[int] = None, limit: int = 50, offset: in
             "total": db.count_upload_rounds(task_id)}
 
 
+@app.get("/api/rounds/{round_id}/files")
+def api_round_files(round_id: int, status: Optional[str] = None,
+                    limit: int = 50, offset: int = 0):
+    """轮次文件明细：逐文件展示成功/失败/冲突/取消/待处理等状态。"""
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(422, "limit 必须在 1-200，offset 不得为负数")
+    round_info = db.get_round(round_id)
+    if not round_info:
+        raise HTTPException(404, "轮次不存在")
+    return {"round": round_info,
+            "items": db.list_round_files(round_id, status, limit, offset),
+            "total": db.count_round_files(round_id, status)}
+
+
 # ---------- EIO failures ----------
 
 @app.get("/api/eio-failures")

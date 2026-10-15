@@ -239,6 +239,16 @@ details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;m
     </div>
   </div>
 
+  <!-- 轮次详情弹窗 -->
+  <div id="round-modal-mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center" onclick="if(event.target===this)closeRoundModal()">
+    <div style="background:#fff;border-radius:14px;width:920px;max-width:94vw;max-height:88vh;display:flex;flex-direction:column;padding:20px">
+      <div id="round-modal-head" style="margin-bottom:10px"></div>
+      <div class="filters" id="round-file-filters" style="margin-bottom:10px"></div>
+      <div id="round-file-list" style="overflow:auto;flex:1;min-height:120px"></div>
+      <div class="pager" id="round-file-pager"></div>
+    </div>
+  </div>
+
   <!-- 设置 -->
   <div id="tab-settings" style="display:none">
     <div class="settings-intro"><span class="eyebrow">PREFERENCES / 全局配置</span><h2>设置与安全策略</h2><p>按用途调整扫描节奏与文件处理方式；保存后从下一周期开始生效。</p></div>
@@ -363,7 +373,7 @@ function renderScanSchedules(){
     const detail=active?`${s.current||"扫描准备中"} · ${s.backfill_nfo&&s.backfill_total?`历史视频已检查 ${s.backfill_checked}/${s.backfill_total} · `:""}源目录已发现 ${s.scanned} · 新入队 ${s.enqueued}`:
       s.status==="cooldown"?"挂载 I/O 故障后等待重试":`扫描间隔 ${s.interval_seconds} 秒 · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
     const r=s.round;
-    const roundBlock=r?`<div class="round-mini"><div class="round-mini-title">最近一轮 #${r.id} · ${roundState(r).label}</div><div class="round-mini-stats"><span>总数 <b>${r.total}</b></span><span>视频 <b>${r.video_count}</b></span><span>NFO <b>${r.nfo_count}</b></span><span>图片 <b>${r.image_count}</b></span>${r.other_count?`<span>其他 <b>${r.other_count}</b></span>`:""}</div><div class="round-mini-time">上传耗时 <b data-round-elapsed="${s.id}">${roundElapsed(r)}</b> · 成功 ${r.success_count} / 失败 ${r.failed_count} / 冲突 ${r.conflict_count} / 取消 ${r.cancelled_count} / 待处理 ${r.remaining_count}</div></div>`:
+    const roundBlock=r?`<div class="round-mini" style="cursor:pointer" title="点击查看轮次文件明细" onclick="openRoundDetail(${r.id})"><div class="round-mini-title">最近一轮 #${r.id} · ${roundState(r).label} ▸</div><div class="round-mini-stats"><span>总数 <b>${r.total}</b></span><span>视频 <b>${r.video_count}</b></span><span>NFO <b>${r.nfo_count}</b></span><span>图片 <b>${r.image_count}</b></span>${r.other_count?`<span>其他 <b>${r.other_count}</b></span>`:""}</div><div class="round-mini-time">上传耗时 <b data-round-elapsed="${s.id}">${roundElapsed(r)}</b> · 成功 ${r.success_count} / 失败 ${r.failed_count} / 冲突 ${r.conflict_count} / 取消 ${r.cancelled_count} / 待处理 ${r.remaining_count}</div></div>`:
       `<div class="round-mini"><div class="round-mini-title">当前暂无上传轮次</div><div class="round-mini-time">发现新文件并入队后开始统计</div></div>`;
     return `<article class="scan-card"><div class="scan-card-top"><div class="scan-symbol" aria-hidden="true">↻</div><span class="tag scan-state ${esc(s.status)}">${label}</span></div>
       <h3 title="${esc(s.name)}">${esc(s.name)}</h3><div class="scan-path" title="${esc(s.src_dir)}">${esc(s.src_dir)} <span>→</span> ${esc(s.dst_dir)}</div>
@@ -814,10 +824,10 @@ async function loadRounds(){
     if(requestId!==roundRequestId)return;
     if(!items.length && total && page>0){roundPage=Math.ceil(total/PAGE_SIZE)-1;return loadRounds();}
     if(!items.length)$("#round-list").innerHTML='<div class="empty">暂无上传轮次</div>';
-    else $("#round-list").innerHTML=`<div class="table-wrap"><table><tr><th>轮次 / 任务</th><th>入队 / 上传开始 / 结束</th><th>文件（总 / 视频 / NFO / 图片 / 其他）</th><th>结果（成功 / 失败 / 冲突 / 取消）</th><th>上传耗时</th><th>状态</th></tr>`+
+    else $("#round-list").innerHTML=`<div class="table-wrap"><table><tr><th>轮次 / 任务</th><th>入队 / 上传开始 / 结束</th><th>文件（总 / 视频 / NFO / 图片 / 其他）</th><th>结果（成功 / 失败 / 冲突 / 取消）</th><th>上传耗时</th><th>状态</th><th>操作</th></tr>`+
       items.map(r=>`<tr><td><b>#${r.id}</b><br><span class="log-detail">${esc(r.task_name)}</span></td><td>${new Date(r.created_at*1000).toLocaleString("zh-CN")}<br><span class="log-detail">${r.started_at?new Date(r.started_at*1000).toLocaleString("zh-CN"):"未开始"} / ${r.finished_at?new Date(r.finished_at*1000).toLocaleString("zh-CN"):"—"}</span></td>
       <td>${r.total} / ${r.video_count} / ${r.nfo_count} / ${r.image_count} / ${r.other_count}</td><td><b style="color:var(--ok)">${r.success_count}</b> / <b style="color:var(--err)">${r.failed_count}</b> / ${r.conflict_count} / <b style="color:var(--warn)" title="已从队列移除，不代表上传成功">${r.cancelled_count}</b> · 待处理 ${r.remaining_count}</td>
-      <td data-history-elapsed="${r.id}">${roundElapsed(r)}</td><td><span class="tag ${roundState(r).tag}">${roundState(r).label}</span></td></tr>`).join("")+"</table></div>";
+      <td data-history-elapsed="${r.id}">${roundElapsed(r)}</td><td><span class="tag ${roundState(r).tag}">${roundState(r).label}</span></td><td><button class="btn small gray" onclick="openRoundDetail(${r.id})">详情</button></td></tr>`).join("")+"</table></div>";
     historyRounds=items;
     renderPager("#round-pager",page,total,p=>{roundPage=p;loadRounds();$("#tab-rounds").scrollIntoView({behavior:"smooth"});});
   }catch(e){if(requestId!==roundRequestId)return;$("#round-list").innerHTML='<div class="empty">轮次加载失败：'+esc(e.message)+'</div>';$("#round-pager").innerHTML="";}
@@ -844,16 +854,60 @@ async function loadEioFailures(){
     $("#eio-list").innerHTML=!items.length?'<div class="empty">暂无 EIO 故障记录</div>':
       `<div class="table-wrap"><table><tr><th>任务 / 文件</th><th>发生位置</th><th>次数 / 最近发生</th><th>状态</th><th>详情</th><th>操作</th></tr>`+
       items.map(f=>{
-        const retry=f.task_name?`<button class="btn small" data-eio-task="${f.task_id}" data-eio-path="${esc(f.rel_path)}" ${eioBusy?"disabled":""} title="移除对应排除项并立即重新扫描">重试</button>`:'<span class="log-detail">—</span>';
+        const state=f.active?["已排除","cancelled"]:f.busy?["队列处理中","transferring"]:f.migrated?["已成功迁移","done"]:f.auto_excluded?["规则已移除","pending"]:["待重试","pending"];
+        const retry=f.task_name&&!f.migrated&&!f.busy?`<button class="btn small" data-eio-task="${f.task_id}" data-eio-path="${esc(f.rel_path)}" ${eioBusy?"disabled":""} title="移除对应排除项并立即重新扫描">重试</button>`:'<span class="log-detail">—</span>';
         return `<tr><td><b>${esc(f.task_name||"已删除任务 #"+f.task_id)}</b><br><span class="log-detail">${esc(f.rel_path)}</span></td>
         <td>${f.origin==="source"?"源文件":f.origin==="directory"?"源目录":"目标挂载"}</td><td>${f.occurrences} 次<br><span class="log-detail">${new Date(f.last_at*1000).toLocaleString("zh-CN")}</span></td>
-        <td><span class="tag ${f.active?"cancelled":"pending"}">${f.active?"已排除":f.auto_excluded?"规则已移除":"冷却/待重试"}</span></td><td class="path-cell log-detail">${esc(f.detail)}</td><td>${retry}</td></tr>`;
+        <td><span class="tag ${state[1]}">${state[0]}</span></td><td class="path-cell log-detail">${esc(f.detail)}</td><td>${retry}</td></tr>`;
       }).join("")+"</table></div>";
     $$("#eio-list button[data-eio-path]").forEach(b=>b.onclick=()=>retryEio(+b.dataset.eioTask,b.dataset.eioPath,b));
     renderPager("#eio-pager",page,total,p=>{eioPage=p;loadEioFailures();});
   }catch(e){if(requestId!==eioRequestId)return;$("#eio-list").innerHTML='<div class="empty">故障记录加载失败：'+esc(e.message)+'</div>';}
 }
 $("#eio-task").addEventListener("change",()=>{eioPage=0;loadEioFailures();});
+
+// ---- 轮次文件明细弹窗 ----
+let roundModal={id:null,page:0,status:"",requestId:0};
+const roundFileLabels={done:"成功",failed:"失败",conflict:"冲突",cancelled:"已取消",pending:"待迁移",transferring:"迁移中",accounting_pending:"待记账"};
+function openRoundDetail(id){
+  roundModal={id,page:0,status:"",requestId:roundModal.requestId+1};
+  $("#round-modal-mask").style.display="flex";
+  loadRoundDetail();
+}
+function closeRoundModal(){roundModal.id=null;$("#round-modal-mask").style.display="none";}
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeRoundModal();});
+async function loadRoundDetail(){
+  const requestId=++roundModal.requestId,id=roundModal.id;
+  if(!id)return;
+  const params=new URLSearchParams({limit:PAGE_SIZE,offset:roundModal.page*PAGE_SIZE});
+  if(roundModal.status)params.set("status",roundModal.status);
+  try{
+    const data=await api(`/api/rounds/${id}/files?`+params);
+    if(requestId!==roundModal.requestId||roundModal.id!==id)return;
+    const r=data.round;
+    const stateTag=r.scanning&&!r.finished_at?['<span class="tag transferring">扫描中</span>',true]:(!r.finished_at?['<span class="tag pending">进行中</span>',true]:['',false]);
+    $("#round-modal-head").innerHTML=`<div style="display:flex;align-items:center;gap:10px"><h2 style="font-size:16px;margin:0">轮次 #${r.id} · ${esc(r.task_name)}</h2>${stateTag[0]}<button type="button" class="btn small gray" style="margin-left:auto" onclick="closeRoundModal()">✕</button></div>
+      <div class="log-detail" style="margin-top:4px">${new Date(r.created_at*1000).toLocaleString("zh-CN")} 创建 · ${r.started_at?"开始上传 "+new Date(r.started_at*1000).toLocaleString("zh-CN"):"未开始"}${r.finished_at?" · 结束 "+new Date(r.finished_at*1000).toLocaleString("zh-CN"):""} · 耗时 <span ${stateTag[1]?`data-round-elapsed="${r.id}"`:""}>${roundElapsed(r)}</span></div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:12px"><span>总数 <b>${r.total}</b></span><span>视频 <b>${r.video_count}</b></span><span>NFO <b>${r.nfo_count}</b></span><span>图片 <b>${r.image_count}</b></span><span style="color:var(--ok)">成功 <b>${r.success_count}</b></span><span style="color:var(--err)">失败 <b>${r.failed_count}</b></span><span style="color:var(--warn)">冲突 <b>${r.conflict_count}</b></span><span>取消 <b>${r.cancelled_count}</b></span><span>待处理 <b>${r.remaining_count}</b></span></div>`;
+    const filters=[["","全部"],["done","成功"],["failed","失败"],["conflict","冲突"],["cancelled","已取消"],["active","待处理"]];
+    $("#round-file-filters").innerHTML=filters.map(([v,l])=>`<button type="button" data-rf="${v}" class="${roundModal.status===v?"active":""}">${l}</button>`).join("");
+    $$("#round-file-filters button[data-rf]").forEach(b=>b.onclick=()=>{roundModal.status=b.dataset.rf;roundModal.page=0;loadRoundDetail();});
+    const typeLabels={video:"视频",nfo:"NFO",image:"图片",other:"其他"};
+    $("#round-file-list").innerHTML=!data.items.length?'<div class="empty">该筛选下暂无文件</div>':
+      `<table style="min-width:640px"><tr><th>文件</th><th>类型</th><th>大小</th><th>状态</th><th>更新时间</th></tr>`+
+      data.items.map(f=>{
+        const tagCls=f.round_status==="done"?"done":f.round_status==="failed"?"failed":f.round_status==="conflict"?"conflict":f.round_status==="cancelled"?"cancelled":f.round_status==="transferring"?"transferring":"pending";
+        return `<tr><td class="path-cell" title="${esc(f.src_path||"")}">${f.rel_path?esc(f.rel_path):`<span class="log-detail">已从队列移除 · #${f.queue_id}</span>`}</td>
+          <td>${typeLabels[f.file_type]||esc(f.file_type)}</td><td>${f.size?fmtSize(f.size):"-"}</td>
+          <td><span class="tag ${tagCls}">${roundFileLabels[f.round_status]||esc(f.round_status)}</span></td><td class="log-detail">${esc(f.updated_at||"—")}</td></tr>`;
+      }).join("")+"</table>";
+    renderPager("#round-file-pager",roundModal.page,data.total,p=>{roundModal.page=p;loadRoundDetail();});
+  }catch(e){
+    if(requestId!==roundModal.requestId)return;
+    $("#round-file-list").innerHTML='<div class="empty">轮次详情加载失败：'+esc(e.message)+'</div>';
+    $("#round-file-pager").innerHTML="";
+  }
+}
 let eioBusy=false;
 async function retryEio(taskId,relPath,btn){
   if(eioBusy)return;
