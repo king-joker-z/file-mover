@@ -517,12 +517,12 @@ async function loadTasks(){
         <span class="sync-status" data-sync-status="${t.id}" role="status"></span>
         <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table></div>";
     tasks.forEach(t=>updateSyncBtn(t.id));
-    $("#task-list details[data-exc-task]").forEach(d=>{
+    $$("#task-list details[data-exc-task]").forEach(d=>{
       const tid=+d.dataset.excTask;
       d.open=openExclude.has(tid);
       d.addEventListener("toggle",()=>{if(d.open)openExclude.add(tid);else openExclude.delete(tid);});
     });
-    $("#task-list button[data-del-pattern]").forEach(b=>b.onclick=()=>removeTaskPattern(+b.dataset.task,b.dataset.delPattern));
+    $$("#task-list button[data-del-pattern]").forEach(b=>b.onclick=()=>removeTaskPattern(+b.dataset.task,b.dataset.delPattern));
   }catch(e){$("#task-list").innerHTML='<div class="empty">任务加载失败：'+esc(e.message)+'</div>';}
 }
 
@@ -849,7 +849,7 @@ async function loadEioFailures(){
         <td>${f.origin==="source"?"源文件":f.origin==="directory"?"源目录":"目标挂载"}</td><td>${f.occurrences} 次<br><span class="log-detail">${new Date(f.last_at*1000).toLocaleString("zh-CN")}</span></td>
         <td><span class="tag ${f.active?"cancelled":"pending"}">${f.active?"已排除":f.auto_excluded?"规则已移除":"冷却/待重试"}</span></td><td class="path-cell log-detail">${esc(f.detail)}</td><td>${retry}</td></tr>`;
       }).join("")+"</table></div>";
-    $("#eio-list button[data-eio-path]").forEach(b=>b.onclick=()=>retryEio(+b.dataset.eioTask,b.dataset.eioPath,b));
+    $$("#eio-list button[data-eio-path]").forEach(b=>b.onclick=()=>retryEio(+b.dataset.eioTask,b.dataset.eioPath,b));
     renderPager("#eio-pager",page,total,p=>{eioPage=p;loadEioFailures();});
   }catch(e){if(requestId!==eioRequestId)return;$("#eio-list").innerHTML='<div class="empty">故障记录加载失败：'+esc(e.message)+'</div>';}
 }
