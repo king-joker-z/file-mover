@@ -53,6 +53,18 @@ def _init_log_destinations(conn: sqlite3.Connection):
         conn.execute("INSERT INTO log_destinations_state (id) VALUES (1)")
 
 
+def _repair_cancelled_round_files(conn: sqlite3.Connection) -> int:
+    """修复历史 bug：非孤儿清理曾把已成功文件的轮次状态翻成 cancelled。
+
+    被误翻的记录其队列项仍以 done 保留；真取消的（EIO 排除、改规则、
+    清队列、删任务）队列项已被删除，不受影响。幂等：修复后不再匹配。"""
+    cur = conn.execute(
+        "UPDATE upload_round_files SET status='done', retry_at=NULL"
+        " WHERE status='cancelled' AND queue_id IN"
+        " (SELECT id FROM queue WHERE status='done')")
+    return cur.rowcount
+
+
 def get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
@@ -70,6 +82,11 @@ def get_conn() -> sqlite3.Connection:
                     _migrate_schema(conn)
                     with conn:
                         _init_log_destinations(conn)
+                        repaired = _repair_cancelled_round_files(conn)
+                    if repaired:
+                        import logging
+                        logging.getLogger("uvicorn.error").warning(
+                            "轮次统计修复：已将 %d 条被误标为取消的成功记录恢复为完成", repaired)
                 except BaseException:
                     conn.close()
                     raise
@@ -363,6 +380,16 @@ def update_task(task_id: int, data: dict):
             _finish_rounds(conn, task_id)
 
 
+def update_exclude_patterns(task_id: int, patterns: list[str]):
+    """仅替换排除规则；队列取消与自动排除重置逻辑与编辑任务保存完全一致。"""
+    cleaned: list[str] = []
+    for pattern in patterns:
+        pattern = pattern.strip()
+        if pattern and pattern not in cleaned:
+            cleaned.append(pattern)
+    update_task(task_id, {"exclude_patterns": ", ".join(cleaned)})
+
+
 def toggle_task(task_id: int) -> bool | None:
     conn = get_conn()
     with _lock, conn:
@@ -483,6 +510,13 @@ def record_eio_failure(task_id: int, queue_id: int, rel_path: str, origin: str,
             conn.execute("DELETE FROM queue WHERE id=?", (item_id,))
         _finish_rounds(conn, task_id)
         return True
+
+
+def get_eio_failure(task_id: int, rel_path: str):
+    with _lock:
+        row = get_conn().execute("SELECT * FROM eio_failures WHERE task_id=? AND rel_path=?",
+                                 (task_id, rel_path)).fetchone()
+    return dict(row) if row else None
 
 
 def list_eio_failures(task_id=None, limit=200, offset=0):
@@ -753,10 +787,13 @@ def cleanup_orphan_queue(queue_id: int):
     """删除任务已移除的在途队列；保留日志用于排查。"""
     conn = get_conn()
     with _lock, conn:
-        conn.execute("DELETE FROM queue WHERE id=? AND task_id NOT IN (SELECT id FROM tasks)",
-                     (queue_id,))
-        _round_status(conn, queue_id, 'cancelled')
-        _finish_rounds(conn)
+        deleted = conn.execute(
+            "DELETE FROM queue WHERE id=? AND task_id NOT IN (SELECT id FROM tasks)",
+            (queue_id,))
+        # 仅真删除孤儿时才取消轮次文件；正常完成的文件不能被翻成 cancelled。
+        if deleted.rowcount:
+            _round_status(conn, queue_id, 'cancelled')
+            _finish_rounds(conn)
 
 
 def release_unstarted_claim(queue_id: int) -> int:

@@ -389,6 +389,150 @@ class NfoSafetyTests(unittest.TestCase):
                     scanner.scan_task(self.task)
         self.assertFalse(db.list_queue())
 
+    def test_exclude_pattern_api_matches_edit_task_semantics(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="exc api", enabled=True))
+        self.source("bad.jpg")
+        self.source("good.jpg")
+        db.enqueue(task_id, str(self.src / "bad.jpg"), "bad.jpg", str(self.dst / "bad.jpg"), 5)
+        db.enqueue(task_id, str(self.src / "good.jpg"), "good.jpg", str(self.dst / "good.jpg"), 5)
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            # 添加规则：与编辑任务保存一致，取消队列中匹配的待处理项
+            added = client.post(f"/api/tasks/{task_id}/exclude-patterns",
+                                json={"pattern": "./bad.jpg"}, headers=headers)
+            self.assertEqual(added.status_code, 200)
+            self.assertEqual(db.get_task(task_id)["exclude_patterns"], "./bad.jpg")
+            self.assertEqual([i["rel_path"] for i in db.list_queue()], ["good.jpg"])
+            # 重复添加不产生变化
+            duplicate = client.post(f"/api/tasks/{task_id}/exclude-patterns",
+                                    json={"pattern": "./bad.jpg"}, headers=headers)
+            self.assertTrue(duplicate.json()["duplicate"])
+            self.assertEqual(db.get_task(task_id)["exclude_patterns"], "./bad.jpg")
+            # 逗号/换行是分隔符或非法字符，单条规则必须拒绝
+            invalid = client.post(f"/api/tasks/{task_id}/exclude-patterns",
+                                  json={"pattern": "a,b"}, headers=headers)
+            self.assertEqual(invalid.status_code, 422)
+            # 删除规则：精确匹配整条规则，其余保持不变
+            removed = client.delete(f"/api/tasks/{task_id}/exclude-patterns",
+                                    params={"pattern": "./bad.jpg"}, headers=headers)
+            self.assertEqual(removed.status_code, 200)
+            self.assertTrue(removed.json()["removed"])
+            self.assertEqual(db.get_task(task_id)["exclude_patterns"], "")
+            # 移除规则不恢复已取消的队列项；重新扫描后 bad.jpg 才会重新入队
+            self.assertEqual([i["rel_path"] for i in db.list_queue()], ["good.jpg"])
+            scanner.scan_task(db.get_task(task_id), skip_stable_check=True)
+            self.assertEqual({i["rel_path"] for i in db.list_queue()}, {"bad.jpg", "good.jpg"})
+        # 无 Token 的非本机请求必须拒绝（TestClient 主机非 loopback → 403）
+        self.assertEqual(client.post(f"/api/tasks/{task_id}/exclude-patterns",
+                                     json={"pattern": "x"}).status_code, 403)
+
+    def test_eio_retry_removes_rule_and_triggers_rescan(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="eio retry", enabled=True))
+        path = self.source("bad.jpg", b"payload")
+        db.enqueue(task_id, str(path), "bad.jpg", str(self.dst / "bad.jpg"), 7)
+        item_id = db.list_queue()[0]["id"]
+        db.set_status(item_id, "failed", next_retry_at=time.time() + 60)
+        self.assertTrue(db.record_eio_failure(task_id, item_id, "bad.jpg", "source", "EIO"))
+        self.assertEqual(db.get_task(task_id)["exclude_patterns"], "./bad.jpg")
+        self.assertTrue(db.list_eio_failures(task_id)[0]["active"])
+
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with (patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}),
+              patch.object(scheduler.scheduler, "sync_now",
+                           return_value={"ok": True, "message": "源目录扫描已触发",
+                                         "request_id": "req"}) as sync_now):
+            response = client.post("/api/eio-failures/retry",
+                                   json={"task_id": task_id, "rel_path": "bad.jpg"},
+                                   headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["removed_rule"])
+        sync_now.assert_called_once_with(task_id)
+        # 排除规则已移除，自动排除标记同步重置，状态不再显示"已排除"
+        self.assertEqual(db.get_task(task_id)["exclude_patterns"], "")
+        self.assertEqual(db.list_eio_failures(task_id)[0]["auto_excluded"], 0)
+        self.assertFalse(db.list_eio_failures(task_id)[0]["active"])
+
+    def test_eio_retry_validates_task_state_record_and_existence(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id = db.create_task(dict(self.task, name="eio retry", enabled=True))
+        path = self.source("x.jpg", b"payload")
+        db.enqueue(task_id, str(path), "x.jpg", str(self.dst / "x.jpg"), 7)
+        item_id = db.list_queue()[0]["id"]
+        db.set_status(item_id, "failed")
+        db.record_eio_failure(task_id, item_id, "x.jpg", "source", "EIO")
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            # 故障记录不存在时拒绝，不能把任意路径当成重试目标
+            missing = client.post("/api/eio-failures/retry",
+                                  json={"task_id": task_id, "rel_path": "ghost.jpg"},
+                                  headers=headers)
+            self.assertEqual(missing.status_code, 404)
+            # 任务停用时必须先启用
+            db.toggle_task(task_id)
+            disabled = client.post("/api/eio-failures/retry",
+                                   json={"task_id": task_id, "rel_path": "x.jpg"},
+                                   headers=headers)
+            self.assertEqual(disabled.status_code, 400)
+            self.assertIn("停用", disabled.json()["detail"])
+            # 任务已删除时拒绝
+            db.delete_task(task_id)
+            gone = client.post("/api/eio-failures/retry",
+                               json={"task_id": task_id, "rel_path": "x.jpg"},
+                               headers=headers)
+            self.assertEqual(gone.status_code, 404)
+
+    def test_round_files_survive_non_orphan_cleanup_after_success(self):
+        # 回归：迁移成功后每个队列项都会经过孤儿清理，非孤儿不得把轮次
+        # 文件从 done 翻成 cancelled（曾导致轮次只显示最后一个成功）。
+        task_id = db.create_task(dict(self.task, name="round cleanup",
+                                      enabled=True, interval_seconds=0))
+        for index in range(2):
+            source = self.source(f"clip{index}.mp4", f"data{index}".encode())
+            db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._work_once()
+            worker._work_once()
+        self.assertEqual(db.queue_stats()["done"], 2)
+        stats = db.list_upload_rounds(task_id)[0]
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["success_count"], 2)
+        self.assertEqual(stats["cancelled_count"], 0)
+
+    def test_repair_restores_round_files_cancelled_by_orphan_cleanup(self):
+        task_id = db.create_task(dict(self.task, name="repair", enabled=True))
+        source = self.source("clip.mp4", b"data")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        queue_id = db.list_queue()[0]["id"]
+        db.set_status(queue_id, "done")
+        conn = db.get_conn()
+        # 模拟历史 bug 落库状态：队列项 done，轮次文件被误翻成 cancelled
+        with conn:
+            conn.execute("UPDATE upload_round_files SET status='cancelled'"
+                         " WHERE queue_id=?", (queue_id,))
+        self.assertEqual(db.list_upload_rounds(task_id)[0]["cancelled_count"], 1)
+        self.assertEqual(db._repair_cancelled_round_files(conn), 1)
+        stats = db.list_upload_rounds(task_id)[0]
+        self.assertEqual((stats["success_count"], stats["cancelled_count"]), (1, 0))
+        # 真取消的场景（队列项已删除）不受修复影响
+        with conn:
+            conn.execute("UPDATE upload_round_files SET status='cancelled'"
+                         " WHERE queue_id=?", (queue_id,))
+            conn.execute("DELETE FROM queue WHERE id=?", (queue_id,))
+        self.assertEqual(db._repair_cancelled_round_files(conn), 0)
+        self.assertEqual(db.list_upload_rounds(task_id)[0]["cancelled_count"], 1)
+
     def test_missing_source_root_cannot_clear_scan_circuit_breaker(self):
         task_id = db.create_task(dict(self.task, name="test", enabled=True))
         task = db.get_task(task_id)

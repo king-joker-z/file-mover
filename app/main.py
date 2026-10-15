@@ -118,6 +118,37 @@ class SettingsIn(BaseModel):
     default_interval_seconds: Optional[float] = Field(default=None, ge=0, le=86400, allow_inf_nan=False)
     nfo_fix_enabled: Optional[bool] = None
     douyin_nfo_enabled: Optional[bool] = None
+
+
+class ExcludePatternIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str = Field(min_length=1, max_length=512)
+
+
+class EioRetryIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: int = Field(ge=1)
+    rel_path: str = Field(min_length=1, max_length=1024)
+
+
+def _split_exclude_patterns(raw: str) -> list[str]:
+    return [p.strip() for p in (raw or "").split(",") if p.strip()]
+
+
+def _validate_exclude_pattern(value: str) -> str:
+    """单条规则校验：逗号是规则分隔符，换行/空字符一律拒绝。"""
+    pattern = value.strip()
+    if not pattern:
+        raise HTTPException(422, "排除规则不能为空")
+    if any(ch in pattern for ch in (",", "\n", "\r", "\x00")):
+        raise HTTPException(422, "排除规则不能包含逗号或换行，请逐条添加")
+    if len(pattern) > 512:
+        raise HTTPException(422, "排除规则过长（上限 512 字符）")
+    return pattern
+
+
 def _task_path(value: str, field: str) -> Path:
     """归一化路径并解析现有软链；不存在的尾部仍可校验包含关系。"""
     if not value or not os.path.isabs(value) or "\x00" in value:
@@ -306,6 +337,33 @@ def api_eio_failures(task_id: Optional[int] = None, limit: int = 200, offset: in
             "total": db.count_eio_failures(task_id)}
 
 
+@app.post("/api/eio-failures/retry")
+def api_retry_eio_failure(data: EioRetryIn):
+    """一键重试：自动移除该条自动排除规则并立即重新扫描源目录。"""
+    task = db.get_task(data.task_id)
+    if not task:
+        raise HTTPException(404, "任务已删除，无法重试")
+    if not task.get("enabled"):
+        raise HTTPException(400, "任务已停用，请先启用后再重试")
+    if db.get_eio_failure(data.task_id, data.rel_path) is None:
+        raise HTTPException(404, "故障记录不存在")
+    exact = "./" + data.rel_path
+    patterns = _split_exclude_patterns(task.get("exclude_patterns"))
+    removed_rule = exact in patterns
+    if removed_rule:
+        try:
+            db.update_exclude_patterns(data.task_id, [p for p in patterns if p != exact])
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+    result = scheduler.sync_now(data.task_id)
+    if not result.get("ok"):
+        raise HTTPException(503, result.get("message", "重新扫描触发失败"))
+    logger.info("EIO 故障重试：task_id=%s 路径=%s 移除排除=%s",
+                data.task_id, data.rel_path, removed_rule)
+    return {"ok": True, "removed_rule": removed_rule,
+            "message": ("已移除排除项并" if removed_rule else "已") + "触发重新扫描"}
+
+
 # ---------- tasks ----------
 
 @app.get("/api/tasks")
@@ -363,6 +421,44 @@ def api_toggle_task(task_id: int):
     logger.info("任务启停变更：task_id=%s 启用=%s", task_id, enabled)
     scheduler.wake_scan()
     return {"ok": True, "enabled": enabled}
+
+
+@app.post("/api/tasks/{task_id}/exclude-patterns")
+def api_add_exclude_pattern(task_id: int, data: ExcludePatternIn):
+    """追加一条排除规则；队列联动与编辑任务保存一致。"""
+    pattern = _validate_exclude_pattern(data.pattern)
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    patterns = _split_exclude_patterns(task.get("exclude_patterns"))
+    if pattern in patterns:
+        return {"ok": True, "duplicate": True, "patterns": patterns}
+    try:
+        db.update_exclude_patterns(task_id, [*patterns, pattern])
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    logger.info("排除规则新增：task_id=%s 规则=%s", task_id, pattern)
+    scheduler.wake_scan()
+    return {"ok": True, "duplicate": False, "patterns": [*patterns, pattern]}
+
+
+@app.delete("/api/tasks/{task_id}/exclude-patterns")
+def api_remove_exclude_pattern(task_id: int, pattern: str):
+    """移除单条排除规则（精确匹配整条规则，不做通配展开）。"""
+    pattern = _validate_exclude_pattern(pattern)
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    patterns = _split_exclude_patterns(task.get("exclude_patterns"))
+    if pattern not in patterns:
+        return {"ok": True, "removed": False, "patterns": patterns}
+    try:
+        db.update_exclude_patterns(task_id, [p for p in patterns if p != pattern])
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    logger.info("排除规则移除：task_id=%s 规则=%s", task_id, pattern)
+    scheduler.wake_scan()
+    return {"ok": True, "removed": True, "patterns": [p for p in patterns if p != pattern]}
 
 
 @app.get("/api/tasks/{task_id}/sync-progress")

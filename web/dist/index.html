@@ -74,6 +74,19 @@ body{background:radial-gradient(circle at 90% -15%,#dce9ff 0,transparent 42%),va
 .btn{border-radius:8px;font-weight:600;transition:transform .15s,filter .15s,background .15s}.btn:not(:disabled):hover{filter:brightness(.94);transform:translateY(-1px)}.btn.gray{background:#eef3fa;color:#345270}.btn.red{background:#d85460}.btn.green{background:#128965}.btn:focus-visible,.tabs button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
 th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f7f9fc;color:#62758b;font-weight:700}tr:last-child td{border-bottom:none}tr:hover td{background:#fbfcff}table{min-width:700px}.panel:has(table){overflow-x:auto}.filters button{border-radius:8px;padding:7px 12px}.filters button.active{background:#eaf1ff}.field{min-width:190px}form input,form select{border-radius:8px;padding:10px 12px;background:#fff;color:var(--text)}form input:focus,form select:focus{border-color:var(--primary);outline:3px solid #2563eb20}form .row{gap:16px;margin-bottom:18px}.current{font-size:14px;color:var(--text);font-weight:600;margin-bottom:6px}.log-detail{line-height:1.6}.empty{padding:42px 20px;background:#f8fafd;border-radius:10px;grid-column:1/-1}
 .insight-grid{display:grid;grid-template-columns:minmax(290px,.85fr) minmax(0,1.15fr);gap:20px}.insight-grid .panel{min-width:0}.donut-layout{display:flex;align-items:center;gap:25px;min-height:190px}.donut{width:164px;aspect-ratio:1;border-radius:50%;flex:none;background:conic-gradient(#dfe7f2 0 100%);display:grid;place-items:center;position:relative}.donut:before{content:"";position:absolute;inset:19px;background:white;border-radius:50%}.donut-center{position:relative;text-align:center}.donut-center strong{display:block;font-size:26px;line-height:1.15;font-variant-numeric:tabular-nums}.donut-center span{font-size:11px;color:var(--muted)}.chart-legend{display:grid;gap:7px;flex:1}.legend-row{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.legend-row b{margin-left:auto;color:var(--text);font-variant-numeric:tabular-nums}.legend-dot{width:9px;height:9px;border-radius:3px;flex:none}.stage-bars{display:grid;gap:17px;padding:8px 0}.stage-row{display:grid;grid-template-columns:88px minmax(0,1fr) 50px;gap:12px;align-items:center;font-size:12px}.stage-track{height:10px;background:#eef2f7;border-radius:10px;overflow:hidden}.stage-fill{display:block;height:100%;border-radius:inherit;min-width:0;transition:width .25s}.stage-row b{text-align:right;font-variant-numeric:tabular-nums}.settings-intro{margin-bottom:20px}.settings-intro h2{font-size:26px;letter-spacing:-.03em;margin:4px 0}.settings-intro p{font-size:13px;color:var(--muted)}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.settings-card{margin:0;min-width:0}.settings-card .row{margin-top:18px}.settings-option{display:flex;gap:12px;align-items:flex-start;padding:14px;border:1px solid var(--border);border-radius:11px;margin-top:10px;cursor:pointer;transition:border-color .15s,background .15s}.settings-option:hover{border-color:#b6c9f2;background:#f9fbff}.settings-option input{width:17px;height:17px;flex:none;accent-color:var(--primary);margin-top:2px}.settings-option b{display:block;font-size:13px}.settings-option small{display:block;font-size:11px;color:var(--muted);line-height:1.5;margin-top:3px}.settings-note{background:#eef8f3;color:#137154;padding:12px;border-radius:10px;font-size:12px;margin-top:12px}.settings-save{position:sticky;bottom:12px;z-index:2;display:flex;align-items:center;gap:12px;padding:14px 18px;background:#fff;border:1px solid var(--border);border-radius:14px;box-shadow:0 12px 30px #1b3d6825;margin-top:18px}.settings-save .btn{min-width:120px}.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}.toolbar input,.toolbar select{border:1px solid var(--border);border-radius:8px;padding:9px 11px;font:inherit;background:#fff;color:var(--text);min-height:37px}.toolbar input{flex:1;min-width:180px}.toolbar select{min-width:130px}.toolbar .hint{font-size:11px;color:var(--muted)}.pager{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:14px;font-size:12px;color:var(--muted)}.pager .btn{font-size:12px}.table-wrap{overflow-x:auto}td.path-cell{overflow-wrap:anywhere;max-width:420px}.stat.red:before{background:var(--err)}
+.chip-list{display:flex;flex-wrap:wrap;gap:6px}.chip-list:empty{display:none}
+.chip{display:inline-flex;align-items:flex-start;gap:5px;background:#eef3fa;border:1px solid var(--border);border-radius:8px;padding:4px 6px 4px 10px;font-size:12px;max-width:100%}
+.chip>span{word-break:break-all}
+.chip button{border:none;background:none;cursor:pointer;color:var(--muted);font-size:12px;line-height:1.2;padding:1px 5px;border-radius:5px}
+.chip button:hover{color:var(--err);background:#fde5e5}
+details.exc-drop summary{cursor:pointer;color:var(--primary);font-size:12px;font-weight:600;list-style:none;display:inline-flex;align-items:center;gap:4px;user-select:none}
+details.exc-drop summary::-webkit-details-marker{display:none}
+details.exc-drop summary:after{content:"▾";font-size:10px;color:var(--muted)}
+details.exc-drop[open] summary:after{content:"▴"}
+details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;max-width:420px}
+.exc-row{display:flex;align-items:center;gap:8px;justify-content:space-between;background:#f8fafd;border:1px solid var(--border);border-radius:8px;padding:5px 9px;font-size:12px}
+.exc-row>span{word-break:break-all;min-width:0}
+.exc-row .btn{flex:none}
 @media(max-width:850px){.insight-grid,.settings-grid{grid-template-columns:1fr}}
 @media(max-width:600px){.donut-layout{gap:12px}.donut{width:125px}.donut:before{inset:15px}.donut-center strong{font-size:22px}.settings-save{bottom:0}.toolbar input{min-width:100%}}
 @media(max-width:850px){.container{padding:18px 16px 40px}.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.panel-hint{display:none}}
@@ -143,7 +156,10 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
           <div class="field small"><label>文件间隔（秒）</label><input id="f-interval" type="number" step="0.5" min="0" max="86400" value="5"></div>
           <div class="field small"><label>扫描间隔（秒，0=全局）</label><input id="f-scan" type="number" min="0" max="86400" value="0"></div>
           <div class="field"><label>包含（通配，逗号分隔，空=全部）</label><input id="f-inc" placeholder="*.mp4, *.jpg"></div>
-          <div class="field"><label>排除（相对源目录或完整路径，逗号分隔；排除目录后不进入扫描）</label><input id="f-exc" placeholder="B站/投稿/然然前辈, /data/local/故障目录, *.tmp"><div class="log-detail">遇到 EIO 即自动加入精确路径或目录并记录；移除规则并保存可重新尝试。</div></div>
+          <div class="field"><label>排除（相对源目录或完整路径，逐条添加；排除目录后不进入扫描）</label>
+            <div id="f-exc-chips" class="chip-list"></div>
+            <div style="display:flex;gap:6px;margin-top:6px"><input id="f-exc-input" placeholder="输入路径或通配后回车添加，如 B站/投稿/然然前辈、*.tmp" autocomplete="off"><button type="button" class="btn" onclick="addExcludeFromInput()">添加</button></div>
+            <div class="log-detail">遇到 EIO 自动加入精确路径并记录；每条可单独删除，删除后可在「EIO 故障」页一键重试。</div></div>
         </div>
         <div class="row">
           <div class="field"><label>运行周期（可多段，逗号分隔，留空=全天运行）</label>
@@ -176,7 +192,7 @@ th,td{padding:12px 10px;vertical-align:middle;word-break:normal}th{background:#f
   <!-- EIO 故障 -->
   <div id="tab-eio" style="display:none">
     <div class="panel"><div class="panel-heading"><div><span class="eyebrow">I/O FAILURES</span><h2>EIO 故障文件</h2><p>首次 EIO 即记录并自动排除该文件或故障目录；不会删除源文件。目标端 EIO 也会记录，若多文件连续失败请检查挂载。</p></div></div>
-      <div class="toolbar"><label for="eio-task" class="hint">任务筛选</label><select id="eio-task" aria-label="筛选故障任务"><option value="">全部任务</option></select><span class="hint">移除排除项并保存任务后可重试；源文件始终保留</span></div>
+      <div class="toolbar"><label for="eio-task" class="hint">任务筛选</label><select id="eio-task" aria-label="筛选故障任务"><option value="">全部任务</option></select><span class="hint">点「重试」自动移除对应排除项并立即重新扫描；源文件始终保留</span></div>
       <div id="eio-list"><div class="empty">加载故障记录中…</div></div><div class="pager" id="eio-pager"></div>
     </div>
   </div>
@@ -437,15 +453,50 @@ async function prepareExcludeDir(taskId, path){
     const src=task.src_dir.replace(/\/+$/,"");
     if(!path.startsWith(src+"/"))throw new Error("故障路径不在任务源目录内");
     const rel=path.slice(src.length+1);
-    const tabs=$$(".tabs button"), taskTab=[...tabs].find(b=>b.dataset.tab==="tasks");
-    taskTab.click();
-    await editTask(taskId);
-    const patterns=$("#f-exc").value.split(",").map(x=>x.trim()).filter(Boolean);
-    if(!patterns.includes(rel) && !patterns.includes(path))patterns.push(rel);
-    $("#f-exc").value=patterns.join(", ");
-    $("#f-exc").focus();
-    alert("已预填排除目录："+rel+"\n请核对后点击「保存修改」；排除会跳过该目录所有文件，不会修复底层 I/O 故障。");
-  }catch(e){alert("无法预填排除目录: "+e.message);}
+    if(!confirm(`将故障目录加入排除项？\n${rel}\n排除后重新扫描将跳过该目录下所有文件，不会修复底层 I/O 故障；可在任务管理的排除项中随时删除。`))return;
+    await api(`/api/tasks/${taskId}/exclude-patterns`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pattern:rel})});
+    loadDash();
+    if($("#tab-tasks").style.display!=="none")loadTasks();
+    alert(`已加入排除项：${rel}\n下次扫描开始生效。`);
+  }catch(e){alert("无法加入排除项: "+e.message);}
+}
+
+// ---- 排除规则条目编辑（任务表单） ----
+let formExcludes=[];
+function renderExcChips(){
+  $("#f-exc-chips").innerHTML=formExcludes.map((p,i)=>
+    `<span class="chip" title="${esc(p)}"><span>${esc(p)}</span><button type="button" aria-label="删除排除项 ${esc(p)}" onclick="removeExcludeChip(${i})">✕</button></span>`).join("");
+}
+function removeExcludeChip(i){formExcludes.splice(i,1);renderExcChips();}
+function addExcludeFromInput(){
+  const input=$("#f-exc-input");
+  const parts=input.value.split(",").map(x=>x.trim()).filter(Boolean);
+  if(!parts.length){input.focus();return;}
+  let added=0,duplicate=false;
+  parts.forEach(p=>{
+    if(formExcludes.includes(p))duplicate=true;
+    else{formExcludes.push(p);added++;}
+  });
+  input.value="";renderExcChips();input.focus();
+  if(!added&&duplicate)alert("该排除项已存在");
+}
+
+// ---- 任务列表排除项下拉与单条删除 ----
+let openExclude=new Set();
+function excCell(t){
+  const patterns=(t.exclude_patterns||"").split(",").map(x=>x.trim()).filter(Boolean);
+  if(!patterns.length)return '<span class="log-detail">无</span>';
+  return `<details class="exc-drop" data-exc-task="${t.id}"><summary>排除 ${patterns.length} 条</summary><div class="exc-list">`+
+    patterns.map(p=>`<div class="exc-row"><span title="${esc(p)}">${esc(p)}</span><button type="button" class="btn small red" data-task="${t.id}" data-del-pattern="${esc(p)}">删除</button></div>`).join("")+
+    `</div></details>`;
+}
+async function removeTaskPattern(taskId,pattern){
+  if(!confirm(`确认删除排除项「${pattern}」？\n删除后重新扫描会重新处理该路径；源文件始终保留。`))return;
+  try{
+    await api(`/api/tasks/${taskId}/exclude-patterns?pattern=${encodeURIComponent(pattern)}`,{method:"DELETE"});
+    loadTasks();loadDash();
+    if($("#tab-eio").style.display!=="none")loadEioFailures();
+  }catch(e){alert("删除排除项失败: "+e.message);}
 }
 
 let editingTaskId = null;  // 非 null = 编辑模式
@@ -455,7 +506,7 @@ async function loadTasks(){
     const tasks=await api("/api/tasks");
     if(!tasks.length){$("#task-list").innerHTML='<div class="empty">暂无任务，请先创建</div>';return;}
     $("#task-list").innerHTML=`<div class="table-wrap"><table><tr><th>名称</th><th>源 → 目标</th><th>排除项</th><th>间隔</th><th>运行周期</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
-      tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td><td class="path-cell">${t.exclude_patterns?.trim()?t.exclude_patterns.split(",").map(p=>`<div>${esc(p.trim())}</div>`).join(""):"<span class=\"log-detail\">无</span>"}</td>
+      tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td><td class="path-cell">${excCell(t)}</td>
         <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
         <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.filename_nfo_enabled?" · NFO补全":""}</td>
         <td><label class="switch"><input type="checkbox" aria-label="启用任务 ${esc(t.name)}" ${t.enabled?"checked":""} onchange="toggleTask(${t.id},this)"><span class="slider"></span></label></td>
@@ -466,6 +517,12 @@ async function loadTasks(){
         <span class="sync-status" data-sync-status="${t.id}" role="status"></span>
         <button class="btn small red" onclick="delTask(${t.id})">删除</button></td></tr>`).join("")+"</table></div>";
     tasks.forEach(t=>updateSyncBtn(t.id));
+    $("#task-list details[data-exc-task]").forEach(d=>{
+      const tid=+d.dataset.excTask;
+      d.open=openExclude.has(tid);
+      d.addEventListener("toggle",()=>{if(d.open)openExclude.add(tid);else openExclude.delete(tid);});
+    });
+    $("#task-list button[data-del-pattern]").forEach(b=>b.onclick=()=>removeTaskPattern(+b.dataset.task,b.dataset.delPattern));
   }catch(e){$("#task-list").innerHTML='<div class="empty">任务加载失败：'+esc(e.message)+'</div>';}
 }
 
@@ -477,7 +534,8 @@ async function editTask(id){
   editingTaskId = id;
   $("#f-name").value=t.name; $("#f-src").value=t.src_dir; $("#f-dst").value=t.dst_dir;
   $("#f-interval").value=t.interval_seconds; $("#f-scan").value=t.scan_interval;
-  $("#f-inc").value=t.include_patterns||""; $("#f-exc").value=t.exclude_patterns||"";
+  $("#f-inc").value=t.include_patterns||"";
+  formExcludes=(t.exclude_patterns||"").split(",").map(x=>x.trim()).filter(Boolean);renderExcChips();
   $("#f-conflict").value=t.conflict_policy; $("#f-path").value=t.path_rule;
   $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
   $("#f-filename-nfo").value = t.filename_nfo_enabled ? "1" : "0";
@@ -592,7 +650,7 @@ $("#task-form").onsubmit=async e=>{
   const payload = {
     name:$("#f-name").value,src_dir:src,dst_dir:dst,
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
-    include_patterns:$("#f-inc").value,exclude_patterns:$("#f-exc").value,
+    include_patterns:$("#f-inc").value,exclude_patterns:formExcludes.join(", "),
     conflict_policy:$("#f-conflict").value,path_rule:$("#f-path").value,after_action:$("#f-after").value,
     run_windows:$("#f-windows").value.trim(),
     filename_nfo_enabled:$("#f-filename-nfo").value==="1"};
@@ -603,8 +661,9 @@ $("#task-form").onsubmit=async e=>{
       await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     }
   }catch(err){ alert("保存失败: "+err.message); return; }
-  e.target.reset(); resetFormMode(); loadTasks(); loadDash();
+  e.target.reset(); formExcludes=[];renderExcChips(); resetFormMode(); loadTasks(); loadDash();
 };
+$("#f-exc-input").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();addExcludeFromInput();}});
 async function toggleTask(id,checkbox){
   checkbox.disabled=true;
   try{
@@ -783,14 +842,29 @@ async function loadEioFailures(){
     if(requestId!==eioRequestId)return;
     if(!items.length && total && page>0){eioPage=Math.ceil(total/PAGE_SIZE)-1;return loadEioFailures();}
     $("#eio-list").innerHTML=!items.length?'<div class="empty">暂无 EIO 故障记录</div>':
-      `<div class="table-wrap"><table><tr><th>任务 / 文件</th><th>发生位置</th><th>次数 / 最近发生</th><th>状态</th><th>详情</th></tr>`+
-      items.map(f=>`<tr><td><b>${esc(f.task_name||"已删除任务 #"+f.task_id)}</b><br><span class="log-detail">${esc(f.rel_path)}</span></td>
+      `<div class="table-wrap"><table><tr><th>任务 / 文件</th><th>发生位置</th><th>次数 / 最近发生</th><th>状态</th><th>详情</th><th>操作</th></tr>`+
+      items.map(f=>{
+        const retry=f.task_name?`<button class="btn small" data-eio-task="${f.task_id}" data-eio-path="${esc(f.rel_path)}" ${eioBusy?"disabled":""} title="移除对应排除项并立即重新扫描">重试</button>`:'<span class="log-detail">—</span>';
+        return `<tr><td><b>${esc(f.task_name||"已删除任务 #"+f.task_id)}</b><br><span class="log-detail">${esc(f.rel_path)}</span></td>
         <td>${f.origin==="source"?"源文件":f.origin==="directory"?"源目录":"目标挂载"}</td><td>${f.occurrences} 次<br><span class="log-detail">${new Date(f.last_at*1000).toLocaleString("zh-CN")}</span></td>
-        <td><span class="tag ${f.active?"cancelled":"pending"}">${f.active?"已排除":f.auto_excluded?"规则已移除":"冷却/待重试"}</span></td><td class="path-cell log-detail">${esc(f.detail)}</td></tr>`).join("")+"</table></div>";
+        <td><span class="tag ${f.active?"cancelled":"pending"}">${f.active?"已排除":f.auto_excluded?"规则已移除":"冷却/待重试"}</span></td><td class="path-cell log-detail">${esc(f.detail)}</td><td>${retry}</td></tr>`;
+      }).join("")+"</table></div>";
+    $("#eio-list button[data-eio-path]").forEach(b=>b.onclick=()=>retryEio(+b.dataset.eioTask,b.dataset.eioPath,b));
     renderPager("#eio-pager",page,total,p=>{eioPage=p;loadEioFailures();});
   }catch(e){if(requestId!==eioRequestId)return;$("#eio-list").innerHTML='<div class="empty">故障记录加载失败：'+esc(e.message)+'</div>';}
 }
 $("#eio-task").addEventListener("change",()=>{eioPage=0;loadEioFailures();});
+let eioBusy=false;
+async function retryEio(taskId,relPath,btn){
+  if(eioBusy)return;
+  eioBusy=true;if(btn)btn.disabled=true;
+  try{
+    const r=await api("/api/eio-failures/retry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task_id:taskId,rel_path:relPath})});
+    loadEioFailures();loadTasks();loadDash();
+    alert((r.removed_rule?"已移除该条排除项，":"")+"已触发重新扫描，稍后可在队列中查看进展。\n若故障仍在，会重新记录并再次自动排除。"+(r.removed_rule?"\n提示：若 I/O 问题是永久性的，重试后仍会失败。":""));
+  }catch(e){alert("重试失败: "+e.message);}
+  finally{eioBusy=false;if(btn)btn.disabled=false;}
+}
 
 const queueStatusLabels={pending:"待迁移",transferring:"迁移中",accounting_pending:"待记账",done:"已完成",failed:"失败",conflict:"冲突"};
 const PAGE_SIZE=50;
