@@ -147,6 +147,90 @@
 .round-mini-time { font-size: 11px; color: var(--muted); margin-top: 6px; }
 .round-mini b { color: var(--text); }
 
+/* ---------- 仪表盘：迁移进度（速度 / ETA） ---------- */
+.transfer-list { display: grid; gap: 12px; margin: 2px 0 12px; }
+.transfer-item {
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-2);
+  padding: 12px 14px;
+}
+.transfer-head { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; }
+.transfer-name {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.transfer-track { height: 8px; border-radius: 8px; background: var(--track); overflow: hidden; }
+.transfer-fill {
+  display: block; height: 100%; border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  transition: width .6s ease;
+}
+.transfer-fill.done { background: var(--ok); }
+.transfer-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  margin-top: 8px; font-size: 11.5px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.transfer-meta b { color: var(--text); }
+
+/* ---------- 仪表盘：迁移趋势 ---------- */
+.trend-ranges { display: flex; gap: 6px; }
+.trend-ranges button {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 12px;
+  border-radius: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.trend-ranges button.active {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-color: transparent;
+  font-weight: 600;
+}
+.trend-summary {
+  font-size: 12.5px; color: var(--muted);
+  margin: 12px 0 6px;
+  font-variant-numeric: tabular-nums;
+}
+.trend-summary b { color: var(--text); }
+.trend-summary .sep { margin: 0 10px; opacity: .5; }
+.trend-chart { display: flex; align-items: stretch; gap: 4px; height: 168px; padding-top: 26px; }
+.trend-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.trend-barbox {
+  flex: 1; min-height: 0;
+  position: relative;
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.trend-bar {
+  width: 68%; max-width: 34px;
+  border-radius: 5px 5px 2px 2px;
+  background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 45%, transparent));
+  transition: height .4s ease;
+}
+.trend-bar.zero { min-height: 2px; opacity: .35; }
+.trend-col:hover .trend-bar { filter: brightness(1.12); }
+.trend-day { height: 16px; margin-top: 6px; font-size: 10px; color: var(--muted); text-align: center; white-space: nowrap; }
+.trend-bubble {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%; transform: translateX(-50%);
+  display: none;
+  background: var(--text); color: var(--card);
+  font-size: 11px; line-height: 1;
+  padding: 6px 9px; border-radius: 7px;
+  white-space: nowrap;
+  box-shadow: var(--shadow-pop);
+  z-index: 3;
+  pointer-events: none;
+}
+.trend-col:hover .trend-bubble { display: block; }
+
 /* ---------- 任务管理 ---------- */
 .tasks-toolbar {
   display: flex;
@@ -302,4 +386,7 @@
   .scan-panel { padding: 16px; }
   .field, .field.small { min-width: 100%; flex: 1; }
   form .row { gap: 11px; }
+  .trend-chart { gap: 2px; height: 130px; padding-top: 22px; }
+  .trend-day { display: none; }
+  .transfer-item { padding: 10px 11px; }
 }

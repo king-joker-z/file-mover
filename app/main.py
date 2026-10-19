@@ -329,6 +329,16 @@ def dashboard():
     return scheduler.stats()
 
 
+# ---------- 趋势统计 ----------
+
+@app.get("/api/stats/trend")
+def api_stats_trend(days: int = 14):
+    """按日聚合最近 N 天的成功迁移量，并附迁移记账表的累计统计。"""
+    if not 1 <= days <= 365:
+        raise HTTPException(422, "days 必须在 1-365")
+    return {"days": db.trend_by_day(days), "total": db.migration_totals()}
+
+
 # ---------- upload rounds ----------
 
 @app.get("/api/rounds")

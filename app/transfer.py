@@ -124,14 +124,25 @@ def _fd_digest(fd: int) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+def _report_progress(progress_cb, copied: int, total) -> None:
+    """复制进度上报；回调异常不得影响迁移本身。"""
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(copied, total)
+    except Exception:
+        pass
+
+
 def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None,
-                    overwrite: bool = False, verify: str = "strict"):
+                    overwrite: bool = False, verify: str = "strict", progress_cb=None):
     """在固定的目录描述符内原子发布；verify 决定读回强度。
 
     strict: 临时文件写入后读回一次，发布后再读回一次（目标全量读两遍，历史行为）。
     fast:   跳过临时文件读回，仅在发布后读回目标一次（仍可发现写入损坏/截断）。
     off:    不读回内容，仅核对发布后大小；信任 fsync，速度最快。
     非覆盖策略不得抢占并发创建的目标。
+    progress_cb(copied, total)：按 1MB 块上报复制进度，供仪表盘展示速度/ETA。
     """
     if verify not in ("strict", "fast", "off"):
         verify = "strict"
@@ -155,11 +166,18 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     expected_size = len(content)
                 else:
                     try:
+                        total = os.path.getsize(source)
+                    except OSError:
+                        total = None
+                    copied = 0
+                    try:
                         with open(source, "rb") as original:
                             for chunk in iter(lambda: original.read(1 << 20), b""):
                                 stream.write(chunk)
                                 digest.update(chunk)
                                 expected_size += len(chunk)
+                                copied += len(chunk)
+                                _report_progress(progress_cb, copied, total)
                     except OSError as exc:
                         exc._filemover_eio_origin = 'source'
                         raise
@@ -186,8 +204,11 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                         with os.fdopen(exclusive_fd, "wb") as destination:
                             with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
                                                    dir_fd=parent_fd), "rb") as saved:
+                                copied = 0
                                 for chunk in iter(lambda: saved.read(1 << 20), b""):
                                     destination.write(chunk)
+                                    copied += len(chunk)
+                                    _report_progress(progress_cb, copied, expected_size)
                             destination.flush()
                             os.fsync(destination.fileno())
                     except OSError as write_exc:
@@ -448,11 +469,12 @@ def _failed_io(item: dict, detail: str, exc: OSError) -> Tuple[str, str]:
     return "failed", f"{detail}: {exc}"
 
 
-def transfer(item: dict, task: dict, stage_cb=None) -> Tuple[str, str]:
+def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[str, str]:
     """执行迁移，返回 (success/failed/conflict, detail)。
 
     stage_cb 用于向调度器上报当前阶段（如“复制并校验目标”），
     便于仪表盘展示大文件长时间停留在校验环节的进度。
+    progress_cb(copied, total) 用于上报复制进度字节，供仪表盘计算速度与 ETA。
     task.verify_mode 决定读回强度：strict（默认，多轮读回+删除前暂存）、
     fast（单次读回，无暂存文件）、off（不读回，仅核对大小）；NFO 始终按 strict。
     """
@@ -631,7 +653,8 @@ def transfer(item: dict, task: dict, stage_cb=None) -> Tuple[str, str]:
         target_device = _mount_identity(task["dst_dir"])
         source_stat = os.lstat(src)
         source_hash = _write_verified(final_dst, source=src, root=task["dst_dir"],
-                                      overwrite=how == "overwrite", verify=verify)
+                                      overwrite=how == "overwrite", verify=verify,
+                                      progress_cb=progress_cb)
         item["dst_path"] = final_dst
         current_stat = os.lstat(src)
         identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")

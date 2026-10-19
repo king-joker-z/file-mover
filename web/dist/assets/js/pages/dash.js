@@ -7,11 +7,14 @@ import { store } from "../store.js";
 import { confirmDialog } from "../components/dialogs.js";
 import { adoptRunningSchedules, syncNow, updateSyncBtn, roundElapsed } from "../features/sync.js";
 import { openRoundDetail, roundState } from "../features/rounds.js";
-import { esc, toast, formatCountdown, $ } from "../utils.js";
+import { esc, toast, formatCountdown, fmtSize, $ } from "../utils.js";
 
 let rootEl = null;
 let dashBusy = false;
 let scanRendered = false;   // 扫描卡是否已渲染过（用于增量更新）
+let trendDays = 14;         // 趋势图时间范围
+let trendBusy = false;
+const transferSamples = new Map();  // queue_id -> 上次进度采样（计算实时速度）
 
 const chartSeries = [
   { key: "pending", label: "待迁移", color: "#3b82f6" },
@@ -53,6 +56,18 @@ export function mount(root) {
         <div class="stage-bars" id="stage-bars"></div>
       </section>
     </div>
+    <div class="panel trend-panel"><div class="panel-heading"><div><span class="eyebrow">TREND</span>
+      <h2>迁移趋势</h2><p>按日统计成功迁移的文件数与流量，鼠标悬停查看当日明细</p></div>
+      <div class="trend-ranges" id="trend-ranges">
+        <button type="button" data-days="7">7 天</button>
+        <button type="button" data-days="14">14 天</button>
+        <button type="button" data-days="30">30 天</button>
+      </div></div>
+      <div class="trend-summary" id="trend-summary">加载趋势数据中…</div>
+      <div class="trend-chart" id="trend-chart" role="img" aria-label="每日迁移量柱状图">
+        <div class="empty">加载中…</div>
+      </div>
+    </div>
     <div class="panel scan-panel"><div class="panel-heading"><div><span class="eyebrow">SCAN SCHEDULE</span>
       <h2>扫描计划</h2><p>按配置展示下一次扫描；倒计时每秒更新，可单独立即扫描源目录；历史目标 NFO 巡检需在任务管理中手动确认。</p></div>
       <span class="panel-hint">手动扫描不会中断正在进行的迁移</span></div>
@@ -61,13 +76,26 @@ export function mount(root) {
     <div class="panel"><div class="panel-heading"><div><span class="eyebrow">SYSTEM STATUS</span>
       <h2>运行状态</h2></div></div>
       <div class="current" id="current-file">空闲</div>
+      <div class="transfer-list" id="transfer-list"></div>
       <div class="log-detail" id="uptime"></div>
       <div class="status-warnings" id="status-warnings" role="status"></div>
       <button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button>
     </div>`;
+
+  const ranges = $("#trend-ranges");
+  ranges.addEventListener("click", e => {
+    const btn = e.target.closest("button[data-days]");
+    if (!btn) return;
+    trendDays = Number(btn.dataset.days);
+    ranges.querySelectorAll("button").forEach(b =>
+      b.classList.toggle("active", b === btn));
+    loadTrend();
+  });
+  ranges.querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", Number(b.dataset.days) === trendDays));
 }
 
-export function show() { loadDash(); }
+export function show() { loadDash(); loadTrend(); }
 
 /* ================= 扫描计划卡 ================= */
 
@@ -251,10 +279,11 @@ export async function loadDash() {
     $("#s-conflict").textContent = d.conflict ?? "—";
     $("#s-done").textContent = d.done ?? "—";
     renderQueueCharts(d);
-    const cur = d.current_files && d.current_files.length
-      ? "迁移中: " + d.current_files.map(t => `${t.rel_path}（${t.stage || "迁移中"}）`).join("；")
+    const files = Array.isArray(d.current_files) ? d.current_files : [];
+    $("#current-file").textContent = files.length
+      ? `迁移中 · ${files.length} 个文件`
       : (d.current_file ? "迁移中: " + d.current_file : "空闲");
-    $("#current-file").textContent = cur;
+    renderTransfers(files);
     const h = Math.floor(d.uptime_seconds / 3600), m = Math.floor(d.uptime_seconds % 3600 / 60);
     $("#uptime").textContent = `已运行 ${h}小时${m}分钟 · 全局扫描间隔 ${d.settings?.scan_interval ?? "—"}s`;
     const warnings = [];
@@ -275,6 +304,105 @@ export async function loadDash() {
     const cf = $("#current-file");
     if (cf) cf.textContent = "状态刷新失败（保留上次数据）: " + e.message;
   } finally { dashBusy = false; }
+}
+
+/* ================= 迁移进度（速度 / ETA） ================= */
+
+/** 采样进度并计算平滑速度（字节/秒）；进度回退（重试）时重置采样 */
+function transferSpeed(t) {
+  const now = Date.now() / 1000 - store.serverClockOffset;
+  const copied = Math.max(0, Number(t.copied_bytes) || 0);
+  const prev = transferSamples.get(t.id);
+  let speed = null;
+  if (prev && copied >= prev.copied && now > prev.t) {
+    const inst = (copied - prev.copied) / (now - prev.t);
+    speed = prev.ema == null ? inst : prev.ema * 0.5 + inst * 0.5;
+  }
+  transferSamples.set(t.id, { copied, t: now, ema: speed });
+  return speed;
+}
+
+function renderTransfers(files) {
+  const box = $("#transfer-list");
+  if (!box) return;
+  const active = new Set(files.map(f => f.id));
+  for (const id of transferSamples.keys()) {
+    if (!active.has(id)) transferSamples.delete(id);
+  }
+  if (!files.length) { box.innerHTML = ""; return; }
+  const now = Date.now() / 1000 - store.serverClockOffset;
+  box.innerHTML = files.map(t => {
+    const total = Number(t.total_bytes) || 0;
+    const copied = Math.max(0, Number(t.copied_bytes) || 0);
+    const pct = total > 0 ? Math.min(100, Math.round(copied / total * 100)) : 0;
+    const verifying = total > 0 && copied >= total;   // 复制完成，处于读回校验/删源阶段
+    const speed = verifying ? null : transferSpeed(t);
+    const eta = speed > 0 && total > copied ? formatCountdown((total - copied) / speed) : "";
+    const elapsed = t.started_at ? formatCountdown(Math.max(0, now - t.started_at)) : "";
+    const sizeText = total > 0
+      ? `${fmtSize(copied)} / ${fmtSize(total)} · ${pct}%${verifying ? " · 校验中" : ""}`
+      : fmtSize(copied);
+    const meta = [
+      `<span>${esc(sizeText)}</span>`,
+      speed > 0 ? `<span>速度 <b>${fmtSize(speed)}/s</b></span>` : "",
+      eta ? `<span>剩余 <b>${esc(eta)}</b></span>` : "",
+      elapsed ? `<span>已用 ${esc(elapsed)}</span>` : "",
+    ].filter(Boolean).join("");
+    return `<div class="transfer-item">
+      <div class="transfer-head">
+        <span class="transfer-name" title="${esc(t.rel_path)}">${esc(t.rel_path)}</span>
+        <span class="tag transferring">${esc(t.stage || "迁移中")}</span>
+      </div>
+      <div class="transfer-track"><span class="transfer-fill${verifying ? " done" : ""}" style="width:${pct}%"></span></div>
+      <div class="transfer-meta">${meta}</div>
+    </div>`;
+  }).join("");
+}
+
+/* ================= 迁移趋势统计 ================= */
+
+function trendBytes(n) { n = Number(n) || 0; return n ? fmtSize(n) : "0 B"; }
+
+function renderTrend(d) {
+  const items = Array.isArray(d?.days) ? d.days : [];
+  const total = d?.total || {};
+  const files = items.reduce((s, x) => s + (Number(x.files) || 0), 0);
+  const bytes = items.reduce((s, x) => s + (Number(x.bytes) || 0), 0);
+  $("#trend-summary").innerHTML =
+    `近 ${items.length} 天迁移 <b>${files.toLocaleString("zh-CN")}</b> 个文件 · <b>${trendBytes(bytes)}</b>` +
+    `<span class="sep">|</span>累计 <b>${(Number(total.files) || 0).toLocaleString("zh-CN")}</b> 个文件 · <b>${trendBytes(total.bytes)}</b>`;
+  const chart = $("#trend-chart");
+  if (!chart) return;
+  if (!items.length) {
+    chart.innerHTML = '<div class="empty">暂无趋势数据</div>';
+    return;
+  }
+  const max = Math.max(1, ...items.map(x => Number(x.bytes) || 0));
+  const showAllLabels = items.length <= 14;
+  chart.innerHTML = items.map((x, i) => {
+    const n = Number(x.bytes) || 0;
+    const pct = n ? Math.max(2, Math.round(n / max * 100)) : 0;
+    const showLabel = showAllLabels || i % 5 === 0 || i === items.length - 1;
+    return `<div class="trend-col" title="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}">
+      <div class="trend-barbox">
+        <span class="trend-bubble">${esc(String(x.day).slice(5))} · ${x.files} 个 · ${trendBytes(x.bytes)}</span>
+        <span class="trend-bar${n ? "" : " zero"}" style="height:${pct}%"></span>
+      </div>
+      <span class="trend-day"${showLabel ? "" : " hidden"}>${esc(String(x.day).slice(5))}</span>
+    </div>`;
+  }).join("");
+}
+
+export async function loadTrend() {
+  if (trendBusy) return;
+  trendBusy = true;
+  try {
+    const d = await api(`/api/stats/trend?days=${trendDays}`);
+    renderTrend(d);
+  } catch (e) {
+    const chart = $("#trend-chart");
+    if (chart) chart.innerHTML = `<div class="empty">趋势数据加载失败: ${esc(e.message)}</div>`;
+  } finally { trendBusy = false; }
 }
 
 /* ================= 故障目录加入排除 ================= */

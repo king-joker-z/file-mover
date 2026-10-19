@@ -1,4 +1,5 @@
 """SQLite 状态存储：tasks / queue / logs"""
+import datetime
 import hashlib
 import sqlite3
 import threading
@@ -1166,3 +1167,37 @@ def count_logs(task_id=None, status=None, search=None) -> int:
     where, params = _logs_filter(task_id, status, search)
     with _lock:
         return get_conn().execute("SELECT COUNT(*) FROM logs" + where, params).fetchone()[0]
+
+
+# ---------- 趋势统计 ----------
+
+def trend_by_day(days: int) -> list[dict]:
+    """按本地日期聚合最近 N 天成功迁移的文件数与字节数；缺失日期补零。
+
+    以成功日志的 created_at（本地时间字符串）为准；清空日志后趋势归零，
+    累计值仍来自迁移记账表（migration_totals）。
+    """
+    days = max(1, min(365, int(days)))
+    today = datetime.date.today()
+    first_day = today - datetime.timedelta(days=days - 1)
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS files,"
+            " COALESCE(SUM(size), 0) AS bytes"
+            " FROM logs WHERE result='success' AND created_at >= ?"
+            " GROUP BY day", (first_day.isoformat() + " 00:00:00",)).fetchall()
+    by_day = {row["day"]: (row["files"], row["bytes"]) for row in rows}
+    items = []
+    for offset in range(days - 1, -1, -1):
+        day = (today - datetime.timedelta(days=offset)).isoformat()
+        files, total_bytes = by_day.get(day, (0, 0))
+        items.append({"day": day, "files": files, "bytes": total_bytes})
+    return items
+
+
+def migration_totals() -> dict:
+    """累计迁移统计：记账表中实际登记的文件数与字节总数（删除任务会随之减少）。"""
+    with _lock:
+        row = get_conn().execute(
+            "SELECT COUNT(*) AS files, COALESCE(SUM(size), 0) AS bytes FROM migrated_files").fetchone()
+    return dict(row)

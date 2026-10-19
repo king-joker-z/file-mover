@@ -788,8 +788,10 @@ class Scheduler:
             stage = ["检查源文件"]
             with self._stats_lock:
                 self._current_transfers[item["id"]] = {
-                    "rel_path": item["rel_path"], "task_id": item["task_id"],
-                    "stage": stage[0]}
+                    "id": item["id"], "rel_path": item["rel_path"],
+                    "task_id": item["task_id"], "stage": stage[0],
+                    "total_bytes": item.get("size") or 0, "copied_bytes": 0,
+                    "started_at": time.time()}
 
             def report_stage(name):
                 stage[0] = name
@@ -797,6 +799,15 @@ class Scheduler:
                     entry = self._current_transfers.get(item["id"])
                     if entry is not None:
                         entry["stage"] = name
+
+            def report_progress(copied, total):
+                with self._stats_lock:
+                    entry = self._current_transfers.get(item["id"])
+                    if entry is not None:
+                        entry["copied_bytes"] = copied
+                        if total:
+                            entry["total_bytes"] = total
+                        entry["updated_at"] = time.time()
 
             if track_phase:
                 self._last_work_phase = None
@@ -832,7 +843,9 @@ class Scheduler:
                     else:
                         try:
                             report_stage("复制并校验目标")
-                            result, detail = transfer.transfer(item, task, stage_cb=report_stage)
+                            result, detail = transfer.transfer(
+                                item, task, stage_cb=report_stage,
+                                progress_cb=report_progress)
                         except Exception as exc:
                             logger.exception("迁移执行异常：task_id=%s queue_id=%s 文件=%s",
                                              item["task_id"], item["id"], item["rel_path"])

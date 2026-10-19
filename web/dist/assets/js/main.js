@@ -120,6 +120,12 @@ function startPolling() {
     tickCountdowns();
   }, 1000);
 
+  // 每 30 秒：迁移趋势统计低频刷新（仅仪表盘可见时）
+  setInterval(() => {
+    if (document.hidden || store.activeTab !== "dash") return;
+    dash.loadTrend();
+  }, 30000);
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     dash.loadDash();

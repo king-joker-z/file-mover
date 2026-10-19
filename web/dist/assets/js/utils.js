@@ -12,9 +12,9 @@ export function esc(s) {
 /** 字节数 → 可读大小 */
 export function fmtSize(n) {
   if (!n) return "-";
-  const u = ["B", "KB", "MB", "GB"];
+  const u = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
-  while (n >= 1024 && i < 3) { n /= 1024; i++; }
+  while (n >= 1024 && i < 4) { n /= 1024; i++; }
   return n.toFixed(1) + u[i];
 }
 
