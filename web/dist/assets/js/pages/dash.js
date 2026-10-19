@@ -12,8 +12,13 @@ import { esc, toast, formatCountdown, fmtSize, $ } from "../utils.js";
 let rootEl = null;
 let dashBusy = false;
 let scanRendered = false;   // 扫描卡是否已渲染过（用于增量更新）
-let trendDays = 14;         // 趋势图时间范围
+let trendDays = 14;         // 趋势柱状图时间范围
 let trendBusy = false;
+const HEATMAP_DAYS = 365;   // 热力图最大跨度（一年）；周/月/年视图都在此范围内本地切片
+const HEATMAP_SPAN = { week: 7, month: 30, year: 365 };
+let heatmapView = "month";  // 热力图视图：week / month / year
+let trendAll = [];          // 最近 HEATMAP_DAYS 天的按日数据
+let trendTotal = {};        // 累计迁移统计
 const transferSamples = new Map();  // queue_id -> 上次进度采样（计算实时速度）
 
 const chartSeries = [
@@ -41,6 +46,14 @@ export function mount(root) {
       <div class="stat orange"><div class="num" id="s-conflict">0</div><div class="lbl">冲突</div></div>
       <div class="stat"><div class="num" id="s-done">0</div><div class="lbl">队列已完成</div></div>
     </div>
+    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">SYSTEM STATUS</span>
+      <h2>运行状态</h2></div></div>
+      <div class="current" id="current-file">空闲</div>
+      <div class="transfer-list" id="transfer-list"></div>
+      <div class="log-detail" id="uptime"></div>
+      <div class="status-warnings" id="status-warnings" role="status"></div>
+      <button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button>
+    </div>
     <div class="insight-grid">
       <section class="panel"><div class="panel-heading"><div><span class="eyebrow">QUEUE MIX</span>
         <h2>队列状态分布</h2><p>当前全部队列条目，不含今日迁移计数</p></div></div>
@@ -67,19 +80,23 @@ export function mount(root) {
       <div class="trend-chart" id="trend-chart" role="img" aria-label="每日迁移量柱状图">
         <div class="empty">加载中…</div>
       </div>
+      <div class="heatmap-wrap">
+        <div class="heatmap-head">
+          <span class="hm-caption">迁移活跃度 · 颜色越深当天迁移量越大，悬停查看明细</span>
+          <div class="hm-views" id="hm-views">
+            <button type="button" data-view="week">周</button>
+            <button type="button" data-view="month">月</button>
+            <button type="button" data-view="year">年</button>
+          </div>
+        </div>
+        <div id="trend-heatmap" class="heatmap-body hm-view-month"><div class="empty">加载中…</div></div>
+        <div class="hm-legend-row">少<span class="hm-cell q0"></span><span class="hm-cell q1"></span><span class="hm-cell q2"></span><span class="hm-cell q3"></span><span class="hm-cell q4"></span>多</div>
+      </div>
     </div>
     <div class="panel scan-panel"><div class="panel-heading"><div><span class="eyebrow">SCAN SCHEDULE</span>
       <h2>扫描计划</h2><p>按配置展示下一次扫描；倒计时每秒更新，可单独立即扫描源目录；历史目标 NFO 巡检需在任务管理中手动确认。</p></div>
       <span class="panel-hint">手动扫描不会中断正在进行的迁移</span></div>
       <div id="dash-scan-list" class="scan-grid"><div class="empty">加载扫描计划中…</div></div>
-    </div>
-    <div class="panel"><div class="panel-heading"><div><span class="eyebrow">SYSTEM STATUS</span>
-      <h2>运行状态</h2></div></div>
-      <div class="current" id="current-file">空闲</div>
-      <div class="transfer-list" id="transfer-list"></div>
-      <div class="log-detail" id="uptime"></div>
-      <div class="status-warnings" id="status-warnings" role="status"></div>
-      <button id="exclude-error-dir" class="btn small gray" type="button" style="display:none;margin-top:8px">将故障目录加入排除项…</button>
     </div>`;
 
   const ranges = $("#trend-ranges");
@@ -89,10 +106,23 @@ export function mount(root) {
     trendDays = Number(btn.dataset.days);
     ranges.querySelectorAll("button").forEach(b =>
       b.classList.toggle("active", b === btn));
-    loadTrend();
+    if (trendAll.length) renderTrendBars();   // 数据已在本地，直接重渲染柱状图
+    else loadTrend();
   });
   ranges.querySelectorAll("button").forEach(b =>
     b.classList.toggle("active", Number(b.dataset.days) === trendDays));
+
+  const views = $("#hm-views");
+  views.addEventListener("click", e => {
+    const btn = e.target.closest("button[data-view]");
+    if (!btn) return;
+    heatmapView = btn.dataset.view;
+    views.querySelectorAll("button").forEach(b =>
+      b.classList.toggle("active", b === btn));
+    if (trendAll.length) renderHeatmap();   // 数据已在本地，直接重渲染
+  });
+  views.querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === heatmapView));
 }
 
 export function show() { loadDash(); loadTrend(); }
@@ -363,14 +393,13 @@ function renderTransfers(files) {
 
 function trendBytes(n) { n = Number(n) || 0; return n ? fmtSize(n) : "0 B"; }
 
-function renderTrend(d) {
-  const items = Array.isArray(d?.days) ? d.days : [];
-  const total = d?.total || {};
+function renderTrendBars() {
+  const items = trendAll.slice(-trendDays);
   const files = items.reduce((s, x) => s + (Number(x.files) || 0), 0);
   const bytes = items.reduce((s, x) => s + (Number(x.bytes) || 0), 0);
   $("#trend-summary").innerHTML =
     `近 ${items.length} 天迁移 <b>${files.toLocaleString("zh-CN")}</b> 个文件 · <b>${trendBytes(bytes)}</b>` +
-    `<span class="sep">|</span>累计 <b>${(Number(total.files) || 0).toLocaleString("zh-CN")}</b> 个文件 · <b>${trendBytes(total.bytes)}</b>`;
+    `<span class="sep">|</span>累计 <b>${(Number(trendTotal.files) || 0).toLocaleString("zh-CN")}</b> 个文件 · <b>${trendBytes(trendTotal.bytes)}</b>`;
   const chart = $("#trend-chart");
   if (!chart) return;
   if (!items.length) {
@@ -393,12 +422,75 @@ function renderTrend(d) {
   }).join("");
 }
 
+/** 迁移活跃度热力图：周 = 横排 7 大格；月/年 = GitHub 风格日历（列 = 周，行 = 周一至周日），5 档颜色 */
+function renderHeatmap() {
+  const box = $("#trend-heatmap");
+  if (!box) return;
+  box.className = `heatmap-body hm-view-${heatmapView}`;
+  const days = trendAll.slice(-HEATMAP_SPAN[heatmapView] || []);
+  if (!days.length) {
+    box.innerHTML = '<div class="empty">暂无热力图数据</div>';
+    return;
+  }
+  const max = Math.max(1, ...days.map(x => Number(x.bytes) || 0));
+  const lvl = n => (n ? Math.min(4, 1 + Math.floor(n / max * 4)) : 0);
+
+  if (heatmapView === "week") {
+    // 周视图：7 个大格子横排，格内显示日号，下方标注星期
+    const labels = "日一二三四五六";
+    box.innerHTML = `<div class="hm-week-row">${days.map(x => {
+      const n = Number(x.bytes) || 0;
+      const d = new Date(x.day + "T00:00:00");
+      return `<div class="hm-day">
+        <span class="hm-cell q${lvl(n)}" title="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}"><b>${d.getDate()}</b></span>
+        <span class="hm-day-label">周${labels[d.getDay()]}</span>
+      </div>`;
+    }).join("")}</div>`;
+    return;
+  }
+
+  // 月/年视图：首列对齐星期（getDay() 周日=0 → 偏移 6）
+  const lead = (new Date(days[0].day + "T00:00:00").getDay() + 6) % 7;
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push('<span class="hm-cell blank"></span>');
+  days.forEach(x => {
+    const n = Number(x.bytes) || 0;
+    cells.push(`<span class="hm-cell q${lvl(n)}" title="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}"></span>`);
+  });
+  // 月份标签：按视图列距标注月份变化处
+  const pitch = heatmapView === "month" ? 25 : 13;  // 列宽 + 间距
+  const cols = Math.ceil((lead + days.length) / 7);
+  let months = "";
+  let prevMonth = "";
+  for (let c = 0; c < cols; c++) {
+    const idx = lead + c * 7;
+    if (idx >= days.length) break;
+    const month = days[idx].day.slice(5, 7);
+    if (month !== prevMonth) {
+      months += `<span style="left:${c * pitch}px">${Number(month)}月</span>`;
+      prevMonth = month;
+    }
+  }
+  const label = heatmapView === "month" ? "近一月" : "近一年";
+  box.innerHTML =
+    `<div class="hm-canvas">
+      <div class="hm-weekdays" aria-hidden="true"><span></span><span>一</span><span></span><span>三</span><span></span><span>五</span><span></span></div>
+      <div class="hm-scroll"><div class="hm-months">${months}</div>
+        <div class="hm-grid" role="img" aria-label="${label}每日迁移热力图">${cells.join("")}</div>
+      </div>
+    </div>`;
+}
+
 export async function loadTrend() {
   if (trendBusy) return;
   trendBusy = true;
   try {
-    const d = await api(`/api/stats/trend?days=${trendDays}`);
-    renderTrend(d);
+    // 一次拉取热力图全跨度；柱状图范围切换在本地切片，不再重复请求
+    const d = await api(`/api/stats/trend?days=${HEATMAP_DAYS}`);
+    trendAll = Array.isArray(d?.days) ? d.days : [];
+    trendTotal = d?.total || {};
+    renderTrendBars();
+    renderHeatmap();
   } catch (e) {
     const chart = $("#trend-chart");
     if (chart) chart.innerHTML = `<div class="empty">趋势数据加载失败: ${esc(e.message)}</div>`;
