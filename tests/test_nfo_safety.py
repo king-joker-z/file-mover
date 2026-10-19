@@ -3583,6 +3583,22 @@ class VerifyModeTests(unittest.TestCase):
         self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
         self.assertEqual(list(self.src.iterdir()), [])  # 源目录无 .moving 残留
 
+    def test_fast_mode_dedup_delete_skips_staging(self):
+        # 目标已存在相同内容（如重复下载）时，快速模式删除源也不产生暂存文件
+        item, content = self.video_item()
+        (self.dst / "movie.mp4").write_bytes(content)
+        counts, hashed = {"fd": 0, "sha": 0}, []
+        fd_cb, sha_cb = self._counting_hashes(counts, hashed)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("目标内容一致", detail)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        self.assertEqual(list(self.src.iterdir()), [])  # 不产生 .fm-source-*.moving
+        self.assertFalse(any(name.startswith(".fm-source-") for name in hashed))
+
     def test_fast_mode_failed_readback_keeps_source(self):
         item, content = self.video_item()
 

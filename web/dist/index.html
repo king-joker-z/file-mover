@@ -91,11 +91,60 @@ details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;m
 @media(max-width:600px){.donut-layout{gap:12px}.donut{width:125px}.donut:before{inset:15px}.donut-center strong{font-size:22px}.settings-save{bottom:0}.toolbar input{min-width:100%}}
 @media(max-width:850px){.container{padding:18px 16px 40px}.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.panel-hint{display:none}}
 @media(max-width:570px){.site-header{margin-bottom:18px}.brand-copy h1 span{display:none}.tabs button{padding:9px 12px}.dash-intro{align-items:flex-start}.dash-intro h2{font-size:23px}.dash-intro p{max-width:235px}.live-badge{font-size:10px}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{padding:14px;min-height:96px}.stat .num{font-size:25px}.panel{padding:16px}.scan-panel{padding:16px}.scan-grid{grid-template-columns:minmax(0,1fr)}.field,.field.small{min-width:100%;flex:1}form .row{gap:11px}}
+/* ---- UX 升级：粘性标签栏 / toast / 模态卡片 / 深色模式 ---- */
+:root{--donut-empty:#dfe7f2;color-scheme:light}
+.tabs{position:sticky;top:10px;z-index:60}
+.modal-card{background:var(--card)}
+.theme-btn{font-size:14px;line-height:1}
+#toast-host{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:300;display:grid;gap:8px;justify-items:center;pointer-events:none;width:min(92vw,560px)}
+.toast{pointer-events:auto;background:#1f2b47;color:#e8eefc;border:1px solid #31405f;border-radius:10px;padding:10px 16px;font-size:13px;line-height:1.6;box-shadow:0 12px 32px #10203f40;opacity:0;transform:translateY(-8px);transition:opacity .25s,transform .25s;max-width:100%;word-break:break-word;white-space:pre-line}
+.toast.show{opacity:1;transform:none}
+.toast.error{background:#3d1f27;border-color:#703440;color:#ffd9dd}
+.toast.success{background:#123529;border-color:#1f5c45;color:#cdf5e5}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
+html[data-theme="dark"]{--bg:#0e1523;--card:#151f33;--primary:#7c9bff;--ok:#35c393;--warn:#e6a94e;--err:#f0717d;--text:#dde6f5;--muted:#8d9db8;--border:#283754;--donut-empty:#263452;color-scheme:dark}
+html[data-theme="dark"] body{background:radial-gradient(circle at 90% -15%,#1d2c52 0,transparent 42%),var(--bg)}
+html[data-theme="dark"] .stat,html[data-theme="dark"] .panel,html[data-theme="dark"] .tabs{box-shadow:0 7px 26px #00000045}
+html[data-theme="dark"] .tabs{background:var(--card)}
+html[data-theme="dark"] .tabs button.active{background:#22345e;color:#a8c0ff}
+html[data-theme="dark"] .tabs button:hover:not(.active){background:#1a2743}
+html[data-theme="dark"] th{background:#1a2440;color:#95a7c6}
+html[data-theme="dark"] tr:hover td{background:#192542}
+html[data-theme="dark"] .filters button{background:var(--card);color:var(--text)}
+html[data-theme="dark"] .filters button.active{background:#22345e;color:#a8c0ff;border-color:#3d5588}
+html[data-theme="dark"] form input,html[data-theme="dark"] form select,html[data-theme="dark"] .toolbar input,html[data-theme="dark"] .toolbar select{background:#111a2d;border-color:var(--border);color:var(--text)}
+html[data-theme="dark"] .empty,html[data-theme="dark"] .exc-row{background:#111a2d}
+html[data-theme="dark"] .panel-hint,html[data-theme="dark"] .dir-item:hover,html[data-theme="dark"] .settings-option:hover{background:#1a2743}
+html[data-theme="dark"] .settings-option:hover{border-color:#3d5588}
+html[data-theme="dark"] .scan-card{background:linear-gradient(150deg,#182339,#141d31)}
+html[data-theme="dark"] .scan-symbol{background:#22345e}
+html[data-theme="dark"] .scan-state.scheduled{background:#123529;color:#54d3a3}
+html[data-theme="dark"] .scan-state.manual,html[data-theme="dark"] .scan-state.scanning{background:#22345e;color:#a8c0ff}
+html[data-theme="dark"] .dir-item.sel{background:#22345e}
+html[data-theme="dark"] .scan-state.manual_wait,html[data-theme="dark"] .scan-state.cooldown{background:#3a2c12;color:#eec27f}
+html[data-theme="dark"] .scan-state.disabled{background:#222c44;color:var(--muted)}
+html[data-theme="dark"] .round-mini{background:#1a2743;border-color:#2b3c63}
+html[data-theme="dark"] .donut{background:conic-gradient(var(--donut-empty) 0 100%)}
+html[data-theme="dark"] .donut:before{background:var(--card)}
+html[data-theme="dark"] .stage-track{background:#232f4b}
+html[data-theme="dark"] .live-badge{background:#123529}
+html[data-theme="dark"] .settings-note{background:#123529;color:#54d3a3}
+html[data-theme="dark"] .brand-copy h1 span{background:#22345e;color:#a8c0ff}
+html[data-theme="dark"] .btn.gray{background:#232f4b;color:#c9d5ec}
+html[data-theme="dark"] .settings-save{background:var(--card)}
+html[data-theme="dark"] .chip{background:#1a2743;border-color:var(--border)}
+html[data-theme="dark"] .slider{background:#3a4a6b}
+html[data-theme="dark"] .tag.pending{background:#222c44;color:var(--muted)}
+html[data-theme="dark"] .tag.transferring{background:#22345e;color:#a8c0ff}
+html[data-theme="dark"] .tag.done{background:#123529;color:#54d3a3}
+html[data-theme="dark"] .tag.failed{background:#3d1f27;color:#f599a1}
+html[data-theme="dark"] .tag.conflict,html[data-theme="dark"] .tag.cancelled{background:#3a2c12;color:#eec27f}
+html[data-theme="dark"] .tag.accounting_pending{background:#0f3330;color:#4fc7c1}
 </style>
 </head>
 <body>
 <div class="container">
-  <header class="site-header"><div class="brand-mark" aria-hidden="true">↗</div><div class="brand-copy"><h1>File Mover <span>CONTROL CENTER</span></h1><p>本地文件 → 网盘 · 安全迁移控制台</p></div><button class="btn small gray token-btn" onclick="if(setApiToken())loadDash()">API Token</button></header>
+  <header class="site-header"><div class="brand-mark" aria-hidden="true">↗</div><div class="brand-copy"><h1>File Mover <span>CONTROL CENTER</span></h1><p>本地文件 → 网盘 · 安全迁移控制台</p></div><button class="btn small gray token-btn" onclick="if(setApiToken())loadDash()">API Token</button><button id="theme-toggle" class="btn small gray theme-btn" type="button" title="切换深色 / 浅色模式" aria-label="切换深色模式" onclick="toggleTheme()">🌙</button></header>
   <div class="tabs">
     <button class="active" data-tab="dash">仪表盘</button>
     <button data-tab="tasks">任务管理</button>
@@ -130,7 +179,7 @@ details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;m
   <div id="tab-tasks" style="display:none">
     <!-- 目录选择弹窗 -->
     <div id="picker-mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center" onclick="if(event.target===this)closePicker()">
-      <div style="background:#fff;border-radius:12px;width:440px;max-width:92vw;padding:18px">
+      <div class="modal-card" style="border-radius:12px;width:440px;max-width:92vw;padding:18px">
         <h2 style="font-size:15px;margin-bottom:4px">选择目录 <button type="button" class="btn small gray" style="float:right" onclick="closePicker()">✕</button></h2>
         <div class="log-detail" style="margin-bottom:8px">点 <b>▸</b> 展开子层级，点击目录名选中</div>
         <div id="picker-tree" style="max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px"></div>
@@ -171,7 +220,7 @@ details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;m
           <div class="field"><label>扫描方式（仅手动时不参与自动定时扫描）</label>
             <select id="f-manual"><option value="0">自动定时扫描（默认）</option><option value="1">仅手动扫描：等待「立即扫描」触发</option></select></div>
           <div class="field"><label>校验强度（大文件建议「快速」，源目录不会再出现 .moving 暂存）</label>
-            <select id="f-verify"><option value="strict">严格：多轮读回+删除前暂存（默认，最稳最慢）</option><option value="fast">快速：单次读回，无暂存文件（推荐大文件）</option><option value="off">极速：不读回仅核对大小（最快，信任网盘写入）</option></select></div>
+            <select id="f-verify" onchange="updateVerifyHint()"><option value="strict">严格：多轮读回+删除前暂存（默认，最稳最慢）</option><option value="fast">快速：单次读回，无暂存文件（推荐大文件）</option><option value="off">极速：不读回仅核对大小（最快，信任网盘写入）</option></select><div class="log-detail" id="verify-hint" style="margin-top:6px"></div></div>
         </div>
         <div class="row">
           <div class="field"><label>同名冲突策略</label>
@@ -249,7 +298,7 @@ details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;m
 
   <!-- 轮次详情弹窗 -->
   <div id="round-modal-mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center" onclick="if(event.target===this)closeRoundModal()">
-    <div style="background:#fff;border-radius:14px;width:920px;max-width:94vw;max-height:88vh;display:flex;flex-direction:column;padding:20px">
+    <div class="modal-card" style="border-radius:14px;width:920px;max-width:94vw;max-height:88vh;display:flex;flex-direction:column;padding:20px">
       <div id="round-modal-head" style="margin-bottom:10px"></div>
       <div class="filters" id="round-file-filters" style="margin-bottom:10px"></div>
       <div id="round-file-list" style="overflow:auto;flex:1;min-height:120px"></div>
@@ -288,6 +337,41 @@ details.exc-drop .exc-list{margin-top:8px;display:grid;gap:5px;min-width:280px;m
 const syncUI = window.syncUI = window.syncUI || {};
 const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
 let curQueueFilter="";
+
+// ---- 深色模式（跟随系统 + 手动切换记忆） ----
+function applyTheme(t){
+  document.documentElement.dataset.theme=t;
+  const btn=$("#theme-toggle");if(btn)btn.textContent=t==="dark"?"☀️":"🌙";
+  try{localStorage.setItem("fm-theme",t);}catch(_){}
+}
+function toggleTheme(){applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");}
+(function(){
+  let saved=null;try{saved=localStorage.getItem("fm-theme");}catch(_){}
+  const sys=window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";
+  applyTheme(saved||sys);
+})();
+
+// ---- 轻提示（替代阻塞式 alert） ----
+function toast(msg,type){
+  let host=document.getElementById("toast-host");
+  if(!host){host=document.createElement("div");host.id="toast-host";document.body.appendChild(host);}
+  const el=document.createElement("div");
+  el.className="toast"+(type?" "+type:"");
+  el.textContent=msg;host.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add("show"));
+  setTimeout(()=>{el.classList.remove("show");setTimeout(()=>el.remove(),300);},type==="error"?6000:4000);
+}
+
+// ---- 校验强度动态提示 ----
+const VERIFY_HINTS={
+  strict:"完整多轮校验 + 删除前暂存，最稳但大文件耗时长；适合小文件或重要归档。",
+  fast:"上传后单次读回校验，无暂存文件；大文件在速度与安全间的推荐平衡。",
+  off:"不读回内容，仅核对文件大小，速度最快；若网盘静默损坏将无法检出，请仅用于可重新下载的资源。"};
+function updateVerifyHint(){
+  const sel=$("#f-verify"),tip=$("#verify-hint");
+  if(sel&&tip)tip.textContent=VERIFY_HINTS[sel.value]||"";
+}
+$("#f-verify").addEventListener("change",updateVerifyHint);
 
 // tabs
 $$(".tabs button").forEach(b=>b.onclick=()=>{
@@ -403,7 +487,7 @@ const chartSeries=[
 ];
 function renderQueueCharts(d){
   if(d.pending==null || d.transferring==null || d.failed==null || d.conflict==null || d.done==null){
-    $("#queue-total").textContent="—";$("#queue-donut").style.background="#dfe7f2";
+    $("#queue-donut").style.background="var(--donut-empty)";
     $("#queue-donut").setAttribute("aria-label","队列统计暂不可用");
     $("#queue-legend").textContent="状态暂不可用";$("#stage-bars").textContent="状态暂不可用";
     return;
@@ -414,7 +498,7 @@ function renderQueueCharts(d){
   let from=0;
   donut.style.background=total?`conic-gradient(${series.filter(item=>item.value).map(item=>{
     const start=from;from+=item.value/total*100;return `${item.color} ${start}% ${from}%`;
-  }).join(",")})`:"#dfe7f2";
+  }).join(",")})`:"var(--donut-empty)";
   donut.setAttribute("aria-label",total?series.filter(item=>item.value).map(item=>`${item.label} ${item.value}`).join("，"):"队列为空");
   $("#queue-total").textContent=total.toLocaleString("zh-CN");
   $("#queue-legend").innerHTML=series.map(item=>`<div class="legend-row"><span class="legend-dot" style="background:${item.color}"></span>${item.label}<b>${item.value.toLocaleString("zh-CN")}</b></div>`).join("");
@@ -481,8 +565,8 @@ async function prepareExcludeDir(taskId, path){
     await api(`/api/tasks/${taskId}/exclude-patterns`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pattern:rel})});
     loadDash();
     if($("#tab-tasks").style.display!=="none")loadTasks();
-    alert(`已加入排除项：${rel}\n下次扫描开始生效。`);
-  }catch(e){alert("无法加入排除项: "+e.message);}
+    toast(`已加入排除项：${rel}\n下次扫描开始生效。`,"success");
+  }catch(e){toast("无法加入排除项: "+e.message,"error");}
 }
 
 // ---- 排除规则条目编辑（任务表单） ----
@@ -502,7 +586,7 @@ function addExcludeFromInput(){
     else{formExcludes.push(p);added++;}
   });
   input.value="";renderExcChips();input.focus();
-  if(!added&&duplicate)alert("该排除项已存在");
+  if(!added&&duplicate)toast("该排除项已存在");
 }
 
 // ---- 任务列表排除项下拉与单条删除 ----
@@ -520,7 +604,7 @@ async function removeTaskPattern(taskId,pattern){
     await api(`/api/tasks/${taskId}/exclude-patterns?pattern=${encodeURIComponent(pattern)}`,{method:"DELETE"});
     loadTasks();loadDash();
     if($("#tab-eio").style.display!=="none")loadEioFailures();
-  }catch(e){alert("删除排除项失败: "+e.message);}
+  }catch(e){toast("删除排除项失败: "+e.message,"error");}
 }
 
 let editingTaskId = null;  // 非 null = 编辑模式
@@ -553,8 +637,8 @@ async function loadTasks(){
 async function editTask(id){
   let t;
   try{t=(await api("/api/tasks")).find(x=>x.id===id);}
-  catch(e){alert("读取任务失败: "+e.message);return;}
-  if(!t){alert("任务已不存在，请刷新列表");return;}
+  catch(e){toast("读取任务失败: "+e.message,"error");return;}
+  if(!t){toast("任务已不存在，请刷新列表","error");return;}
   editingTaskId = id;
   $("#f-name").value=t.name; $("#f-src").value=t.src_dir; $("#f-dst").value=t.dst_dir;
   $("#f-interval").value=t.interval_seconds; $("#f-scan").value=t.scan_interval;
@@ -566,6 +650,7 @@ async function editTask(id){
   $("#f-async").value = t.async_transfer ? "1" : "0";
   $("#f-manual").value = t.manual_only ? "1" : "0";
   $("#f-verify").value = t.verify_mode || "strict";
+  updateVerifyHint();
   const btn=$("#task-form button[type=submit]");
   btn.textContent="保存修改"; btn.classList.add("green");
   $("#form-title").textContent = "编辑任务（ID "+id+"）— 保存后立即生效";
@@ -663,8 +748,8 @@ function makeNode(rel, name) {
 
 function confirmPicker() {
   if (!pickerKind) return;
-  if (!pickerSelRel) { alert("请先点击一个目录选中"); return; }
-  if(!pickerSelAbs){alert("目录路径尚未加载完成，请稍后重试");return;}
+  if (!pickerSelRel) { toast("请先点击一个目录选中"); return; }
+  if(!pickerSelAbs){toast("目录路径尚未加载完成，请稍后重试");return;}
   $("#f-" + pickerKind).value = pickerSelAbs;
   closePicker();
 }
@@ -672,8 +757,8 @@ function confirmPicker() {
 $("#task-form").onsubmit=async e=>{
   e.preventDefault();
   const src = $("#f-src").value, dst = $("#f-dst").value;
-  if (!src || !dst) { alert("请先点击「选择」挑选源目录和目标目录"); return; }
-  if (dst === src || dst.startsWith(src + "/") || src.startsWith(dst + "/")) { alert("源目录与目标目录不能相同或互相包含"); return; }
+  if (!src || !dst) { toast("请先点击「选择」挑选源目录和目标目录"); return; }
+  if (dst === src || dst.startsWith(src + "/") || src.startsWith(dst + "/")) { toast("源目录与目标目录不能相同或互相包含"); return; }
   const payload = {
     name:$("#f-name").value,src_dir:src,dst_dir:dst,
     interval_seconds:+$("#f-interval").value,scan_interval:+$("#f-scan").value,
@@ -690,7 +775,7 @@ $("#task-form").onsubmit=async e=>{
     } else {
       await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     }
-  }catch(err){ alert("保存失败: "+err.message); return; }
+  }catch(err){ toast("保存失败: "+err.message,"error"); return; }
   e.target.reset(); formExcludes=[];renderExcChips(); resetFormMode(); loadTasks(); loadDash();
 };
 $("#f-exc-input").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();addExcludeFromInput();}});
@@ -702,7 +787,7 @@ async function toggleTask(id,checkbox){
     loadTasks();loadDash();
   }catch(e){
     checkbox.checked=!checkbox.checked;
-    alert("切换任务状态失败: "+e.message);
+    toast("切换任务状态失败: "+e.message,"error");
   }finally{checkbox.disabled=false;}
 }
 function newSyncRequestId(){
@@ -824,7 +909,7 @@ async function delTask(id){
   try{
     await api(`/api/tasks/${id}`,{method:"DELETE"});
     delete syncUI[id];loadTasks();loadDash();
-  }catch(e){alert("删除任务失败: "+e.message);}
+  }catch(e){toast("删除任务失败: "+e.message,"error");}
 }
 
 let roundPage=0,roundRequestId=0;
@@ -935,8 +1020,8 @@ async function retryEio(taskId,relPath,btn){
   try{
     const r=await api("/api/eio-failures/retry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task_id:taskId,rel_path:relPath})});
     loadEioFailures();loadTasks();loadDash();
-    alert((r.removed_rule?"已移除该条排除项，":"")+"已触发重新扫描，稍后可在队列中查看进展。\n若故障仍在，会重新记录并再次自动排除。"+(r.removed_rule?"\n提示：若 I/O 问题是永久性的，重试后仍会失败。":""));
-  }catch(e){alert("重试失败: "+e.message);}
+    toast((r.removed_rule?"已移除该条排除项，":"")+"已触发重新扫描，稍后可在队列中查看进展。\n若故障仍在，会重新记录并再次自动排除。"+(r.removed_rule?"\n提示：若 I/O 问题是永久性的，重试后仍会失败。":""),"success");
+  }catch(e){toast("重试失败: "+e.message,"error");}
   finally{eioBusy=false;if(btn)btn.disabled=false;}
 }
 
@@ -975,27 +1060,27 @@ $$("#queue-filters button[data-s]").forEach(b=>b.onclick=()=>{
 });
 async function retryOne(id){
   try{await api(`/api/queue/${id}/retry`,{method:"POST"});loadQueue();loadDash();}
-  catch(e){alert("重试失败: "+e.message);}
+  catch(e){toast("重试失败: "+e.message,"error");}
 }
 async function clearQueue(scope){
   const names={done:"已完成",failed:"失败",conflict:"冲突",all:"全部"};
   if(!confirm(`确认清除${names[scope]}队列条目？`))return;
   const q=scope==="all"?"?status=all":scope==="done"?"":`?status=${scope}`;
   try{await api(`/api/queue${q}`,{method:"DELETE"});loadQueue();loadDash();}
-  catch(e){alert("清除队列失败: "+e.message);}
+  catch(e){toast("清除队列失败: "+e.message,"error");}
 }
 async function clearLogs(){
   if(!confirm("确认清空全部日志？"))return;
   try{await api("/api/logs",{method:"DELETE"});loadLogs();}
-  catch(e){alert("清空日志失败: "+e.message);}
+  catch(e){toast("清空日志失败: "+e.message,"error");}
 }
 async function retryFailed(){
   if(!confirm("确认重试全部失败队列条目？"))return;
   try{
     const result=await api("/api/queue/retry-failed",{method:"POST"});
     loadQueue();loadDash();
-    if(!result.retried)alert("当前没有失败项");
-  }catch(e){loadQueue();alert("批量重试失败: "+e.message);}
+    if(!result.retried)toast("当前没有失败项");
+  }catch(e){loadQueue();toast("批量重试失败: "+e.message,"error");}
 }
 
 async function loadLogTasks(){
@@ -1094,7 +1179,7 @@ function browseTo(rel){
   });
 }
 function browseUp(){browseTo(browseNavRel.split("/").slice(0,-1).join("/"));}
-loadDash();setInterval(()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();if($("#tab-eio").style.display!=="none")loadEioFailures();}},3000);setInterval(tickScanCountdowns,1000);
+updateVerifyHint();loadDash();setInterval(()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();if($("#tab-eio").style.display!=="none")loadEioFailures();}},3000);setInterval(tickScanCountdowns,1000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden){loadDash();if($("#tab-rounds").style.display!=="none")loadRounds();if($("#tab-eio").style.display!=="none")loadEioFailures();}});
 </script>
 </body>

@@ -576,9 +576,14 @@ def transfer(item: dict, task: dict, stage_cb=None) -> Tuple[str, str]:
                 try:
                     target_device = _mount_identity(task["dst_dir"])
                     source_stat = os.lstat(src)
-                    deleted, reason = _remove_verified_source(
-                        src, dst, source_stat, task["dst_dir"], target_device,
-                        (source_stat.st_size, matching_hash))
+                    if verify == "strict":
+                        deleted, reason = _remove_verified_source(
+                            src, dst, source_stat, task["dst_dir"], target_device,
+                            (source_stat.st_size, matching_hash))
+                    else:
+                        # fast/off：目标内容刚经过全量比对一致，直接删除源，不产生暂存文件。
+                        deleted, reason = _unlink_verified_source(
+                            src, source_stat, dst, source_stat.st_size)
                     if not deleted:
                         return "failed", reason
                 except OSError as exc:
