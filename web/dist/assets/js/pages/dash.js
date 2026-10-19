@@ -442,7 +442,7 @@ function renderHeatmap() {
       const n = Number(x.bytes) || 0;
       const d = new Date(x.day + "T00:00:00");
       return `<div class="hm-day">
-        <span class="hm-cell q${lvl(n)}" title="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}"><b>${d.getDate()}</b></span>
+        <span class="hm-cell q${lvl(n)}" data-tip="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}"><b>${d.getDate()}</b></span>
         <span class="hm-day-label">周${labels[d.getDay()]}</span>
       </div>`;
     }).join("")}</div>`;
@@ -455,7 +455,7 @@ function renderHeatmap() {
   for (let i = 0; i < lead; i++) cells.push('<span class="hm-cell blank"></span>');
   days.forEach(x => {
     const n = Number(x.bytes) || 0;
-    cells.push(`<span class="hm-cell q${lvl(n)}" title="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}"></span>`);
+    cells.push(`<span class="hm-cell q${lvl(n)}" data-tip="${esc(x.day)} · ${x.files} 个文件 · ${trendBytes(x.bytes)}"></span>`);
   });
   // 月份标签：按视图列距标注月份变化处
   const pitch = heatmapView === "month" ? 25 : 13;  // 列宽 + 间距
@@ -480,6 +480,29 @@ function renderHeatmap() {
       </div>
     </div>`;
 }
+
+/* ================= 热力图悬浮提示 ================= */
+
+/** 即时悬浮气泡：全局事件委托（模块加载即绑定一次），替代原生 title 的延迟提示 */
+const hmTip = document.createElement("div");
+hmTip.className = "hm-tip";
+const hideHmTip = () => hmTip.classList.remove("show");
+document.addEventListener("mouseover", e => {
+  const cell = e.target instanceof Element ? e.target.closest(".hm-cell[data-tip]") : null;
+  if (!cell || !cell.isConnected) { hideHmTip(); return; }
+  if (!hmTip.isConnected) document.body.appendChild(hmTip);
+  hmTip.textContent = cell.dataset.tip;
+  hmTip.classList.add("show");
+  const r = cell.getBoundingClientRect();
+  const t = hmTip.getBoundingClientRect();
+  let x = r.left + r.width / 2 - t.width / 2;
+  let y = r.top - t.height - 8;
+  x = Math.max(8, Math.min(x, window.innerWidth - t.width - 8));
+  if (y < 8) y = r.bottom + 8;   // 顶部空间不足 → 改为显示在下方
+  hmTip.style.left = `${x}px`;
+  hmTip.style.top = `${y}px`;
+});
+document.addEventListener("scroll", hideHmTip, true);   // 滚动后定位失效，直接隐藏
 
 export async function loadTrend() {
   if (trendBusy) return;

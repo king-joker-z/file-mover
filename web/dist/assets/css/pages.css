@@ -287,6 +287,21 @@
 .hm-view-week .hm-cell.q3 b,
 .hm-view-week .hm-cell.q4 b { color: #fff; }
 
+/* 热力图悬浮提示：固定定位即时气泡（风格与柱状图 trend-bubble 一致），位置由 JS 控制 */
+.hm-tip {
+  position: fixed; left: 0; top: 0;
+  background: var(--text); color: var(--card);
+  font-size: 11px; line-height: 1;
+  padding: 6px 9px; border-radius: 7px;
+  white-space: nowrap;
+  box-shadow: var(--shadow-pop);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .12s ease;
+  z-index: 500;
+}
+.hm-tip.show { opacity: 1; }
+
 /* 窄屏适配：年视图可横向滚动，其余视图缩格 */
 @media (max-width: 860px) {
   .hm-view-month .hm-grid { grid-template-rows: repeat(7, 18px); grid-auto-columns: 18px; gap: 2px; }
