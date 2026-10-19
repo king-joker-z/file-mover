@@ -14,6 +14,7 @@ logger = logging.getLogger("uvicorn.error")
 
 class Scheduler:
     HEARTBEAT_INTERVAL = 15  # 慢挂载无返回时持续报告所在阶段
+    RETENTION_INTERVAL = 3600  # 数据保留清理周期；启动后首次延迟执行
 
     def __init__(self):
         self._stop = threading.Event()
@@ -53,6 +54,9 @@ class Scheduler:
         self._busy_tasks = {}  # task_id -> 在途迁移数；同一任务最多并发 transfer_workers 个
         self._stats_lock = threading.Lock()
         self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
+        self._next_retention_at = time.monotonic() + 60  # 启动后稍作延迟再首次清理
+        self.last_retention_result = None
+        self.last_retention_error = None
 
     @property
     def current_file(self):
@@ -142,6 +146,11 @@ class Scheduler:
     def wake_scan(self):
         self._scan_wake.set()
         self._work_wake.set()
+
+    def request_retention(self):
+        """请求尽快执行一次数据保留清理（如设置页刚改过保留天数）。"""
+        self._next_retention_at = 0.0
+        self._scan_wake.set()
 
     def sync_now(self, task_id: int, request_id: str = None, *, backfill_nfo: bool = False):
         """请求立即扫描源目录；历史目标 NFO 巡检仅由显式操作触发。"""
@@ -379,6 +388,7 @@ class Scheduler:
             "last_worker_error": self.last_worker_error,
             "accounting_pending": q.get("accounting_pending", 0) if q is not None else None,
             "last_accounting_error": self.last_accounting_error,
+            "last_retention_error": self.last_retention_error,
             "stats_error": stats_error,
         }
 
@@ -436,6 +446,16 @@ class Scheduler:
                             self._last_scan_phase = None
                     self._last_scan_phase = (None, "处理立即同步请求", time.monotonic())
                     self._process_sync_requests()
+                    now_monotonic = time.monotonic()
+                    if now_monotonic >= self._next_retention_at:
+                        # 清理只碰数据库，不访问挂载；失败不影响扫描节奏。
+                        self._last_scan_phase = (None, "数据保留清理", time.monotonic())
+                        try:
+                            self._run_retention()
+                        except Exception as exc:
+                            self.last_retention_error = str(exc)
+                            logger.warning("数据保留清理失败：%s", exc)
+                        self._next_retention_at = now_monotonic + self.RETENTION_INTERVAL
                     timeout = min(5, max(1, cfg["scan_interval"] / 6))
                 except Exception as exc:
                     self._scan_failed(exc)
@@ -520,6 +540,18 @@ class Scheduler:
                 if cur >= start or cur < end:
                     return True
         return False
+
+    # ---------- 数据保留清理 ----------
+
+    def _run_retention(self):
+        cfg = config.get()
+        result = db.cleanup_expired(cfg.get("log_retention_days", 0),
+                                    cfg.get("round_retention_days", 0))
+        if any(result.values()):
+            logger.info("数据保留清理完成：日志=%d 轮次=%d 轮次文件=%d",
+                        result["logs"], result["rounds"], result["round_files"])
+        self.last_retention_result = result
+        self.last_retention_error = None
 
     # ---------- 迁移主循环 ----------
 

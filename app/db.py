@@ -124,6 +124,9 @@ def _init_schema(conn: sqlite3.Connection):
             async_transfer INTEGER NOT NULL DEFAULT 0,
             transfer_workers INTEGER NOT NULL DEFAULT 1,
             verify_mode TEXT NOT NULL DEFAULT 'strict',
+            min_size_mb REAL NOT NULL DEFAULT 0,
+            max_size_mb REAL NOT NULL DEFAULT 0,
+            min_age_minutes INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
             rule_epoch INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -165,6 +168,11 @@ def _init_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_queue_retry_due ON queue(next_retry_at, id)
             WHERE status='failed' AND next_retry_at IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
+        CREATE TABLE IF NOT EXISTS trend_daily (
+            day TEXT PRIMARY KEY,
+            files INTEGER NOT NULL DEFAULT 0,
+            bytes INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS migrated_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER NOT NULL,
@@ -212,6 +220,7 @@ def _init_schema(conn: sqlite3.Connection):
             PRIMARY KEY (round_id, queue_id)
         );
         CREATE INDEX IF NOT EXISTS idx_round_files_queue ON upload_round_files(queue_id, round_id);
+        CREATE INDEX IF NOT EXISTS idx_rounds_finished ON upload_rounds(finished_at);
         """
     )
     conn.commit()
@@ -237,6 +246,15 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks ADD COLUMN transfer_workers INTEGER NOT NULL DEFAULT 1")
     if "rule_epoch" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN rule_epoch INTEGER NOT NULL DEFAULT 0")
+    for column, definition in (("min_size_mb", "REAL NOT NULL DEFAULT 0"),
+                               ("max_size_mb", "REAL NOT NULL DEFAULT 0"),
+                               ("min_age_minutes", "INTEGER NOT NULL DEFAULT 0")):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rounds_finished ON upload_rounds(finished_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS trend_daily (
+        day TEXT PRIMARY KEY, files INTEGER NOT NULL DEFAULT 0,
+        bytes INTEGER NOT NULL DEFAULT 0)""")
     conn.commit()
     # migrated_files 表（老库升级）
     conn.execute("""CREATE TABLE IF NOT EXISTS migrated_files (
@@ -319,6 +337,24 @@ def normalize_transfer_workers(value) -> int:
         return 1
 
 
+def normalize_size_mb(value) -> float:
+    """任务大小过滤（MB）；0/负数/非法值都归一为 0 = 不限制。"""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if 0 < value <= 1048576 else 0.0
+
+
+def normalize_min_age_minutes(value) -> int:
+    """文件最小年龄（分钟）；0/负数/非法值都归一为 0 = 不限制。"""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 < value <= 43200 else 0
+
+
 def create_task(data: dict) -> int:
     conn = get_conn()
     with _lock, conn:
@@ -329,9 +365,9 @@ def create_task(data: dict) -> int:
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
                run_windows, filename_nfo_enabled, manual_only, async_transfer,
-               transfer_workers, verify_mode,
+               transfer_workers, verify_mode, min_size_mb, max_size_mb, min_age_minutes,
                enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
@@ -341,6 +377,9 @@ def create_task(data: dict) -> int:
              1 if data.get("async_transfer") else 0,
              normalize_transfer_workers(data.get("transfer_workers")),
              normalize_verify_mode(data.get("verify_mode")),
+             normalize_size_mb(data.get("min_size_mb")),
+             normalize_size_mb(data.get("max_size_mb")),
+             normalize_min_age_minutes(data.get("min_age_minutes")),
              1 if data.get("enabled", True) else 0, now_str(), now_str()))
         return cur.lastrowid
 
@@ -353,6 +392,7 @@ def update_task(task_id: int, data: dict):
               "path_rule", "after_action", "run_windows",
               "filename_nfo_enabled", "manual_only", "async_transfer",
               "transfer_workers", "verify_mode",
+              "min_size_mb", "max_size_mb", "min_age_minutes",
               "enabled"):
         if k in data:
             fields.append(f"{k}=?")
@@ -360,6 +400,10 @@ def update_task(task_id: int, data: dict):
                 vals.append(normalize_verify_mode(data[k]))
             elif k == "transfer_workers":
                 vals.append(normalize_transfer_workers(data[k]))
+            elif k in ("min_size_mb", "max_size_mb"):
+                vals.append(normalize_size_mb(data[k]))
+            elif k == "min_age_minutes":
+                vals.append(normalize_min_age_minutes(data[k]))
             else:
                 vals.append(data[k])
     if not fields:
@@ -1014,6 +1058,58 @@ def clear_logs() -> int:
         return cur.rowcount
 
 
+# ---------- 数据保留策略 ----------
+
+def _wal_checkpoint(conn: sqlite3.Connection) -> None:
+    """大批量删除后截断 WAL，及时回收磁盘空间；失败不影响主流程。"""
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass
+
+
+def cleanup_expired(log_days: int, round_days: int) -> dict:
+    """删除超过保留期的迁移日志与已完结轮次，返回各类删除/归档数量。
+
+    日志删除前，先把被删成功记录按日聚合写入 trend_daily，趋势图不因
+    日志老化而归零；trend_daily 体积固定为每天一行，远小于明细日志。
+    未完结轮次（进行中/扫描中）与进行中的队列永不会被清理。
+    """
+    conn = get_conn()
+    result = {"logs": 0, "rounds": 0, "round_files": 0}
+    now = time.time()
+    with _lock, conn:
+        if round_days > 0:
+            round_cutoff = now - round_days * 86400
+            rounds = conn.execute(
+                "SELECT id FROM upload_rounds WHERE finished_at IS NOT NULL AND finished_at < ?",
+                (round_cutoff,)).fetchall()
+            if rounds:
+                ids = [row["id"] for row in rounds]
+                marks = ",".join("?" for _ in ids)
+                cur = conn.execute(f"DELETE FROM upload_round_files WHERE round_id IN ({marks})", ids)
+                result["round_files"] = cur.rowcount
+                cur = conn.execute(f"DELETE FROM upload_rounds WHERE id IN ({marks})", ids)
+                result["rounds"] = cur.rowcount
+        if log_days > 0:
+            log_cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - log_days * 86400))
+            conn.execute(
+                """INSERT INTO trend_daily (day, files, bytes)
+                   SELECT substr(created_at, 1, 10) AS day, COUNT(*), COALESCE(SUM(size), 0)
+                   FROM logs WHERE result='success' AND created_at < ?
+                   GROUP BY day
+                   ON CONFLICT(day) DO UPDATE SET
+                     files=files+excluded.files, bytes=bytes+excluded.bytes""",
+                (log_cutoff,))
+            conn.execute("DELETE FROM log_destinations WHERE log_id IN"
+                         " (SELECT id FROM logs WHERE created_at < ?)", (log_cutoff,))
+            cur = conn.execute("DELETE FROM logs WHERE created_at < ?", (log_cutoff,))
+            result["logs"] = cur.rowcount
+        if result["logs"] or result["rounds"]:
+            _wal_checkpoint(conn)
+    return result
+
+
 # ---------- migrated_files（重复下载检测） ----------
 
 def record_migrated(task_id: int, rel_path: str, size: int, dst_path: str = None):
@@ -1174,7 +1270,8 @@ def count_logs(task_id=None, status=None, search=None) -> int:
 def trend_by_day(days: int) -> list[dict]:
     """按本地日期聚合最近 N 天成功迁移的文件数与字节数；缺失日期补零。
 
-    以成功日志的 created_at（本地时间字符串）为准；清空日志后趋势归零，
+    活跃数据来自成功日志的 created_at（本地时间字符串）；超过日志保留期
+    的历史来自 trend_daily 归档表（日志删除前聚合），两者按日互补不重叠。
     累计值仍来自迁移记账表（migration_totals）。
     """
     days = max(1, min(365, int(days)))
@@ -1186,7 +1283,14 @@ def trend_by_day(days: int) -> list[dict]:
             " COALESCE(SUM(size), 0) AS bytes"
             " FROM logs WHERE result='success' AND created_at >= ?"
             " GROUP BY day", (first_day.isoformat() + " 00:00:00",)).fetchall()
-    by_day = {row["day"]: (row["files"], row["bytes"]) for row in rows}
+        archived = get_conn().execute(
+            "SELECT day, files, bytes FROM trend_daily WHERE day >= ?",
+            (first_day.isoformat(),)).fetchall()
+    by_day = {row["day"]: [row["files"], row["bytes"]] for row in rows}
+    for row in archived:
+        slot = by_day.setdefault(row["day"], [0, 0])
+        slot[0] += row["files"]
+        slot[1] += row["bytes"]
     items = []
     for offset in range(days - 1, -1, -1):
         day = (today - datetime.timedelta(days=offset)).isoformat()

@@ -88,6 +88,11 @@ class TaskIn(BaseModel):
     # 校验强度：strict=多轮读回+删除前暂存（最稳）；fast=单次读回无暂存（大文件推荐）；
     # off=不读回仅核对大小（最快，信任网盘写入）。NFO 小文件始终按 strict 处理。
     verify_mode: Literal["strict", "fast", "off"] = "strict"
+    # 文件范围过滤：0 = 不限制。min/max 单位 MB；min_age_minutes = 只迁移
+    # 最后修改时间至少在 X 分钟前的文件（避开刚下载/正在写入的大文件）。
+    min_size_mb: float = Field(default=0, ge=0, le=1048576, allow_inf_nan=False)
+    max_size_mb: float = Field(default=0, ge=0, le=1048576, allow_inf_nan=False)
+    min_age_minutes: int = Field(default=0, ge=0, le=43200)
 
     @field_validator("run_windows")
     @classmethod
@@ -130,6 +135,11 @@ class SettingsIn(BaseModel):
     douyin_nfo_enabled: Optional[bool] = None
     # 异步迁移线程数：开启异步的任务可与其它任务并行迁移的最大线程数
     max_async_transfers: Optional[int] = Field(default=None, ge=1, le=8)
+    # 数据保留：0 = 永久保留；过期日志删除前会先把按日趋势聚合归档。
+    log_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    round_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    # 全局忽略后缀（如 .tmp/.part）；空列表 = 不忽略。逗号是输入分隔符，后缀本身不含逗号。
+    ignore_suffixes: Optional[list[str]] = None
 
 
 class ExcludePatternIn(BaseModel):
@@ -613,6 +623,8 @@ def api_update_settings(data: SettingsIn):
         raise HTTPException(422, "设置项不可为 null")
     result = config.update(data_dict)
     logger.info("设置更新：字段=%s", sorted(data_dict))
+    if {"log_retention_days", "round_retention_days"} & set(data_dict):
+        scheduler.request_retention()  # 保留天数变化后立即清理一次，无需等下一小时
     return result
 
 

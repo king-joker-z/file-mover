@@ -324,6 +324,7 @@ export async function loadDash() {
     if (d.accounting_pending > 0) warnings.push(`待补偿记账: ${d.accounting_pending} 项`);
     if (d.last_worker_error) warnings.push("最近迁移异常: " + d.last_worker_error);
     if (d.last_accounting_error) warnings.push(d.last_accounting_error);
+    if (d.last_retention_error) warnings.push("数据保留清理失败: " + d.last_retention_error);
     $("#status-warnings").textContent = warnings.join("\n");
     const excludeBtn = $("#exclude-error-dir");
     excludeBtn.style.display = d.last_scan_error_path && d.last_scan_error_task_id != null

@@ -44,6 +44,20 @@ export function mount(root) {
           <label class="settings-option"><input type="checkbox" id="g-douyin">
             <span><b>抖音 NFO 自动生成</b><small>无 NFO 的视频按文件名生成简易信息。</small></span></label>
         </section>
+        <section class="panel settings-card"><span class="eyebrow">05 / RETENTION</span><h2>数据保留</h2>
+          <p class="log-detail">自动清理超过保留期的迁移日志与历史轮次，控制数据库体积；填 0 = 永久保留。</p>
+          <div class="row">
+            <div class="field small"><label for="g-log-retention">日志保留 · 天</label><input id="g-log-retention" type="number" min="0" max="3650" required></div>
+            <div class="field small"><label for="g-round-retention">轮次保留 · 天</label><input id="g-round-retention" type="number" min="0" max="3650" required></div>
+          </div>
+          <div class="settings-note">每小时自动清理一次，保存后立即执行。过期日志删除前会把按日趋势聚合归档，趋势图不受影响；进行中的队列与未完结轮次永不会被清理。删除的空间由 SQLite 后续写入复用。</div>
+        </section>
+        <section class="panel settings-card"><span class="eyebrow">06 / GLOBAL FILTERS</span><h2>全局忽略后缀</h2>
+          <p class="log-detail">不完整的下载/临时文件不参与任何任务的扫描。</p>
+          <div class="field"><label for="g-ignore">忽略后缀（逗号分隔）</label>
+            <input id="g-ignore" placeholder=".tmp, .part, .crdownload, .!ut">
+            <div class="field-hint">清空 = 不忽略任何后缀。单个任务的过滤还可在任务表单中按大小/年龄设置。</div></div>
+        </section>
       </div>
       <div class="settings-save"><button class="btn" type="submit">保存设置</button>
         <span class="log-detail">更改在下一周期生效</span>
@@ -66,6 +80,9 @@ async function load() {
     set("g-quiet-s", s.stable_quiet_seconds);
     set("g-retries", s.max_retries);
     set("g-async-workers", s.max_async_transfers ?? 2);
+    set("g-log-retention", s.log_retention_days ?? 0);
+    set("g-round-retention", s.round_retention_days ?? 0);
+    set("g-ignore", (s.ignore_suffixes || []).join(", "));
     setChk("g-stable", s.stable_check);
     setChk("g-empty", s.remove_empty_dirs);
     setChk("g-nfo", s.nfo_fix_enabled !== false);
@@ -93,6 +110,9 @@ async function onSubmit(e) {
         remove_empty_dirs: chk("g-empty"),
         nfo_fix_enabled: chk("g-nfo"),
         douyin_nfo_enabled: chk("g-douyin"),
+        log_retention_days: +val("g-log-retention") || 0,
+        round_retention_days: +val("g-round-retention") || 0,
+        ignore_suffixes: val("g-ignore").split(/[,，]/).map(x => x.trim()).filter(Boolean),
       }),
     });
     msg.style.color = "var(--ok-ink)";

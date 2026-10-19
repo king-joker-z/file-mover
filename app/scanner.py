@@ -54,6 +54,28 @@ def _signature(info):
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
+def _file_in_scope(signature, task) -> bool:
+    """任务级范围过滤：大小/年龄不在范围内的文件不入队。
+
+    signature 为 (dev, ino, size, mtime_ns)；min/max 单位 MB，0 = 不限；
+    min_age_minutes 只入队最后修改至少在 X 分钟前的文件。
+    与排除规则一样静默跳过，不写日志，避免每轮刷屏。
+    """
+    if signature is None:
+        return True
+    size = signature[2]
+    minimum = db.normalize_size_mb(task.get("min_size_mb")) * (1 << 20)
+    maximum = db.normalize_size_mb(task.get("max_size_mb")) * (1 << 20)
+    if minimum and size < minimum:
+        return False
+    if maximum and size > maximum:
+        return False
+    minutes = db.normalize_min_age_minutes(task.get("min_age_minutes"))
+    if minutes and time.time_ns() - signature[3] < minutes * 60 * 1_000_000_000:
+        return False
+    return True
+
+
 def _scan_io_error(action: str, path: str, error: OSError) -> OSError:
     """保留 errno 和实际路径，并说明扫描时失败的文件系统操作。"""
     failure = OSError(error.errno, f"{action}: {error.strerror or error}", error.filename or path)
@@ -319,6 +341,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                         or any(fn.endswith(s) for s in ignores)
                         or (includes and not _match_any(rel_video, fn, includes))
                         or (excludes and _match_any(rel_video, fn, excludes))
+                        or not _file_in_scope(samples.get(full_p), task)
                         or not _stable(full_p, wait)):
                     continue
                 base, ext = os.path.splitext(fn)
@@ -372,6 +395,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                     os.path.splitext(name)[0].casefold() == video_stem.casefold()
                     and os.path.splitext(name)[1].lower() in VIDEO_EXTS
                     and os.path.join(root, name) in samples
+                    and _file_in_scope(samples.get(os.path.join(root, name)), task)
                     and not any(name.endswith(s) for s in ignores)
                     and not (excludes and _match_any(
                         os.path.relpath(os.path.join(root, name), src), name, excludes))
@@ -394,6 +418,9 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             if samples.get(full) != current_signature:
                 continue
             size = current_signature[2]
+            # 任务范围过滤：大小/年龄不在范围内的文件不入队（与排除规则同语义）。
+            if not _file_in_scope(current_signature, task):
+                continue
             prior_dst = db.get_migrated_dst(task["id"], rel) if task.get("after_action", "delete") == "delete" else None
             if (fn.lower().endswith(".nfo") and db.has_migrated_rel(task["id"], rel) and not prior_dst
                     and task.get("path_rule") == "by_date"

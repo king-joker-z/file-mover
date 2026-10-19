@@ -21,6 +21,8 @@ DEFAULTS = {
     "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
     "douyin_nfo_enabled": False,  # 对无 nfo 的抖音视频自动生成简易 nfo
     "max_async_transfers": 2,     # 异步迁移线程数：开启异步的任务可与其它任务并行迁移
+    "log_retention_days": 365,    # 迁移日志保留天数，0=永久；过期日志删除前先把按日趋势聚合存档
+    "round_retention_days": 90,   # 已完结上传轮次的保留天数，0=永久
 }
 
 _lock = threading.Lock()
@@ -33,7 +35,8 @@ def _validate(data: dict) -> None:
     bounds = {"scan_interval": (1, 86400), "stable_check_seconds": (0, 3600),
               "stable_quiet_seconds": (0, 86400),
               "max_retries": (0, 100), "default_interval_seconds": (0, 86400),
-              "max_async_transfers": (1, 8)}
+              "max_async_transfers": (1, 8),
+              "log_retention_days": (0, 3650), "round_retention_days": (0, 3650)}
     for key, (minimum, maximum) in bounds.items():
         if key in data:
             value = data[key]
@@ -47,12 +50,16 @@ def _validate(data: dict) -> None:
     for key in ("retry_backoff_seconds", "ignore_suffixes"):
         if key in data:
             values = data[key]
-            if not isinstance(values, list) or not values:
+            # ignore_suffixes 允许空列表 = 不做全局后缀忽略；退避序列为空会导致取下标失败，仍禁止。
+            if not isinstance(values, list) or (not values and key == "retry_backoff_seconds"):
                 raise ValueError(f"配置项 {key} 必须是非空列表")
             if key == "retry_backoff_seconds" and any(type(v) is not int or v < 0 for v in values):
                 raise ValueError(f"配置项 {key} 非法")
-            if key == "ignore_suffixes" and any(not isinstance(v, str) or not v for v in values):
+            if key == "ignore_suffixes" and any(
+                    not isinstance(v, str) or not v.strip() for v in values):
                 raise ValueError(f"配置项 {key} 非法")
+            if key == "ignore_suffixes":
+                data[key] = [v.strip() for v in values]
 
 
 def _load() -> dict:

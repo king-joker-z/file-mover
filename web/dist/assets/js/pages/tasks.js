@@ -118,6 +118,9 @@ function taskCard(t) {
     t.async_transfer ? `<span class="badge accent" title="与其它任务并行迁移">异步</span>` : "",
     t.transfer_workers > 1 ? `<span class="badge accent" title="同一任务最多 ${t.transfer_workers} 个文件同时迁移">并发×${t.transfer_workers}</span>` : "",
     t.manual_only ? `<span class="badge warn" title="不参与自动定时扫描，需手动触发">仅手动扫描</span>` : "",
+    (t.min_size_mb || t.max_size_mb)
+      ? `<span class="badge" title="${t.min_size_mb ? "≥" + t.min_size_mb + "MB" : ""}${t.min_size_mb && t.max_size_mb ? " 且 " : ""}${t.max_size_mb ? "≤" + t.max_size_mb + "MB" : ""}">大小过滤</span>` : "",
+    t.min_age_minutes ? `<span class="badge" title="仅迁移最后修改至少 ${t.min_age_minutes} 分钟前的文件">年龄≥${t.min_age_minutes}分</span>` : "",
     t.filename_nfo_enabled ? `<span class="badge">NFO 补全</span>` : "",
   ].filter(Boolean).join("");
 
@@ -302,9 +305,14 @@ function modalFormHtml(t) {
     </section>
 
     <section class="form-section">
-      <div class="section-title"><b>包含与排除规则</b><span>通配匹配文件名；命中排除的文件与目录不参与扫描</span></div>
+      <div class="section-title"><b>包含与排除规则</b><span>通配匹配文件名；也可按大小/年龄限定迁移范围</span></div>
       <div class="row">
         ${field("包含（通配，逗号分隔）", `<input id="f-inc" placeholder="*.mp4, *.jpg">`, "", "留空 = 全部文件")}
+      </div>
+      <div class="row">
+        ${field("最小大小 · MB", `<input id="f-minsize" type="number" min="0" step="0.1" value="0">`, "small", "0 = 不限")}
+        ${field("最大大小 · MB", `<input id="f-maxsize" type="number" min="0" step="0.1" value="0">`, "small", "0 = 不限")}
+        ${field("最小年龄 · 分钟", `<input id="f-age" type="number" min="0" step="1" value="0">`, "small", "仅迁移最后修改至少 X 分钟前的文件；0 = 不限")}
       </div>
       <div id="f-exc-chips" class="chip-list"></div>
       <div class="inline-controls" style="display:flex;gap:6px;margin-top:8px">
@@ -333,10 +341,13 @@ function bindModalEvents(modal, closeFn) {
     set("f-workers", String(t.transfer_workers || 1));
     set("f-manual", t.manual_only ? "1" : "0");
     set("f-verify", t.verify_mode || "strict");
+    set("f-minsize", t.min_size_mb || 0); set("f-maxsize", t.max_size_mb || 0);
+    set("f-age", t.min_age_minutes || 0);
   } else {
     set("f-conflict", "skip"); set("f-path", "keep_structure"); set("f-after", "delete");
     set("f-verify", "strict"); set("f-manual", "0"); set("f-async", "0");
     set("f-workers", "1"); set("f-filename-nfo", "0");
+    set("f-minsize", "0"); set("f-maxsize", "0"); set("f-age", "0");
   }
   renderExcChips(body);
 
@@ -425,6 +436,9 @@ async function submitTask(modal, closeFn) {
     transfer_workers: +val("f-workers") || 1,
     manual_only: val("f-manual") === "1",
     verify_mode: val("f-verify") || "strict",
+    min_size_mb: +val("f-minsize") || 0,
+    max_size_mb: +val("f-maxsize") || 0,
+    min_age_minutes: +val("f-age") || 0,
   };
   const submitBtn = modal.el.querySelector('button[form="task-form"]');
   submitBtn.disabled = true;
