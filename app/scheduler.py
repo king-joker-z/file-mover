@@ -105,14 +105,30 @@ class Scheduler:
         self._async_threads.clear()
         logger.info("后台线程已退出")
 
+    def _desired_async_workers(self, configured) -> int:
+        """异步线程池目标大小：全局设置与已启用异步任务并发迁移数的最大值。
+
+        任务内并发（transfer_workers）依赖异步线程池：线程不够时任务并发
+        会被隐式限制，因此按任务需求自动补足，避免两个设置需要手动对齐。
+        """
+        want = max(1, min(8, int(configured)))
+        try:
+            need = max((db.normalize_transfer_workers(task.get("transfer_workers"))
+                        for task in db.list_tasks()
+                        if task.get("enabled") and task.get("async_transfer")),
+                       default=0)
+        except Exception:
+            need = 0
+        return max(want, min(8, need))
+
     def _ensure_async_workers(self, want=None):
-        """按全局设置补足异步迁移线程；调大即时生效，调小重启后生效。"""
+        """按全局设置与任务并发需求补足异步迁移线程；调大即时生效，调小重启后生效。"""
         if want is None:
             try:
                 want = int(config.get().get("max_async_transfers", 2))
             except Exception:
                 want = 2
-        want = max(1, min(8, int(want)))
+        want = self._desired_async_workers(want)
         with self._lifecycle_lock:
             while len(self._async_threads) < want:
                 if self._stop.is_set():

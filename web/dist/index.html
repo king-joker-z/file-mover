@@ -217,7 +217,7 @@ html[data-theme="dark"] .tag.accounting_pending{background:#0f3330;color:#4fc7c1
         <div class="row">
           <div class="field"><label>迁移方式（异步可与其它任务并行，适合超大文件）</label>
             <select id="f-async"><option value="0">同步：与其它任务依次迁移（默认）</option><option value="1">异步：与其它任务并行迁移，不阻塞其它任务</option></select></div>
-          <div class="field small"><label>并发迁移数（需异步，建议配合调大异步线程数）</label>
+          <div class="field small"><label>并发迁移数（需异步；线程不足时自动补足）</label>
             <select id="f-workers"><option value="1">1：串行（默认）</option><option value="2">2 个文件并行</option><option value="3">3 个文件并行</option><option value="4">4 个文件并行</option></select></div>
           <div class="field"><label>扫描方式（仅手动时不参与自动定时扫描）</label>
             <select id="f-manual"><option value="0">自动定时扫描（默认）</option><option value="1">仅手动扫描：等待「立即扫描」触发</option></select></div>
@@ -315,7 +315,7 @@ html[data-theme="dark"] .tag.accounting_pending{background:#0f3330;color:#4fc7c1
       <div class="settings-grid">
         <section class="panel settings-card"><span class="eyebrow">01 / SCHEDULING</span><h2>扫描与重试</h2><p class="log-detail">控制定时扫描和异常后的重试频率。</p>
           <div class="row"><div class="field small"><label for="g-scan">全局扫描间隔 · 秒</label><input id="g-scan" type="number" min="1" required></div><div class="field small"><label for="g-retries">最大重试次数</label><input id="g-retries" type="number" min="0" required></div><div class="field small"><label for="g-async-workers">异步迁移线程数</label><input id="g-async-workers" type="number" min="1" max="8" required></div></div>
-          <div class="settings-note">任务单独设置的扫描间隔优先于此处的全局值。异步迁移线程数：开启「异步迁移」的任务可与其它任务并行迁移；调大即时生效，调小重启后生效。</div>
+          <div class="settings-note">任务单独设置的扫描间隔优先于此处的全局值。异步迁移线程数：开启「异步迁移」的任务可与其它任务并行迁移；调大即时生效，调小重启后生效。任务并发迁移数需要更多线程时会自动补足（上限 8）。</div>
         </section>
         <section class="panel settings-card"><span class="eyebrow">02 / FILE SAFETY</span><h2>文件稳定性</h2><p class="log-detail">避免未写完的文件过早进入迁移队列。</p>
           <div class="row"><div class="field small"><label for="g-stable-s">采样间隔 · 秒</label><input id="g-stable-s" type="number" min="0" max="3600" required></div><div class="field small"><label for="g-quiet-s">文件静默期 · 秒</label><input id="g-quiet-s" type="number" min="0" max="86400" required></div></div>

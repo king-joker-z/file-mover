@@ -3507,6 +3507,18 @@ class LaneSchedulingTests(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertNotIn(task_id, worker._busy_tasks)
 
+    def test_async_pool_scales_to_task_transfer_workers(self):
+        """异步线程池按已启用异步任务的并发迁移数自动补足，不再卡在全局默认 2。"""
+        task_id = db.create_task(dict(self.task, name="big", enabled=True,
+                                      async_transfer=True, transfer_workers=4))
+        worker = scheduler.Scheduler()
+        self.assertEqual(worker._desired_async_workers(2), 4)   # 任务需求 > 全局设置
+        self.assertEqual(worker._desired_async_workers(8), 8)   # 全局设置优先取大
+        db.update_task(task_id, {"enabled": False})
+        self.assertEqual(worker._desired_async_workers(2), 2)   # 停用后不再放大
+        db.update_task(task_id, {"transfer_workers": 1})
+        self.assertEqual(worker._desired_async_workers(2), 2)   # 并发 1 无额外需求
+
     def test_transfer_workers_out_of_range_is_rejected(self):
         # pydantic 校验：0 与 5 都非法，默认 1
         with self.assertRaises(Exception):
