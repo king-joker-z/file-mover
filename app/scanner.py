@@ -269,6 +269,9 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             if (name.startswith(".") or name.endswith(".moving")
                     or any(name.endswith(s) for s in ignores)
                     or (excludes and _match_any(rel, name, excludes))):
+                # 传输中断残留的源暂存文件（产生时目标已校验完成）超期自动清理。
+                if name.startswith(".fm-source-") and name.endswith(".moving"):
+                    transfer.cleanup_stale_source_staging(path)
                 continue
             try:
                 info = os.lstat(path)

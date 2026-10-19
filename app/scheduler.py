@@ -18,6 +18,8 @@ class Scheduler:
     def __init__(self):
         self._stop = threading.Event()
         self._threads = []
+        self._async_threads = []  # 异步迁移线程池：仅领取开启异步的任务
+        self._lifecycle_lock = threading.Lock()
         self._scan_wake = threading.Event()
         self._work_wake = threading.Event()
         self._sync_requests = set()
@@ -34,7 +36,6 @@ class Scheduler:
         self._active_scan_task_id = None
         self._active_scan_state = None
         self.sync_progress = {}  # task_id -> 扫描进度
-        self.current_file = None
         self.moved_today = 0
         self._today = time.strftime("%Y-%m-%d")
         self.started_at = time.time()
@@ -49,6 +50,16 @@ class Scheduler:
         self._accounting_blocked = set()  # 安全校验失败不在每次轮询重读网盘
         self._accounting_retry_at = {}  # 数据库暂不可用时限速重试
         self._unstarted_claims = set()  # DB 故障期间待释放的迁移前认领
+        self._busy_tasks = set()  # 有在途迁移的任务：同一任务同时只迁移一个文件
+        self._stats_lock = threading.Lock()
+        self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
+
+    @property
+    def current_file(self):
+        """当前正在迁移的文件（串行 + 异步全部在途项，分号连接）。"""
+        with self._stats_lock:
+            entries = list(self._current_transfers.values())
+        return "; ".join(entry["rel_path"] for entry in entries) or None
 
     # ---------- 生命周期 ----------
 
@@ -77,17 +88,40 @@ class Scheduler:
             t = threading.Thread(target=target, name=f"fm-{name}", daemon=True)
             t.start()
             self._threads.append(t)
-        logger.info("后台线程已启动：任务数=%d", len(tasks))
+        self._ensure_async_workers()
+        logger.info("后台线程已启动：任务数=%d 异步迁移线程=%d",
+                    len(tasks), len(self._async_threads))
 
     def stop(self):
         logger.info("服务停止：等待后台任务退出")
         self._stop.set()
         self._scan_wake.set()
         self._work_wake.set()
-        for thread in self._threads:
+        with self._lifecycle_lock:
+            threads = list(self._threads) + list(self._async_threads)
+        for thread in threads:
             thread.join()  # 正在传输的文件完成验证后才允许服务退出
         self._threads.clear()
+        self._async_threads.clear()
         logger.info("后台线程已退出")
+
+    def _ensure_async_workers(self, want=None):
+        """按全局设置补足异步迁移线程；调大即时生效，调小重启后生效。"""
+        if want is None:
+            try:
+                want = int(config.get().get("max_async_transfers", 2))
+            except Exception:
+                want = 2
+        want = max(1, min(8, int(want)))
+        with self._lifecycle_lock:
+            while len(self._async_threads) < want:
+                if self._stop.is_set():
+                    return
+                thread = threading.Thread(
+                    target=self._async_work_loop,
+                    name=f"fm-async-{len(self._async_threads) + 1}", daemon=True)
+                thread.start()
+                self._async_threads.append(thread)
 
     def wake_scan(self):
         self._scan_wake.set()
@@ -253,6 +287,8 @@ class Scheduler:
             errors.append(f"轮次统计失败: {exc}")
         stats_error = "；".join(errors) if errors else None
         now = time.time()
+        with self._stats_lock:
+            transfers = [dict(entry) for entry in self._current_transfers.values()]
         schedules = []
         for task in tasks or []:
             task_id = task["id"]
@@ -269,16 +305,26 @@ class Scheduler:
                 status = "scanning"
             elif now < retry_at:
                 status = "cooldown"
+            elif task.get("manual_only"):
+                status = "manual_wait"  # 仅手动扫描：不参与自动调度，等待手动触发
             else:
                 status = "scheduled"
+            if not task.get("enabled"):
+                next_scan = None
+            elif task.get("manual_only"):
+                # 仅手动扫描无自动计划；故障冷却时展示剩余冷却时间。
+                next_scan = retry_at if task_id in self._scan_retry_at else None
+            else:
+                next_scan = (retry_at if task_id in self._scan_retry_at else
+                             (last + interval) if last is not None else now)
             schedules.append({
                 "id": task_id, "name": task["name"], "enabled": bool(task.get("enabled")),
                 "round": rounds.get(task_id),
                 "src_dir": task["src_dir"], "dst_dir": task["dst_dir"],
                 "interval_seconds": interval, "last_scan_at": last,
-                "next_scan_at": (retry_at if task_id in self._scan_retry_at else
-                                 (last + interval) if last is not None else now)
-                if task.get("enabled") else None,
+                "next_scan_at": next_scan,
+                "manual_only": bool(task.get("manual_only")),
+                "async_transfer": bool(task.get("async_transfer")),
                 "status": status, "request_id": progress.get("request_id") if running else None,
                 "backfill_nfo": bool(progress.get("backfill_nfo")) if running else False,
                 "backfill_checked": progress.get("backfill_checked", 0) if running else 0,
@@ -303,6 +349,7 @@ class Scheduler:
             "conflict": q.get("conflict", 0) if q is not None else None,
             "done": q.get("done", 0) if q is not None else None,
             "current_file": self.current_file,
+            "current_files": transfers,
             "uptime_seconds": int(time.time() - self.started_at),
             "settings": cfg,
             "scanner_alive": any(t.name == "fm-scanner" and t.is_alive() for t in self._threads),
@@ -339,13 +386,16 @@ class Scheduler:
                     self._process_sync_requests()
                     self._last_scan_phase = (None, "读取全局配置", time.monotonic())
                     cfg = config.get()
+                    # 异步迁移线程数调大后即时补足；复用已读取的 cfg，不额外访问配置。
+                    self._ensure_async_workers(cfg.get("max_async_transfers", 2))
                     now = time.time()
                     self._last_scan_phase = (None, "读取任务列表", time.monotonic())
                     tasks = db.list_tasks()
                     for task in tasks:
                         if self._sync_requests:
                             break
-                        if not task.get("enabled"):
+                        # 仅手动扫描的任务不参与自动调度，等待「立即扫描」触发。
+                        if not task.get("enabled") or task.get("manual_only"):
                             continue
                         interval = task.get("scan_interval") or cfg["scan_interval"]
                         retry_at = self._scan_retry_at.get(task["id"])
@@ -472,7 +522,6 @@ class Scheduler:
             except Exception as exc:
                 logger.exception("迁移线程异常：当前文件=%s", self.current_file)
                 self.last_worker_error = str(exc)
-                self.current_file = None
                 self._stop.wait(timeout=2)
             finally:
                 self._last_work_phase = None
@@ -613,142 +662,225 @@ class Scheduler:
         now = time.monotonic()
         # 扫描已发现该任务目录故障时，不仅延迟下次扫描，也暂停其迁移写入。
         # 即使冷却时间到了，也须先完成一次成功扫描才能解除暂停。
+        # 开启异步的任务由异步线程池处理；串行线程只处理同步任务，
+        # 这样超大文件（异步）不会阻塞其它任务的逐个迁移。
         self._last_work_phase = ("筛选可迁移任务", time.monotonic())
         eligible = [tid for tid, task in task_map.items() if task.get("enabled")
+                    and not task.get("async_transfer")
                     and tid not in self._scan_retry_at
+                    and tid not in self._busy_tasks
                     and now >= self._next_eligible.get(tid, 0)
                     and self._in_run_window(task) and self._task_paths_safe(task)]
         self._last_work_phase = ("领取待迁移文件", time.monotonic())
-        item = db.take_next_pending(eligible)
+        item = self._claim_item(eligible)
         if item is None:
             self._last_work_phase = None
-            self.current_file = None
             deadlines = [deadline for tid, deadline in self._next_eligible.items()
                          if tid in task_map and task_map[tid].get("enabled") and deadline > now]
             return min(1, max(0, min(deadlines) - now)) if deadlines else 1
-        self._last_work_phase = (f"检查队列项 {item['id']}", time.monotonic())
-        try:
-            task = task_map.get(item["task_id"])
-            if task is None or db.get_task(item["task_id"]) is None:
-                logger.warning("孤儿队列清理：task_id=%s queue_id=%s", item["task_id"], item["id"])
-                db.cleanup_orphan_queue(item["id"])
-                return
-            if not task.get("enabled") or not self._in_run_window(task):
-                db.set_status(item["id"], "pending")
-                return
-        except Exception:
-            # 尚未开始传输，可安全释放认领；传输后的异常不可用同一策略处理。
-            self._unstarted_claims.add(item["id"])
+        self._execute_transfer(item, task_map)
+
+    def _claim_item(self, eligible_task_ids):
+        """原子认领一条队列项并登记任务占用；同一任务同时只允许一个在途迁移。"""
+        with self._stats_lock:
+            item = db.take_next_pending(eligible_task_ids)
+            if item is None:
+                return None
+            if item["task_id"] in self._busy_tasks:
+                conflict = True
+            else:
+                self._busy_tasks.add(item["task_id"])
+                conflict = False
+        if conflict:
+            # 另一个线程抢先开始了同一任务的迁移；回退本次认领，稍后重试。
             try:
                 db.release_unstarted_claim(item["id"])
             except Exception:
-                logger.exception("迁移前认领回退失败：queue_id=%s，待数据库恢复后重试", item["id"])
-            else:
-                self._unstarted_claims.discard(item["id"])
-            raise
+                self._unstarted_claims.add(item["id"])
+            return None
+        return item
 
-        self._last_work_phase = None
-        self.current_file = item["rel_path"]
-        started = time.monotonic()
-        logger.info("迁移开始：task_id=%s queue_id=%s 文件=%s 大小=%s 源=%s 目标=%s",
-                    item["task_id"], item["id"], item["rel_path"], item["size"],
-                    item["src_path"], item["dst_path"])
-        finished = threading.Event()
-        stage = ["检查源文件"]
-
-        def heartbeat():
-            while not finished.wait(self.HEARTBEAT_INTERVAL):
-                logger.warning("迁移仍在进行：task_id=%s queue_id=%s 文件=%s 阶段=%s 耗时=%.1fs",
-                               item["task_id"], item["id"], item["rel_path"], stage[0],
-                               time.monotonic() - started)
-
-        threading.Thread(target=heartbeat, name=f"fm-work-report-{item['id']}", daemon=True).start()
-        try:
-            # 无持久化凭证的 transferring 重启后回退；已删源不可重传或盲目补记。
-            transient_source_io = False
+    def _async_work_loop(self):
+        """异步迁移线程：只领取开启异步的任务，与串行迁移线程并行执行。"""
+        while not self._stop.is_set():
+            executed = False
             try:
-                source_stat = os.lstat(item["src_path"])
-            except FileNotFoundError:
-                result, detail = "conflict", "源文件缺失，可能迁移成功但记账丢失；需人工核查目标与记录"
-            except OSError as exc:
-                transient_source_io = exc.errno in (
-                    errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY)
-                if exc.errno == errno.EIO:
-                    item['_eio_origin'] = 'source'
-                result, detail = "failed", f"源路径读取失败，已保留待重试: {exc}"
-            else:
-                if not stat.S_ISREG(source_stat.st_mode):
-                    result, detail = "conflict", "源不是普通文件，可能是历史残留；需人工核查目标与记录"
-                else:
-                    try:
-                        stage[0] = "复制并校验目标"
-                        result, detail = transfer.transfer(item, task)
-                    except Exception as exc:
-                        logger.exception("迁移执行异常：task_id=%s queue_id=%s 文件=%s",
-                                         item["task_id"], item["id"], item["rel_path"])
-                        result, detail = "failed", f"迁移异常: {exc}"
-            duration_ms = int((time.monotonic() - started) * 1000)
-            stage[0] = "更新队列与记账"
-            if result == "success":
-                self.moved_today += 1
+                executed = self._async_work_once()
+            except Exception as exc:
+                logger.exception("异步迁移线程异常")
+                self.last_worker_error = str(exc)
+            if not executed:
+                self._work_wake.wait(timeout=1)
+                self._work_wake.clear()
+
+    def _async_work_once(self) -> bool:
+        # 扫描等待/进行中时暂停领取新文件，避免与目录枚举争抢慢挂载；
+        # 已在传输的异步文件不中断，会与扫描并行完成。
+        if self._scan_io_waiting.is_set():
+            return False
+        task_map = {t["id"]: t for t in db.list_tasks()}
+        now = time.monotonic()
+        eligible = [tid for tid, task in task_map.items() if task.get("enabled")
+                    and task.get("async_transfer")
+                    and tid not in self._scan_retry_at
+                    and tid not in self._busy_tasks
+                    and now >= self._next_eligible.get(tid, 0)
+                    and self._in_run_window(task) and self._task_paths_safe(task)]
+        if not eligible:
+            return False
+        item = self._claim_item(eligible)
+        if item is None:
+            return False
+        self._execute_transfer(item, task_map, track_phase=False)
+        return True
+
+    def _execute_transfer(self, item, task_map, track_phase=True):
+        """执行已认领队列项的迁移；串行与异步迁移线程共用。"""
+        with self._stats_lock:
+            self._busy_tasks.add(item["task_id"])
+        try:
+            if track_phase:
+                self._last_work_phase = (f"检查队列项 {item['id']}", time.monotonic())
+            try:
+                task = task_map.get(item["task_id"])
+                if task is None or db.get_task(item["task_id"]) is None:
+                    logger.warning("孤儿队列清理：task_id=%s queue_id=%s", item["task_id"], item["id"])
+                    db.cleanup_orphan_queue(item["id"])
+                    return
+                if not task.get("enabled") or not self._in_run_window(task):
+                    db.set_status(item["id"], "pending")
+                    return
+            except Exception:
+                # 尚未开始传输，可安全释放认领；传输后的异常不可用同一策略处理。
+                self._unstarted_claims.add(item["id"])
                 try:
-                    db.persist_accounting_pending(item['id'], item, item.get('_verified_target'))
-                except Exception as exc:
-                    self.last_accounting_error = f"凭证落盘失败 ({item['id']}): {exc}；保留 transferring 供人工核查"
-                    logger.exception("%s", self.last_accounting_error)
-                    detail += f"；{self.last_accounting_error}"
+                    db.release_unstarted_claim(item["id"])
+                except Exception:
+                    logger.exception("迁移前认领回退失败：queue_id=%s，待数据库恢复后重试", item["id"])
                 else:
+                    self._unstarted_claims.discard(item["id"])
+                raise
+
+            stage = ["检查源文件"]
+            with self._stats_lock:
+                self._current_transfers[item["id"]] = {
+                    "rel_path": item["rel_path"], "task_id": item["task_id"],
+                    "stage": stage[0]}
+
+            def report_stage(name):
+                stage[0] = name
+                with self._stats_lock:
+                    entry = self._current_transfers.get(item["id"])
+                    if entry is not None:
+                        entry["stage"] = name
+
+            if track_phase:
+                self._last_work_phase = None
+            started = time.monotonic()
+            logger.info("迁移开始：task_id=%s queue_id=%s 文件=%s 大小=%s 源=%s 目标=%s",
+                        item["task_id"], item["id"], item["rel_path"], item["size"],
+                        item["src_path"], item["dst_path"])
+            finished = threading.Event()
+
+            def heartbeat():
+                while not finished.wait(self.HEARTBEAT_INTERVAL):
+                    logger.warning("迁移仍在进行：task_id=%s queue_id=%s 文件=%s 阶段=%s 耗时=%.1fs",
+                                   item["task_id"], item["id"], item["rel_path"], stage[0],
+                                   time.monotonic() - started)
+
+            threading.Thread(target=heartbeat, name=f"fm-work-report-{item['id']}", daemon=True).start()
+            try:
+                # 无持久化凭证的 transferring 重启后回退；已删源不可重传或盲目补记。
+                transient_source_io = False
+                try:
+                    source_stat = os.lstat(item["src_path"])
+                except FileNotFoundError:
+                    result, detail = "conflict", "源文件缺失，可能迁移成功但记账丢失；需人工核查目标与记录"
+                except OSError as exc:
+                    transient_source_io = exc.errno in (
+                        errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY)
+                    if exc.errno == errno.EIO:
+                        item['_eio_origin'] = 'source'
+                    result, detail = "failed", f"源路径读取失败，已保留待重试: {exc}"
+                else:
+                    if not stat.S_ISREG(source_stat.st_mode):
+                        result, detail = "conflict", "源不是普通文件，可能是历史残留；需人工核查目标与记录"
+                    else:
+                        try:
+                            report_stage("复制并校验目标")
+                            result, detail = transfer.transfer(item, task, stage_cb=report_stage)
+                        except Exception as exc:
+                            logger.exception("迁移执行异常：task_id=%s queue_id=%s 文件=%s",
+                                             item["task_id"], item["id"], item["rel_path"])
+                            result, detail = "failed", f"迁移异常: {exc}"
+                duration_ms = int((time.monotonic() - started) * 1000)
+                report_stage("更新队列与记账")
+                if result == "success":
+                    with self._stats_lock:
+                        self.moved_today += 1
                     try:
-                        # 正常路径已有传输阶段全量读回，无需再读网盘。
-                        pending = db.get_accounting_pending(item['id'])
-                        self._verify_accounting(pending, task, rehash=False)
-                        db.complete_accounting(pending)
+                        db.persist_accounting_pending(item['id'], item, item.get('_verified_target'))
                     except Exception as exc:
-                        self.last_accounting_error = f"记账待补偿 ({item['id']}): {exc}"
+                        self.last_accounting_error = f"凭证落盘失败 ({item['id']}): {exc}；保留 transferring 供人工核查"
                         logger.exception("%s", self.last_accounting_error)
                         detail += f"；{self.last_accounting_error}"
                     else:
-                        self.last_accounting_error = None
-            elif result == "conflict":
-                db.set_status(item["id"], "conflict")
-            elif result == "failed":
-                if transient_source_io or item.get("_transient_io"):
-                    # 源/目标挂载 EIO 不消耗迁移重试额度，需成功扫描后才恢复写入。
-                    logger.warning("迁移暂停并等待扫描恢复：task_id=%s queue_id=%s 源=%s",
-                                   task["id"], item["id"], item["src_path"])
-                    self._pause_task_for_scan(task["id"])
-                    db.set_status(item["id"], "failed", next_retry_at=time.time() + 60)
-                    detail += "；挂载 I/O 故障，60s 后限速探测恢复"
-                    if item.get('_eio_origin'):
-                        excluded = db.record_eio_failure(task['id'], item['id'],
-                                                         item['rel_path'], item['_eio_origin'], detail)
-                        if excluded:
-                            detail += '；EIO 已自动加入精确排除项（源文件保留）'
-                            logger.warning("EIO 文件已自动排除：task_id=%s 文件=%s 类型=%s",
-                                           task['id'], item['rel_path'], item['_eio_origin'])
-                    self._log(item, duration_ms, "failed", detail)
-                    return
-                retries = item.get("retries", 0) + 1
-                cfg = config.get()
-                detail = f"[第{retries}次尝试] {detail}"
-                if retries <= cfg["max_retries"]:
-                    backoff = cfg["retry_backoff_seconds"]
-                    delay = backoff[min(retries - 1, len(backoff) - 1)]
-                    db.set_status(item["id"], "failed", retries=retries,
-                                  next_retry_at=time.time() + delay)
-                    detail += f"，{delay}s 后自动重试"
-                else:
-                    db.set_status(item["id"], "failed", retries=retries)
-                    detail += f"，已达最大重试次数({cfg['max_retries']})，等待手动重试"
-            # DB 将 success 日志索引成迁移凭证；未记账时不能授予该凭证。
-            log_result = "accounting_pending" if result == "success" and self.last_accounting_error else result
-            self._log(item, duration_ms, log_result, detail)
-            db.cleanup_orphan_queue(item["id"])
+                        try:
+                            # 正常路径已有传输阶段全量读回，无需再读网盘。
+                            pending = db.get_accounting_pending(item['id'])
+                            self._verify_accounting(pending, task, rehash=False)
+                            db.complete_accounting(pending)
+                        except Exception as exc:
+                            self.last_accounting_error = f"记账待补偿 ({item['id']}): {exc}"
+                            logger.exception("%s", self.last_accounting_error)
+                            detail += f"；{self.last_accounting_error}"
+                        else:
+                            self.last_accounting_error = None
+                elif result == "conflict":
+                    db.set_status(item["id"], "conflict")
+                elif result == "failed":
+                    if transient_source_io or item.get("_transient_io"):
+                        # 源/目标挂载 EIO 不消耗迁移重试额度，需成功扫描后才恢复写入。
+                        logger.warning("迁移暂停并等待扫描恢复：task_id=%s queue_id=%s 源=%s",
+                                       task["id"], item["id"], item["src_path"])
+                        self._pause_task_for_scan(task["id"])
+                        db.set_status(item["id"], "failed", next_retry_at=time.time() + 60)
+                        detail += "；挂载 I/O 故障，60s 后限速探测恢复"
+                        if item.get('_eio_origin'):
+                            excluded = db.record_eio_failure(task['id'], item['id'],
+                                                             item['rel_path'], item['_eio_origin'], detail)
+                            if excluded:
+                                detail += '；EIO 已自动加入精确排除项（源文件保留）'
+                                logger.warning("EIO 文件已自动排除：task_id=%s 文件=%s 类型=%s",
+                                               task['id'], item['rel_path'], item['_eio_origin'])
+                        self._log(item, duration_ms, "failed", detail)
+                        return
+                    retries = item.get("retries", 0) + 1
+                    cfg = config.get()
+                    detail = f"[第{retries}次尝试] {detail}"
+                    if retries <= cfg["max_retries"]:
+                        backoff = cfg["retry_backoff_seconds"]
+                        delay = backoff[min(retries - 1, len(backoff) - 1)]
+                        db.set_status(item["id"], "failed", retries=retries,
+                                      next_retry_at=time.time() + delay)
+                        detail += f"，{delay}s 后自动重试"
+                    else:
+                        db.set_status(item["id"], "failed", retries=retries)
+                        detail += f"，已达最大重试次数({cfg['max_retries']})，等待手动重试"
+                # DB 将 success 日志索引成迁移凭证；未记账时不能授予该凭证。
+                log_result = "accounting_pending" if result == "success" and self.last_accounting_error else result
+                self._log(item, duration_ms, log_result, detail)
+                db.cleanup_orphan_queue(item["id"])
+            finally:
+                finished.set()
+                with self._stats_lock:
+                    self._current_transfers.pop(item["id"], None)
+                interval = max(0.0, float(task.get("interval_seconds", 5)))
+                self._next_eligible[item["task_id"]] = time.monotonic() + interval
         finally:
-            finished.set()
-            self.current_file = None
-            interval = max(0.0, float(task.get("interval_seconds", 5)))
-            self._next_eligible[item["task_id"]] = time.monotonic() + interval
+            with self._stats_lock:
+                self._current_transfers.pop(item["id"], None)
+                self._busy_tasks.discard(item["task_id"])
 
 
 scheduler = Scheduler()

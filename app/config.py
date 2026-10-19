@@ -20,6 +20,7 @@ DEFAULTS = {
     "default_interval_seconds": 5,
     "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
     "douyin_nfo_enabled": False,  # 对无 nfo 的抖音视频自动生成简易 nfo
+    "max_async_transfers": 2,     # 异步迁移线程数：开启异步的任务可与其它任务并行迁移
 }
 
 _lock = threading.Lock()
@@ -31,7 +32,8 @@ def _validate(data: dict) -> None:
         raise ValueError("配置文件必须是 JSON 对象")
     bounds = {"scan_interval": (1, 86400), "stable_check_seconds": (0, 3600),
               "stable_quiet_seconds": (0, 86400),
-              "max_retries": (0, 100), "default_interval_seconds": (0, 86400)}
+              "max_retries": (0, 100), "default_interval_seconds": (0, 86400),
+              "max_async_transfers": (1, 8)}
     for key, (minimum, maximum) in bounds.items():
         if key in data:
             value = data[key]

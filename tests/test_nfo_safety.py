@@ -730,7 +730,7 @@ class NfoSafetyTests(unittest.TestCase):
         worker = scheduler.Scheduler()
         started, release, scanned = threading.Event(), threading.Event(), threading.Event()
 
-        def busy_transfer(*args):
+        def busy_transfer(*args, **kwargs):
             started.set()
             self.assertTrue(release.wait(2))
             return "failed", "temporary error"
@@ -2399,7 +2399,7 @@ class NfoSafetyTests(unittest.TestCase):
         worker.HEARTBEAT_INTERVAL = 0.01
         seen = threading.Event()
 
-        def slow_transfer(*args):
+        def slow_transfer(*args, **kwargs):
             self.assertTrue(seen.wait(2))
             return "failed", "temporary error"
 
@@ -3327,6 +3327,403 @@ class NfoSafetyTests(unittest.TestCase):
         (self.dst / "new.nfo").write_bytes(b"ok")
         db.record_migrated(1, "new.nfo", 2, str(self.dst / "new.nfo"))
         self.assertEqual(db.get_migrated_dst(1, "new.nfo"), str(self.dst / "new.nfo"))
+
+    def test_old_database_adds_lane_columns(self):
+        legacy = self.root / "legacy-lane.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, src_dir TEXT,"
+                         " dst_dir TEXT, enabled INTEGER)")
+        if db._conn is not None:
+            db._conn.close()
+        db.DB_PATH, db._conn = str(legacy), None
+        columns = {row[1] for row in db.get_conn().execute("PRAGMA table_info(tasks)")}
+        self.assertIn("manual_only", columns)
+        self.assertIn("async_transfer", columns)
+        # 旧库行默认不开启新开关
+        row = db.get_conn().execute("SELECT manual_only, async_transfer FROM tasks").fetchone()
+        self.assertIsNone(row)  # 空表仅验证列存在
+
+
+class LaneSchedulingTests(unittest.TestCase):
+    """异步迁移与仅手动扫描任务的调度行为回归测试。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.src = self.root / "src"
+        self.dst = self.root / "dst"
+        self.src.mkdir()
+        self.dst.mkdir()
+        self.old_db_path, self.old_conn = db.DB_PATH, db._conn
+        db.DB_PATH, db._conn = str(self.root / "test.db"), None
+        self.addCleanup(self.restore_db)
+        self.settings = dict(config.DEFAULTS, stable_check=False, stable_quiet_seconds=0,
+                             remove_empty_dirs=False, max_async_transfers=2)
+        get_config = patch.object(config, "get", return_value=self.settings)
+        get_config.start()
+        self.addCleanup(get_config.stop)
+        self.task = {
+            "id": 1, "src_dir": str(self.src), "dst_dir": str(self.dst),
+            "path_rule": "keep_structure", "conflict_policy": "skip",
+            "after_action": "delete",
+        }
+
+    def restore_db(self):
+        if db._conn is not None:
+            db._conn.close()
+        db.DB_PATH, db._conn = self.old_db_path, self.old_conn
+
+    def source(self, name="movie.mp4", content=b"video"):
+        path = self.src / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def test_manual_only_task_is_skipped_by_scan_loop(self):
+        task_id = db.create_task(dict(self.task, name="manual", enabled=True,
+                                      scan_interval=0.01, manual_only=True))
+        worker = scheduler.Scheduler()
+        # 手动触发（立即同步）仍然可用
+        manual = threading.Event()
+
+        def manual_scan(*args, **kwargs):
+            manual.set()
+            return {"enqueued": 0}
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", side_effect=manual_scan)):
+            worker.sync_now(task_id)
+            worker._process_sync_requests()
+        self.assertTrue(manual.is_set())
+        self.assertIsNone(worker.sync_progress[task_id].get("error"))
+        worker._stop.set()
+        worker._work_wake.set()
+
+        # 自动扫描循环不得触碰仅手动任务
+        scanned = threading.Event()
+        auto = scheduler.Scheduler()
+
+        def scan(*args, **kwargs):
+            scanned.set()
+            auto._stop.set()
+            return {"enqueued": 0}
+
+        with (patch.object(auto, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", side_effect=scan)):
+            thread = threading.Thread(target=auto._scan_loop)
+            thread.start()
+            self.assertFalse(scanned.wait(1.5), "仅手动扫描的任务不应被自动扫描")
+            auto._stop.set()
+            auto._scan_wake.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(scanned.is_set())
+
+    def test_async_task_is_not_transferred_by_serial_worker(self):
+        task_id = db.create_task(dict(self.task, name="async", enabled=True,
+                                      interval_seconds=0, async_transfer=True))
+        source = self.source()
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._work_once_locked()  # 串行线程不得领取异步任务
+            self.assertEqual(db.list_queue()[0]["status"], "pending")
+            self.assertTrue(worker._async_work_once())  # 异步线程完成迁移
+        self.assertEqual(db.queue_stats().get("done"), 1)
+        self.assertFalse(source.exists())
+        self.assertTrue((self.dst / source.name).exists())
+
+    def test_async_lane_transfers_one_file_per_task_at_a_time(self):
+        task_id = db.create_task(dict(self.task, name="async", enabled=True,
+                                      interval_seconds=0, async_transfer=True))
+        for name in ("a.mp4", "b.mp4"):
+            source = self.source(name, name.encode())
+            db.enqueue(task_id, str(source), name, str(self.dst / name), len(name))
+        worker = scheduler.Scheduler()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_transfer(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return "failed", "temporary error"
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(transfer, "transfer", side_effect=slow_transfer)):
+            first = threading.Thread(target=worker._async_work_once)
+            first.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                self.assertIn(task_id, worker._busy_tasks)
+                # 同一任务在途时，异步与串行线程都不得再领取它的下一个文件
+                self.assertFalse(worker._async_work_once())
+                self.assertEqual(db.queue_stats().get("pending"), 1)
+            finally:
+                release.set()
+                first.join(3)
+        self.assertFalse(first.is_alive())
+
+    def test_serial_worker_ignores_busy_async_task(self):
+        task_id = db.create_task(dict(self.task, name="mixed", enabled=True,
+                                      interval_seconds=0, async_transfer=True))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        worker = scheduler.Scheduler()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_transfer(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return "failed", "temporary error"
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(transfer, "transfer", side_effect=slow_transfer)):
+            first = threading.Thread(target=worker._async_work_once)
+            first.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                idle = worker._work_once_locked()
+                self.assertEqual(idle, 1)  # 无其他任务时返回空闲超时，不领取在途任务
+                self.assertEqual(db.queue_stats().get("transferring"), 1)
+            finally:
+                release.set()
+                first.join(3)
+        self.assertFalse(first.is_alive())
+
+    def test_transfer_reports_stage_to_callback(self):
+        task_id = db.create_task(dict(self.task, name="stage", enabled=True))
+        source = self.source("movie.mp4", b"video")
+        db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
+        item = db.take_next_pending(claim=False)
+        stages = []
+        result, detail = transfer.transfer(item, self.task, stage_cb=stages.append)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("复制并校验目标", stages)
+        self.assertIn("校验并删除源文件", stages)
+
+
+class VerifyModeTests(unittest.TestCase):
+    """校验强度（verify_mode）行为回归：strict 保持历史多轮读回，fast/off 提速。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.src = self.root / "src"
+        self.dst = self.root / "dst"
+        self.src.mkdir()
+        self.dst.mkdir()
+        self.old_db_path, self.old_conn = db.DB_PATH, db._conn
+        db.DB_PATH, db._conn = str(self.root / "test.db"), None
+        self.addCleanup(self.restore_db)
+        self.settings = dict(config.DEFAULTS, stable_check=False, stable_quiet_seconds=0,
+                             remove_empty_dirs=False)
+        get_config = patch.object(config, "get", return_value=self.settings)
+        get_config.start()
+        self.addCleanup(get_config.stop)
+        self.task = {
+            "id": 1, "src_dir": str(self.src), "dst_dir": str(self.dst),
+            "path_rule": "keep_structure", "conflict_policy": "skip",
+            "after_action": "delete", "verify_mode": "fast",
+        }
+
+    def restore_db(self):
+        if db._conn is not None:
+            db._conn.close()
+        db.DB_PATH, db._conn = self.old_db_path, self.old_conn
+
+    def video_item(self, name="movie.mp4", content=b"0123456789" * 100):
+        path = self.src / name
+        path.write_bytes(content)
+        db.enqueue(self.task["id"], str(path), name, str(self.dst / name), len(content))
+        return db.take_next_pending(claim=False), content
+
+    def _counting_hashes(self, counts, hashed_names=None):
+        real_fd, real_sha = transfer._fd_digest, transfer._sha256
+
+        def counting_fd(fd):
+            counts["fd"] += 1
+            return real_fd(fd)
+
+        def counting_sha(path):
+            counts["sha"] += 1
+            if hashed_names is not None:
+                hashed_names.append(os.path.basename(path))
+            return real_sha(path)
+
+        return counting_fd, counting_sha
+
+    def test_strict_mode_keeps_double_readback_and_staging(self):
+        task = dict(self.task, verify_mode="strict")
+        item, content = self.video_item()
+        counts, hashed = {"fd": 0, "sha": 0}, []
+        fd_cb, sha_cb = self._counting_hashes(counts, hashed)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual(counts["fd"], 2)    # 临时文件 + 发布后目标各读回一次
+        self.assertEqual(counts["sha"], 2)   # 暂存源 + 目标内容核对
+        self.assertTrue(any(name.startswith(".fm-source-") for name in hashed))
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        self.assertEqual(list(self.src.iterdir()), [])  # 暂存文件已随删除清理
+
+    def test_fast_mode_single_readback_without_staging(self):
+        item, content = self.video_item()
+        counts = {"fd": 0, "sha": 0}
+        fd_cb, sha_cb = self._counting_hashes(counts)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual(counts["fd"], 1)   # 仅发布后读回一次
+        self.assertEqual(counts["sha"], 0)  # 不再暂存重读源/目标
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        self.assertEqual(list(self.src.iterdir()), [])  # 源目录无 .moving 残留
+
+    def test_fast_mode_failed_readback_keeps_source(self):
+        item, content = self.video_item()
+
+        def bad_digest(fd):
+            os.close(fd)
+            return 1, "bad"
+
+        with patch.object(transfer, "_fd_digest", side_effect=bad_digest):
+            result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "failed", detail)
+        self.assertEqual(Path(item["src_path"]).read_bytes(), content)
+        self.assertEqual(list(self.dst.glob(".fm-*.moving")), [])  # 临时文件已清理
+
+    def test_off_mode_never_reads_back_content(self):
+        task = dict(self.task, verify_mode="off")
+        item, content = self.video_item()
+
+        def no_read(*args, **kwargs):
+            raise AssertionError("off 模式不应读取文件内容")
+
+        with (patch.object(transfer, "_fd_digest", side_effect=no_read),
+              patch.object(transfer, "_sha256", side_effect=no_read)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+
+    def test_off_mode_keep_source_skips_rehash(self):
+        task = dict(self.task, verify_mode="off", after_action="keep")
+        item, content = self.video_item()
+
+        def no_read(*args, **kwargs):
+            raise AssertionError("off 模式不应读取文件内容")
+
+        with (patch.object(transfer, "_fd_digest", side_effect=no_read),
+              patch.object(transfer, "_sha256", side_effect=no_read)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertTrue(Path(item["src_path"]).exists())
+        self.assertEqual(Path(item["src_path"]).read_bytes(), content)
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+
+    def test_fast_mode_keep_source_skips_rehash(self):
+        task = dict(self.task, after_action="keep")
+        item, content = self.video_item()
+        counts = {"fd": 0, "sha": 0}
+        fd_cb, sha_cb = self._counting_hashes(counts)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual(counts["fd"], 1)
+        self.assertEqual(counts["sha"], 0)
+        self.assertTrue(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+
+    def test_unknown_verify_mode_falls_back_to_strict(self):
+        task = dict(self.task, verify_mode="bogus")
+        item, _ = self.video_item()
+        counts = {"fd": 0, "sha": 0}
+        fd_cb, sha_cb = self._counting_hashes(counts)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual(counts["fd"], 2)  # strict 的两轮读回
+
+    def test_nfo_always_uses_strict_verification(self):
+        task = dict(self.task, verify_mode="off")
+        src = self.src / "show.nfo"
+        src.write_bytes(b"<tvshow/>")
+        db.enqueue(task["id"], str(src), src.name, str(self.dst / src.name), len(b"<tvshow/>"))
+        item = db.take_next_pending(claim=False)
+        counts, hashed = {"fd": 0, "sha": 0}, []
+        fd_cb, sha_cb = self._counting_hashes(counts, hashed)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(src.exists())
+        self.assertTrue(any(name.startswith(".fm-source-") for name in hashed))
+
+    def test_stale_temp_files_cleaned_in_destination(self):
+        item, _ = self.video_item()
+        stale = self.dst / ".fm-deadbeef.moving"
+        stale.write_bytes(b"junk")
+        fresh = self.dst / ".fm-fresh.moving"
+        fresh.write_bytes(b"junk")
+        backup = self.dst / ".fm-old.backup"
+        backup.write_bytes(b"old target")
+        aged = time.time() - 25 * 3600
+        os.utime(stale, (aged, aged))
+        os.utime(backup, (aged, aged))
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())      # 传输中的临时文件不受影响
+        self.assertTrue(backup.exists())     # 覆盖失败备份是用户数据，不清理
+
+    def test_scanner_cleans_stale_source_staging(self):
+        stale = self.src / ".fm-source-abc123.moving"
+        stale.write_bytes(b"stale staging")
+        fresh = self.src / ".fm-source-def456.moving"
+        fresh.write_bytes(b"fresh staging")
+        aged = time.time() - 25 * 3600
+        os.utime(stale, (aged, aged))
+        scanner.scan_task(self.task, skip_stable_check=True)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_old_database_adds_verify_mode_column(self):
+        legacy = self.root / "legacy-verify.db"
+        with sqlite3.connect(legacy) as conn:
+            # 与上一版本 tasks 表一致的完整结构（不含 verify_mode）。
+            conn.execute("""CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                src_dir TEXT NOT NULL, dst_dir TEXT NOT NULL,
+                interval_seconds REAL NOT NULL DEFAULT 5,
+                scan_interval INTEGER NOT NULL DEFAULT 30,
+                include_patterns TEXT DEFAULT '', exclude_patterns TEXT DEFAULT '',
+                conflict_policy TEXT NOT NULL DEFAULT 'skip',
+                path_rule TEXT NOT NULL DEFAULT 'keep_structure',
+                after_action TEXT NOT NULL DEFAULT 'delete',
+                run_windows TEXT NOT NULL DEFAULT '',
+                filename_nfo_enabled INTEGER NOT NULL DEFAULT 0,
+                manual_only INTEGER NOT NULL DEFAULT 0,
+                async_transfer INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                rule_epoch INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        if db._conn is not None:
+            db._conn.close()
+        db.DB_PATH, db._conn = str(legacy), None
+        columns = {row[1] for row in db.get_conn().execute("PRAGMA table_info(tasks)")}
+        self.assertIn("verify_mode", columns)
+        task_id = db.create_task({"name": "v", "src_dir": str(self.src) + "-v",
+                                  "dst_dir": str(self.dst) + "-v"})
+        self.assertEqual(db.get_task(task_id)["verify_mode"], "strict")
+        fast_id = db.create_task({"name": "f", "src_dir": str(self.src) + "-f",
+                                  "dst_dir": str(self.dst) + "-f", "verify_mode": "fast"})
+        self.assertEqual(db.get_task(fast_id)["verify_mode"], "fast")
 
 
 if __name__ == "__main__":

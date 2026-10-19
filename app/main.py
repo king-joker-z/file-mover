@@ -78,6 +78,13 @@ class TaskIn(BaseModel):
     # 运行周期：空 = 全天运行；否则窗口内运行，如 "01:00-07:00"，可多段逗号分隔
     run_windows: str = ""
     filename_nfo_enabled: bool = False
+    # 仅手动扫描：开启后任务不参与自动定时扫描，只能通过「立即扫描」手动触发
+    manual_only: bool = False
+    # 异步迁移：开启后该任务的文件与其它任务并行迁移，适合超大文件不堵塞其它任务
+    async_transfer: bool = False
+    # 校验强度：strict=多轮读回+删除前暂存（最稳）；fast=单次读回无暂存（大文件推荐）；
+    # off=不读回仅核对大小（最快，信任网盘写入）。NFO 小文件始终按 strict 处理。
+    verify_mode: Literal["strict", "fast", "off"] = "strict"
 
     @field_validator("run_windows")
     @classmethod
@@ -118,6 +125,8 @@ class SettingsIn(BaseModel):
     default_interval_seconds: Optional[float] = Field(default=None, ge=0, le=86400, allow_inf_nan=False)
     nfo_fix_enabled: Optional[bool] = None
     douyin_nfo_enabled: Optional[bool] = None
+    # 异步迁移线程数：开启异步的任务可与其它任务并行迁移的最大线程数
+    max_async_transfers: Optional[int] = Field(default=None, ge=1, le=8)
 
 
 class ExcludePatternIn(BaseModel):

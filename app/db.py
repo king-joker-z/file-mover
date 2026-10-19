@@ -8,6 +8,14 @@ import os
 from typing import Optional
 DB_PATH = os.environ.get("FILEMOVER_DB", "/app/config/app.db")
 
+# 任务校验强度：strict 多轮读回+删除前暂存；fast 单次读回无暂存；off 不读回仅核对大小
+VERIFY_MODES = ("strict", "fast", "off")
+
+
+def normalize_verify_mode(value) -> str:
+    """校验强度取值归一；缺失/未知值回退到最稳妥的 strict。"""
+    return value if value in VERIFY_MODES else "strict"
+
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
 _init_lock = threading.Lock()
@@ -111,6 +119,9 @@ def _init_schema(conn: sqlite3.Connection):
             after_action TEXT NOT NULL DEFAULT 'delete',
             run_windows TEXT NOT NULL DEFAULT '',
             filename_nfo_enabled INTEGER NOT NULL DEFAULT 0,
+            manual_only INTEGER NOT NULL DEFAULT 0,
+            async_transfer INTEGER NOT NULL DEFAULT 0,
+            verify_mode TEXT NOT NULL DEFAULT 'strict',
             enabled INTEGER NOT NULL DEFAULT 1,
             rule_epoch INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -214,6 +225,12 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks DROP COLUMN symlink_enabled")
     if "filename_nfo_enabled" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN filename_nfo_enabled INTEGER NOT NULL DEFAULT 0")
+    if "manual_only" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN manual_only INTEGER NOT NULL DEFAULT 0")
+    if "async_transfer" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN async_transfer INTEGER NOT NULL DEFAULT 0")
+    if "verify_mode" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN verify_mode TEXT NOT NULL DEFAULT 'strict'")
     if "rule_epoch" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN rule_epoch INTEGER NOT NULL DEFAULT 0")
     conn.commit()
@@ -299,13 +316,17 @@ def create_task(data: dict) -> int:
         cur = conn.execute(
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
-               run_windows, filename_nfo_enabled, enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               run_windows, filename_nfo_enabled, manual_only, async_transfer, verify_mode,
+               enabled, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
              data.get("path_rule", "keep_structure"), data.get("after_action", "delete"),
              data.get("run_windows", ""), 1 if data.get("filename_nfo_enabled") else 0,
+             1 if data.get("manual_only") else 0,
+             1 if data.get("async_transfer") else 0,
+             normalize_verify_mode(data.get("verify_mode")),
              1 if data.get("enabled", True) else 0, now_str(), now_str()))
         return cur.lastrowid
 
@@ -316,10 +337,11 @@ def update_task(task_id: int, data: dict):
     for k in ("name", "src_dir", "dst_dir", "interval_seconds", "scan_interval",
               "include_patterns", "exclude_patterns", "conflict_policy",
               "path_rule", "after_action", "run_windows",
-              "filename_nfo_enabled", "enabled"):
+              "filename_nfo_enabled", "manual_only", "async_transfer", "verify_mode",
+              "enabled"):
         if k in data:
             fields.append(f"{k}=?")
-            vals.append(data[k])
+            vals.append(normalize_verify_mode(data[k]) if k == "verify_mode" else data[k])
     if not fields:
         return
     fields.append("updated_at=?")
