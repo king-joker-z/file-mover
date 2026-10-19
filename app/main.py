@@ -610,14 +610,22 @@ def api_update_settings(data: SettingsIn):
 
 WEB_DIST = os.environ.get("FILEMOVER_WEB", "/app/web/dist")
 
+class NoCacheStaticFiles(StaticFiles):
+    """静态资源使用协商缓存：文件更新后浏览器立即拿到新版本，未变则 304 复用。"""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
 if os.path.isdir(WEB_DIST):
     assets_dir = os.path.join(WEB_DIST, "assets")
     if os.path.isdir(assets_dir):
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+        app.mount("/assets", NoCacheStaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{path:path}")
     async def spa(path: str):
         full = os.path.join(WEB_DIST, path)
         if path and os.path.isfile(full) and os.path.commonpath([os.path.abspath(full), os.path.abspath(WEB_DIST)]) == os.path.abspath(WEB_DIST):
-            return FileResponse(full)
-        return FileResponse(os.path.join(WEB_DIST, "index.html"))
+            return FileResponse(full, headers={"Cache-Control": "no-cache"})
+        return FileResponse(os.path.join(WEB_DIST, "index.html"), headers={"Cache-Control": "no-cache"})
