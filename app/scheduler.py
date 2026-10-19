@@ -50,7 +50,7 @@ class Scheduler:
         self._accounting_blocked = set()  # 安全校验失败不在每次轮询重读网盘
         self._accounting_retry_at = {}  # 数据库暂不可用时限速重试
         self._unstarted_claims = set()  # DB 故障期间待释放的迁移前认领
-        self._busy_tasks = set()  # 有在途迁移的任务：同一任务同时只迁移一个文件
+        self._busy_tasks = {}  # task_id -> 在途迁移数；同一任务最多并发 transfer_workers 个
         self._stats_lock = threading.Lock()
         self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
 
@@ -325,6 +325,7 @@ class Scheduler:
                 "next_scan_at": next_scan,
                 "manual_only": bool(task.get("manual_only")),
                 "async_transfer": bool(task.get("async_transfer")),
+                "transfer_workers": db.normalize_transfer_workers(task.get("transfer_workers")),
                 "status": status, "request_id": progress.get("request_id") if running else None,
                 "backfill_nfo": bool(progress.get("backfill_nfo")) if running else False,
                 "backfill_checked": progress.get("backfill_checked", 0) if running else 0,
@@ -665,14 +666,16 @@ class Scheduler:
         # 开启异步的任务由异步线程池处理；串行线程只处理同步任务，
         # 这样超大文件（异步）不会阻塞其它任务的逐个迁移。
         self._last_work_phase = ("筛选可迁移任务", time.monotonic())
+        workers = {tid: db.normalize_transfer_workers(task.get("transfer_workers"))
+                   for tid, task in task_map.items()}
         eligible = [tid for tid, task in task_map.items() if task.get("enabled")
                     and not task.get("async_transfer")
                     and tid not in self._scan_retry_at
-                    and tid not in self._busy_tasks
+                    and self._busy_tasks.get(tid, 0) < workers[tid]
                     and now >= self._next_eligible.get(tid, 0)
                     and self._in_run_window(task) and self._task_paths_safe(task)]
         self._last_work_phase = ("领取待迁移文件", time.monotonic())
-        item = self._claim_item(eligible)
+        item = self._claim_item(eligible, workers)
         if item is None:
             self._last_work_phase = None
             deadlines = [deadline for tid, deadline in self._next_eligible.items()
@@ -680,16 +683,18 @@ class Scheduler:
             return min(1, max(0, min(deadlines) - now)) if deadlines else 1
         self._execute_transfer(item, task_map)
 
-    def _claim_item(self, eligible_task_ids):
-        """原子认领一条队列项并登记任务占用；同一任务同时只允许一个在途迁移。"""
+    def _claim_item(self, eligible_task_ids, workers=None):
+        """原子认领一条队列项并登记任务占用；同一任务最多 transfer_workers 个在途迁移。"""
+        if workers is None:
+            workers = {}
         with self._stats_lock:
             item = db.take_next_pending(eligible_task_ids)
             if item is None:
                 return None
-            if item["task_id"] in self._busy_tasks:
+            if self._busy_tasks.get(item["task_id"], 0) >= workers.get(item["task_id"], 1):
                 conflict = True
             else:
-                self._busy_tasks.add(item["task_id"])
+                self._busy_tasks[item["task_id"]] = self._busy_tasks.get(item["task_id"], 0) + 1
                 conflict = False
         if conflict:
             # 另一个线程抢先开始了同一任务的迁移；回退本次认领，稍后重试。
@@ -720,24 +725,27 @@ class Scheduler:
             return False
         task_map = {t["id"]: t for t in db.list_tasks()}
         now = time.monotonic()
+        workers = {tid: db.normalize_transfer_workers(task.get("transfer_workers"))
+                   for tid, task in task_map.items()}
         eligible = [tid for tid, task in task_map.items() if task.get("enabled")
                     and task.get("async_transfer")
                     and tid not in self._scan_retry_at
-                    and tid not in self._busy_tasks
+                    and self._busy_tasks.get(tid, 0) < workers[tid]
                     and now >= self._next_eligible.get(tid, 0)
                     and self._in_run_window(task) and self._task_paths_safe(task)]
         if not eligible:
             return False
-        item = self._claim_item(eligible)
+        item = self._claim_item(eligible, workers)
         if item is None:
             return False
         self._execute_transfer(item, task_map, track_phase=False)
         return True
 
     def _execute_transfer(self, item, task_map, track_phase=True):
-        """执行已认领队列项的迁移；串行与异步迁移线程共用。"""
-        with self._stats_lock:
-            self._busy_tasks.add(item["task_id"])
+        """执行已认领队列项的迁移；串行与异步迁移线程共用。
+
+        认领阶段（_claim_item）已登记任务占用计数，本函数退出时递减。
+        """
         try:
             if track_phase:
                 self._last_work_phase = (f"检查队列项 {item['id']}", time.monotonic())
@@ -880,7 +888,11 @@ class Scheduler:
         finally:
             with self._stats_lock:
                 self._current_transfers.pop(item["id"], None)
-                self._busy_tasks.discard(item["task_id"])
+                remaining = self._busy_tasks.get(item["task_id"], 1) - 1
+                if remaining > 0:
+                    self._busy_tasks[item["task_id"]] = remaining
+                else:
+                    self._busy_tasks.pop(item["task_id"], None)
 
 
 scheduler = Scheduler()

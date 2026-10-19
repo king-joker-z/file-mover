@@ -217,6 +217,8 @@ html[data-theme="dark"] .tag.accounting_pending{background:#0f3330;color:#4fc7c1
         <div class="row">
           <div class="field"><label>迁移方式（异步可与其它任务并行，适合超大文件）</label>
             <select id="f-async"><option value="0">同步：与其它任务依次迁移（默认）</option><option value="1">异步：与其它任务并行迁移，不阻塞其它任务</option></select></div>
+          <div class="field small"><label>并发迁移数（需异步，建议配合调大异步线程数）</label>
+            <select id="f-workers"><option value="1">1：串行（默认）</option><option value="2">2 个文件并行</option><option value="3">3 个文件并行</option><option value="4">4 个文件并行</option></select></div>
           <div class="field"><label>扫描方式（仅手动时不参与自动定时扫描）</label>
             <select id="f-manual"><option value="0">自动定时扫描（默认）</option><option value="1">仅手动扫描：等待「立即扫描」触发</option></select></div>
           <div class="field"><label>校验强度（大文件建议「快速」，源目录不会再出现 .moving 暂存）</label>
@@ -465,8 +467,8 @@ function renderScanSchedules(){
     const active=s.status==="manual"||s.status==="scanning";
     const detail=active?`${s.current||"扫描准备中"} · ${s.backfill_nfo&&s.backfill_total?`历史视频已检查 ${s.backfill_checked}/${s.backfill_total} · `:""}源目录已发现 ${s.scanned} · 新入队 ${s.enqueued}`:
       s.status==="cooldown"?"挂载 I/O 故障后等待重试":
-      s.status==="manual_wait"?`仅手动扫描：点「立即扫描」触发${s.async_transfer?" · 异步迁移":""}`:
-      `扫描间隔 ${s.interval_seconds} 秒${s.async_transfer?" · 异步迁移":""} · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
+      s.status==="manual_wait"?`仅手动扫描：点「立即扫描」触发${s.async_transfer?" · 异步迁移":""}${s.transfer_workers>1?" · 并发×"+s.transfer_workers:""}`:
+      `扫描间隔 ${s.interval_seconds} 秒${s.async_transfer?" · 异步迁移":""}${s.transfer_workers>1?" · 并发×"+s.transfer_workers:""} · ${s.last_scan_at?"上次扫描 "+new Date(s.last_scan_at*1000).toLocaleTimeString("zh-CN",{hour12:false}):"等待首次扫描"}`;
     const r=s.round;
     const roundBlock=r?`<div class="round-mini" style="cursor:pointer" title="点击查看轮次文件明细" onclick="openRoundDetail(${r.id})"><div class="round-mini-title">最近一轮 #${r.id} · ${roundState(r).label} ▸</div><div class="round-mini-stats"><span>总数 <b>${r.total}</b></span><span>视频 <b>${r.video_count}</b></span><span>NFO <b>${r.nfo_count}</b></span><span>图片 <b>${r.image_count}</b></span>${r.other_count?`<span>其他 <b>${r.other_count}</b></span>`:""}</div><div class="round-mini-time">上传耗时 <b data-round-elapsed="${s.id}">${roundElapsed(r)}</b> · 成功 ${r.success_count} / 失败 ${r.failed_count} / 冲突 ${r.conflict_count} / 取消 ${r.cancelled_count} / 待处理 ${r.remaining_count}</div></div>`:
       `<div class="round-mini"><div class="round-mini-title">当前暂无上传轮次</div><div class="round-mini-time">发现新文件并入队后开始统计</div></div>`;
@@ -616,7 +618,7 @@ async function loadTasks(){
     $("#task-list").innerHTML=`<div class="table-wrap"><table><tr><th>名称</th><th>源 → 目标</th><th>排除项</th><th>间隔</th><th>运行周期</th><th>策略</th><th>启用</th><th>操作</th></tr>`+
       tasks.map(t=>`<tr><td><b>${esc(t.name)}</b></td><td>${esc(t.src_dir)} → ${esc(t.dst_dir)}</td><td class="path-cell">${excCell(t)}</td>
         <td>${t.interval_seconds}s</td><td>${esc(t.run_windows||"全天")}</td>
-        <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.async_transfer?" · <b style=\"color:var(--primary)\" title=\"与其它任务并行迁移\">异步</b>":""}${t.manual_only?" · <b style=\"color:var(--warn)\" title=\"不参与自动定时扫描，需手动触发\">仅手动</b>":""}${t.verify_mode==="fast"?" · <b style=\"color:var(--primary)\" title=\"单次读回，无暂存文件，校验提速\">快速校验</b>":""}${t.verify_mode==="off"?" · <b style=\"color:var(--warn)\" title=\"不读回内容，仅核对大小，最快但信任网盘写入\">不读回</b>":""}${t.filename_nfo_enabled?" · NFO补全":""}</td>
+        <td>${{skip:"跳过",overwrite:"覆盖",rename:"重命名"}[t.conflict_policy]}${t.async_transfer?" · <b style=\"color:var(--primary)\" title=\"与其它任务并行迁移\">异步</b>":""}${t.transfer_workers>1?" · <b style=\"color:var(--primary)\" title=\"同一任务最多 "+t.transfer_workers+" 个文件同时迁移\">并发"+t.transfer_workers+"</b>":""}${t.manual_only?" · <b style=\"color:var(--warn)\" title=\"不参与自动定时扫描，需手动触发\">仅手动</b>":""}${t.verify_mode==="fast"?" · <b style=\"color:var(--primary)\" title=\"单次读回，无暂存文件，校验提速\">快速校验</b>":""}${t.verify_mode==="off"?" · <b style=\"color:var(--warn)\" title=\"不读回内容，仅核对大小，最快但信任网盘写入\">不读回</b>":""}${t.filename_nfo_enabled?" · NFO补全":""}</td>
         <td><label class="switch"><input type="checkbox" aria-label="启用任务 ${esc(t.name)}" ${t.enabled?"checked":""} onchange="toggleTask(${t.id},this)"><span class="slider"></span></label></td>
         <td><button class="btn small" onclick="editTask(${t.id})">编辑</button>
         <button class="btn small green" data-sync-id="${t.id}" onclick="syncNow(${t.id})">立即同步</button>
@@ -648,6 +650,7 @@ async function editTask(id){
   $("#f-after").value=t.after_action; $("#f-windows").value=t.run_windows||"";
   $("#f-filename-nfo").value = t.filename_nfo_enabled ? "1" : "0";
   $("#f-async").value = t.async_transfer ? "1" : "0";
+  $("#f-workers").value = String(t.transfer_workers || 1);
   $("#f-manual").value = t.manual_only ? "1" : "0";
   $("#f-verify").value = t.verify_mode || "strict";
   updateVerifyHint();
@@ -767,6 +770,7 @@ $("#task-form").onsubmit=async e=>{
     run_windows:$("#f-windows").value.trim(),
     filename_nfo_enabled:$("#f-filename-nfo").value==="1",
     async_transfer:$("#f-async").value==="1",
+    transfer_workers:+$("#f-workers").value||1,
     manual_only:$("#f-manual").value==="1",
     verify_mode:$("#f-verify").value||"strict"};
   try{

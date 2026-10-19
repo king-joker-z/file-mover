@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import config, db, douyin_nfo, scanner, scheduler, transfer
+from app.main import TaskIn
 
 
 class NfoSafetyTests(unittest.TestCase):
@@ -3339,6 +3340,7 @@ class NfoSafetyTests(unittest.TestCase):
         columns = {row[1] for row in db.get_conn().execute("PRAGMA table_info(tasks)")}
         self.assertIn("manual_only", columns)
         self.assertIn("async_transfer", columns)
+        self.assertIn("transfer_workers", columns)
         # 旧库行默认不开启新开关
         row = db.get_conn().execute("SELECT manual_only, async_transfer FROM tasks").fetchone()
         self.assertIsNone(row)  # 空表仅验证列存在
@@ -3462,6 +3464,56 @@ class LaneSchedulingTests(unittest.TestCase):
                 release.set()
                 first.join(3)
         self.assertFalse(first.is_alive())
+
+    def test_transfer_workers_allow_parallel_files_per_task(self):
+        """transfer_workers>1 时，同一任务可同时迁移多个文件，达到上限后拒绝再领取。"""
+        task_id = db.create_task(dict(self.task, name="parallel", enabled=True,
+                                      interval_seconds=0, async_transfer=True,
+                                      transfer_workers=2))
+        for name in ("a.mp4", "b.mp4"):
+            source = self.source(name, name.encode())
+            db.enqueue(task_id, str(source), name, str(self.dst / name), len(name))
+        worker = scheduler.Scheduler()
+        first_entered, second_entered = threading.Event(), threading.Event()
+        release = threading.Event()
+        state = {"count": 0}
+        lock = threading.Lock()
+
+        def slow_transfer(item, task, *args, **kwargs):
+            with lock:
+                state["count"] += 1
+                (first_entered if state["count"] == 1 else second_entered).set()
+            self.assertTrue(release.wait(3))
+            return "failed", "temporary error"
+
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(transfer, "transfer", side_effect=slow_transfer)):
+            first = threading.Thread(target=worker._async_work_once)
+            first.start()
+            self.assertTrue(first_entered.wait(2))
+            second = threading.Thread(target=worker._async_work_once)
+            second.start()
+            try:
+                self.assertTrue(second_entered.wait(2), "并发 2 时第二个文件应同时进入迁移")
+                self.assertEqual(worker._busy_tasks.get(task_id), 2)
+                self.assertEqual(db.queue_stats().get("transferring"), 2)
+                # 已达并发上限：不得再领取该任务的下一个文件
+                self.assertFalse(worker._async_work_once())
+            finally:
+                release.set()
+                first.join(3)
+                second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertNotIn(task_id, worker._busy_tasks)
+
+    def test_transfer_workers_out_of_range_is_rejected(self):
+        # pydantic 校验：0 与 5 都非法，默认 1
+        with self.assertRaises(Exception):
+            TaskIn(name="t", src_dir="/a", dst_dir="/b", transfer_workers=5)
+        with self.assertRaises(Exception):
+            TaskIn(name="t", src_dir="/a", dst_dir="/b", transfer_workers=0)
+        self.assertEqual(TaskIn(name="t", src_dir="/a", dst_dir="/b").transfer_workers, 1)
 
     def test_serial_worker_ignores_busy_async_task(self):
         task_id = db.create_task(dict(self.task, name="mixed", enabled=True,

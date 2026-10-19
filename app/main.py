@@ -82,6 +82,9 @@ class TaskIn(BaseModel):
     manual_only: bool = False
     # 异步迁移：开启后该任务的文件与其它任务并行迁移，适合超大文件不堵塞其它任务
     async_transfer: bool = False
+    # 任务内并发迁移数：同一任务同时迁移的文件数（需开启异步迁移），
+    # 大量中小文件或网盘单连接限速时，2-4 并发可显著提升总吞吐
+    transfer_workers: int = Field(default=1, ge=1, le=4)
     # 校验强度：strict=多轮读回+删除前暂存（最稳）；fast=单次读回无暂存（大文件推荐）；
     # off=不读回仅核对大小（最快，信任网盘写入）。NFO 小文件始终按 strict 处理。
     verify_mode: Literal["strict", "fast", "off"] = "strict"

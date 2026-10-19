@@ -121,6 +121,7 @@ def _init_schema(conn: sqlite3.Connection):
             filename_nfo_enabled INTEGER NOT NULL DEFAULT 0,
             manual_only INTEGER NOT NULL DEFAULT 0,
             async_transfer INTEGER NOT NULL DEFAULT 0,
+            transfer_workers INTEGER NOT NULL DEFAULT 1,
             verify_mode TEXT NOT NULL DEFAULT 'strict',
             enabled INTEGER NOT NULL DEFAULT 1,
             rule_epoch INTEGER NOT NULL DEFAULT 0,
@@ -231,6 +232,8 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks ADD COLUMN async_transfer INTEGER NOT NULL DEFAULT 0")
     if "verify_mode" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN verify_mode TEXT NOT NULL DEFAULT 'strict'")
+    if "transfer_workers" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN transfer_workers INTEGER NOT NULL DEFAULT 1")
     if "rule_epoch" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN rule_epoch INTEGER NOT NULL DEFAULT 0")
     conn.commit()
@@ -307,6 +310,14 @@ def get_task(task_id: int):
         return dict(row) if row else None
 
 
+def normalize_transfer_workers(value) -> int:
+    """并发迁移数限制在 1-4；非法值回退 1。"""
+    try:
+        return max(1, min(4, int(value)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def create_task(data: dict) -> int:
     conn = get_conn()
     with _lock, conn:
@@ -316,9 +327,10 @@ def create_task(data: dict) -> int:
         cur = conn.execute(
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
-               run_windows, filename_nfo_enabled, manual_only, async_transfer, verify_mode,
+               run_windows, filename_nfo_enabled, manual_only, async_transfer,
+               transfer_workers, verify_mode,
                enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
@@ -326,6 +338,7 @@ def create_task(data: dict) -> int:
              data.get("run_windows", ""), 1 if data.get("filename_nfo_enabled") else 0,
              1 if data.get("manual_only") else 0,
              1 if data.get("async_transfer") else 0,
+             normalize_transfer_workers(data.get("transfer_workers")),
              normalize_verify_mode(data.get("verify_mode")),
              1 if data.get("enabled", True) else 0, now_str(), now_str()))
         return cur.lastrowid
@@ -337,11 +350,17 @@ def update_task(task_id: int, data: dict):
     for k in ("name", "src_dir", "dst_dir", "interval_seconds", "scan_interval",
               "include_patterns", "exclude_patterns", "conflict_policy",
               "path_rule", "after_action", "run_windows",
-              "filename_nfo_enabled", "manual_only", "async_transfer", "verify_mode",
+              "filename_nfo_enabled", "manual_only", "async_transfer",
+              "transfer_workers", "verify_mode",
               "enabled"):
         if k in data:
             fields.append(f"{k}=?")
-            vals.append(normalize_verify_mode(data[k]) if k == "verify_mode" else data[k])
+            if k == "verify_mode":
+                vals.append(normalize_verify_mode(data[k]))
+            elif k == "transfer_workers":
+                vals.append(normalize_transfer_workers(data[k]))
+            else:
+                vals.append(data[k])
     if not fields:
         return
     fields.append("updated_at=?")
