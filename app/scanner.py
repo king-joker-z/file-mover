@@ -191,7 +191,7 @@ def _backfill_migrated_nfo(task: dict, filename_format: bool, device: int,
                     before = os.fstat(stream.fileno())
                     if not stat.S_ISREG(before.st_mode) or before.st_size != size:
                         continue
-                    for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    for chunk in iter(lambda: stream.read(transfer.COPY_CHUNK_SIZE), b""):
                         checksum.update(chunk)
                     after = os.fstat(stream.fileno())
                 latest = os.lstat(dst)

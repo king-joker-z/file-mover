@@ -617,7 +617,7 @@ class Scheduler:
                 digest = hashlib.sha256() if rehash else None
                 if rehash:
                     with os.fdopen(os.dup(target_fd), 'rb') as stream:
-                        for chunk in iter(lambda: stream.read(1 << 20), b''):
+                        for chunk in iter(lambda: stream.read(transfer.COPY_CHUNK_SIZE), b''):
                             digest.update(chunk)
                 after = os.fstat(target_fd)
                 named = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)

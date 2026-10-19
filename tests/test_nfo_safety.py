@@ -2142,7 +2142,7 @@ class NfoSafetyTests(unittest.TestCase):
         def fail_published_readback(fd):
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == 1:
                 os.close(fd)
                 raise OSError("readback failed")
             return original_digest(fd)
@@ -3567,7 +3567,7 @@ class LaneSchedulingTests(unittest.TestCase):
 
 
 class VerifyModeTests(unittest.TestCase):
-    """校验强度（verify_mode）行为回归：strict 保持历史多轮读回，fast/off 提速。"""
+    """校验强度（verify_mode）行为回归：strict 发布后读回+删除前暂存，fast 单次读回，off 不读回。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -3617,7 +3617,7 @@ class VerifyModeTests(unittest.TestCase):
 
         return counting_fd, counting_sha
 
-    def test_strict_mode_keeps_double_readback_and_staging(self):
+    def test_strict_mode_keeps_staging_and_target_readback(self):
         task = dict(self.task, verify_mode="strict")
         item, content = self.video_item()
         counts, hashed = {"fd": 0, "sha": 0}, []
@@ -3626,7 +3626,7 @@ class VerifyModeTests(unittest.TestCase):
               patch.object(transfer, "_sha256", side_effect=sha_cb)):
             result, detail = transfer.transfer(item, task)
         self.assertEqual(result, "success", detail)
-        self.assertEqual(counts["fd"], 2)    # 临时文件 + 发布后目标各读回一次
+        self.assertEqual(counts["fd"], 1)    # 发布后目标读回一次；临时文件读回冗余已移除
         self.assertEqual(counts["sha"], 2)   # 暂存源 + 目标内容核对
         self.assertTrue(any(name.startswith(".fm-source-") for name in hashed))
         self.assertFalse(Path(item["src_path"]).exists())
@@ -3728,7 +3728,7 @@ class VerifyModeTests(unittest.TestCase):
               patch.object(transfer, "_sha256", side_effect=sha_cb)):
             result, detail = transfer.transfer(item, task)
         self.assertEqual(result, "success", detail)
-        self.assertEqual(counts["fd"], 2)  # strict 的两轮读回
+        self.assertEqual(counts["fd"], 1)  # strict 的发布后读回（与 fast 相同强度，仅多暂存核对）
 
     def test_nfo_always_uses_strict_verification(self):
         task = dict(self.task, verify_mode="off")

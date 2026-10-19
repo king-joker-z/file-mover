@@ -1,7 +1,8 @@
 """单文件迁移：按任务校验强度写入目标，再按任务策略处理源文件。
 
 校验强度 verify_mode：
-- strict: 临时文件读回 + 发布后读回 + 删除前暂存源/目标再读回（最稳，历史行为）。
+- strict: 发布后读回 + 删除前暂存源/目标再读回（最稳；发布后读回读的是同一 inode
+  或复制目标的全量内容，已覆盖写入校验能力，不再重复读回临时文件）。
 - fast:   仅发布后读回目标一次；删除源前不再暂存、不再重读（推荐大文件）。
 - off:    不读回内容，仅核对发布后大小；信任 fsync（最快）。
 NFO 小文件始终按 strict 处理。
@@ -11,6 +12,7 @@ import hashlib
 import logging
 import os
 import stat
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -20,9 +22,20 @@ from . import config, db, nfo_fix
 
 logger = logging.getLogger("uvicorn.error")
 
+# 复制/校验的读写块大小。网盘挂载（极空间 115、CloudDrive2 等）上每次 write/read
+# 都是一次跨网络的 RPC，大块能显著减少请求次数、提升吞吐；总流量不变，请求数
+# 更少对网盘侧也更友好。内存占用：每个传输线程一个块缓冲（8MB）。
+COPY_CHUNK_SIZE = 8 << 20
+
 # 残留临时/暂存文件超过该时长才会被自动清理；
 # 正在写入的临时文件 mtime 持续更新，不会被误删。
 STALE_TEMP_SECONDS = 24 * 3600
+# 同一目标目录两次残留临时文件扫描的最小间隔。网盘挂载上 scandir 是一次
+# 列目录网络请求，逐文件迁移时不应每个文件都枚举一次目标目录；残留清理
+# 本身针对的是 24 小时前的垃圾，延迟一个扫描间隔没有任何影响。
+STALE_TEMP_SCAN_INTERVAL = 600
+_stale_temp_scan_at: dict[str, float] = {}
+_stale_temp_lock = threading.Lock()
 
 
 def _size(path: str) -> int:
@@ -35,7 +48,7 @@ def _size(path: str) -> int:
 def _sha256(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
+        for chunk in iter(lambda: stream.read(COPY_CHUNK_SIZE), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -118,7 +131,7 @@ def _fd_digest(fd: int) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     with os.fdopen(fd, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
+        for chunk in iter(lambda: stream.read(COPY_CHUNK_SIZE), b""):
             size += len(chunk)
             digest.update(chunk)
     return size, digest.hexdigest()
@@ -138,11 +151,12 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     overwrite: bool = False, verify: str = "strict", progress_cb=None):
     """在固定的目录描述符内原子发布；verify 决定读回强度。
 
-    strict: 临时文件写入后读回一次，发布后再读回一次（目标全量读两遍，历史行为）。
-    fast:   跳过临时文件读回，仅在发布后读回目标一次（仍可发现写入损坏/截断）。
+    strict: 发布后读回目标一次（读的是硬链接/rename 后的同一 inode 或复制目标，
+            覆盖了临时文件读回的全部校验能力，不再重复读回），删除源前暂存再读回。
+    fast:   仅发布后读回目标一次（仍可发现写入损坏/截断），无暂存文件。
     off:    不读回内容，仅核对发布后大小；信任 fsync，速度最快。
     非覆盖策略不得抢占并发创建的目标。
-    progress_cb(copied, total)：按 1MB 块上报复制进度，供仪表盘展示速度/ETA。
+    progress_cb(copied, total)：按 COPY_CHUNK_SIZE 块上报复制进度，供仪表盘展示速度/ETA。
     """
     if verify not in ("strict", "fast", "off"):
         verify = "strict"
@@ -172,7 +186,7 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     copied = 0
                     try:
                         with open(source, "rb") as original:
-                            for chunk in iter(lambda: original.read(1 << 20), b""):
+                            for chunk in iter(lambda: original.read(COPY_CHUNK_SIZE), b""):
                                 stream.write(chunk)
                                 digest.update(chunk)
                                 expected_size += len(chunk)
@@ -184,11 +198,6 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                 stream.flush()
                 os.fsync(stream.fileno())
             expected_hash = digest.hexdigest()
-            if verify == "strict":
-                size, digest = _fd_digest(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
-                                                  dir_fd=parent_fd))
-                if (size, digest) != (expected_size, expected_hash):
-                    raise IOError("临时文件内容校验失败，源文件已保留")
             if not overwrite:
                 # 硬链接的 EEXIST 检查与发布不可分割；rename 也不得覆盖外部新文件。
                 try:
@@ -205,7 +214,7 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                             with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
                                                    dir_fd=parent_fd), "rb") as saved:
                                 copied = 0
-                                for chunk in iter(lambda: saved.read(1 << 20), b""):
+                                for chunk in iter(lambda: saved.read(COPY_CHUNK_SIZE), b""):
                                     destination.write(chunk)
                                     copied += len(chunk)
                                     _report_progress(progress_cb, copied, expected_size)
@@ -395,13 +404,19 @@ def _cleanup_stale_temps(directory: str):
 
     仅删除超过 24 小时未更新的临时文件；.fm-*.backup 是覆盖失败时保留的
     旧目标，属于用户数据，不在清理范围。
+    网盘挂载上 scandir 是一次列目录网络请求（高频列目录是网盘风控敏感操作），
+    因此按目录节流：同一目录一个扫描间隔内只枚举一次。
     """
+    now = time.time()
+    with _stale_temp_lock:
+        if now - _stale_temp_scan_at.get(directory, 0.0) < STALE_TEMP_SCAN_INTERVAL:
+            return
+        _stale_temp_scan_at[directory] = now
     try:
         with os.scandir(directory) as entries:
             entries = list(entries)
     except OSError:
         return
-    now = time.time()
     for entry in entries:
         name = entry.name
         if not (name.startswith(".fm-") and name.endswith(".moving")):
@@ -475,7 +490,7 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
     stage_cb 用于向调度器上报当前阶段（如“复制并校验目标”），
     便于仪表盘展示大文件长时间停留在校验环节的进度。
     progress_cb(copied, total) 用于上报复制进度字节，供仪表盘计算速度与 ETA。
-    task.verify_mode 决定读回强度：strict（默认，多轮读回+删除前暂存）、
+    task.verify_mode 决定读回强度：strict（默认，发布后读回+删除前暂存）、
     fast（单次读回，无暂存文件）、off（不读回，仅核对大小）；NFO 始终按 strict。
     """
     def _stage(name: str):

@@ -9,7 +9,7 @@ import os
 from typing import Optional
 DB_PATH = os.environ.get("FILEMOVER_DB", "/app/config/app.db")
 
-# 任务校验强度：strict 多轮读回+删除前暂存；fast 单次读回无暂存；off 不读回仅核对大小
+# 任务校验强度：strict 发布后读回+删除前暂存；fast 单次读回无暂存；off 不读回仅核对大小
 VERIFY_MODES = ("strict", "fast", "off")
 
 

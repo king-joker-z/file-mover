@@ -114,7 +114,7 @@ function taskCard(t) {
     `<span class="badge">${t.after_action === "delete" ? "迁移（删源）" : "复制（留源）"}</span>`,
     t.verify_mode === "fast" ? `<span class="badge accent" title="单次读回，无暂存文件，校验提速">快速校验</span>`
       : t.verify_mode === "off" ? `<span class="badge warn" title="不读回内容，仅核对大小，最快但信任网盘写入">不读回校验</span>`
-      : `<span class="badge ok" title="多轮读回 + 删除前暂存">严格校验</span>`,
+      : `<span class="badge ok" title="发布后读回 + 删除前暂存核对">严格校验</span>`,
     t.async_transfer ? `<span class="badge accent" title="与其它任务并行迁移">异步</span>` : "",
     t.transfer_workers > 1 ? `<span class="badge accent" title="同一任务最多 ${t.transfer_workers} 个文件同时迁移">并发×${t.transfer_workers}</span>` : "",
     t.manual_only ? `<span class="badge warn" title="不参与自动定时扫描，需手动触发">仅手动扫描</span>` : "",
@@ -280,7 +280,7 @@ function modalFormHtml(t) {
       </div>
       <div class="row">
         ${field("校验强度", `<select id="f-verify">
-            <option value="strict">严格：多轮读回 + 删除前暂存（默认）</option>
+            <option value="strict">严格：发布后读回 + 删除前暂存（默认）</option>
             <option value="fast">快速：单次读回，无暂存（大文件推荐）</option>
             <option value="off">极速：仅核对大小（信任网盘写入）</option></select>`)}
       </div>
