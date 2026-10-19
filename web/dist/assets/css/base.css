@@ -1,0 +1,67 @@
+/* ============================================================
+ * base.css — Reset 与基础排版
+ * ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 14px; }
+
+body {
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* 页面顶部光晕，随主题换色 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 46vh;
+  background: radial-gradient(ellipse 62% 100% at 82% -12%, var(--bg-glow), transparent 68%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+h1, h2, h3 { letter-spacing: -.02em; line-height: 1.35; }
+b { font-weight: 650; }
+
+button { font: inherit; color: inherit; }
+input, select, textarea { font: inherit; color: inherit; }
+
+a { color: var(--accent-ink); }
+
+::selection { background: var(--accent-soft); }
+
+/* 滚动条 */
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------- 通用文字工具 ---------- */
+.eyebrow {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .14em;
+  color: var(--accent-ink);
+  text-transform: uppercase;
+}
+.muted { color: var(--muted); }
+.log-detail { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .93em; }
+.spacer { flex: 1; }

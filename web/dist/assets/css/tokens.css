@@ -1,0 +1,162 @@
+/* ============================================================
+ * tokens.css — 设计令牌与主题定义
+ * 新增主题只需复制一份 [data-theme="..."] 块并替换变量值，
+ * 组件层永远只引用这里的语义变量。
+ * ============================================================ */
+
+/* ---------- 01 晨蓝（默认浅色） ---------- */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #eef2f7;
+  --bg-glow: rgba(120, 165, 255, .22);
+  --card: #ffffff;
+  --surface-2: #f5f8fc;      /* 次级表面：表头 / 输入框底 */
+  --surface-3: #e9f0fb;      /* 强调 hover / 选中 */
+  --text: #17283e;
+  --muted: #67788f;
+  --border: #dfe6f0;
+
+  --accent: #2f6bff;
+  --accent-strong: #1d4fd7;  /* 渐变深端 / 文字级主色 */
+  --accent-ink: #1d4fd7;
+  --accent-soft: #e9f0ff;    /* 主色浅底：active 标签 / 徽章 */
+  --brand-grad: linear-gradient(145deg, #1744a0, #3984ee);
+
+  --ok: #0e9f6e;
+  --ok-ink: #0b7c56;
+  --ok-soft: #e0f5ec;
+  --warn: #c47712;
+  --warn-ink: #96550a;
+  --warn-soft: #fdf1dc;
+  --err: #d64752;
+  --err-ink: #b32e3c;
+  --err-soft: #fde7e9;
+  --info-ink: #5b56d6;
+  --info-soft: #eae8fd;
+
+  --donut-empty: #dfe7f2;
+  --track: #eef2f7;
+
+  --shadow-card: 0 6px 24px rgba(23, 45, 89, .07);
+  --shadow-pop: 0 18px 44px rgba(23, 45, 89, .18);
+  --ring: rgba(47, 107, 255, .35);
+}
+
+/* ---------- 02 夜幕（深色） ---------- */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0d1420;
+  --bg-glow: rgba(56, 92, 255, .16);
+  --card: #151f33;
+  --surface-2: #1a2743;
+  --surface-3: #22345e;
+  --text: #dde6f5;
+  --muted: #8d9db8;
+  --border: #283754;
+
+  --accent: #7c9bff;
+  --accent-strong: #5b83f5;
+  --accent-ink: #a8c0ff;
+  --accent-soft: #22345e;
+  --brand-grad: linear-gradient(145deg, #1b3a8a, #4a7ae8);
+
+  --ok: #35c393;
+  --ok-ink: #54d3a3;
+  --ok-soft: #123529;
+  --warn: #e6a94e;
+  --warn-ink: #eec27f;
+  --warn-soft: #3a2c12;
+  --err: #f0717d;
+  --err-ink: #f599a1;
+  --err-soft: #3d1f27;
+  --info-ink: #a29bf5;
+  --info-soft: #2b2750;
+
+  --donut-empty: #263452;
+  --track: #232f4b;
+
+  --shadow-card: 0 6px 24px rgba(0, 0, 0, .35);
+  --shadow-pop: 0 18px 44px rgba(0, 0, 0, .5);
+  --ring: rgba(124, 155, 255, .4);
+}
+
+/* ---------- 03 暖沙（暖纸浅色） ---------- */
+[data-theme="paper"] {
+  color-scheme: light;
+
+  --bg: #f5f0e6;
+  --bg-glow: rgba(228, 178, 110, .25);
+  --card: #fffdf8;
+  --surface-2: #f7f1e5;
+  --surface-3: #f1e6d2;
+  --text: #3b2f21;
+  --muted: #8b7a62;
+  --border: #e7dcc7;
+
+  --accent: #b4713d;
+  --accent-strong: #96551e;
+  --accent-ink: #8f4f1d;
+  --accent-soft: #f7e8d5;
+  --brand-grad: linear-gradient(145deg, #8a4f22, #cd8b4e);
+
+  --ok: #6a994e;
+  --ok-ink: #4f7a38;
+  --ok-soft: #e9f2dd;
+  --warn: #b7791f;
+  --warn-ink: #8f5d12;
+  --warn-soft: #f9edd4;
+  --err: #c1554d;
+  --err-ink: #a03c34;
+  --err-soft: #fae3e0;
+  --info-ink: #7d5ba6;
+  --info-soft: #efe6f9;
+
+  --donut-empty: #ece2cd;
+  --track: #eee6d6;
+
+  --shadow-card: 0 6px 24px rgba(93, 70, 40, .09);
+  --shadow-pop: 0 18px 44px rgba(93, 70, 40, .2);
+  --ring: rgba(180, 113, 61, .35);
+}
+
+/* ---------- 04 青竹（冷绿浅色） ---------- */
+[data-theme="forest"] {
+  color-scheme: light;
+
+  --bg: #edf4f0;
+  --bg-glow: rgba(24, 138, 94, .16);
+  --card: #ffffff;
+  --surface-2: #f1f7f3;
+  --surface-3: #e1efe7;
+  --text: #1c3a2d;
+  --muted: #5f7d6d;
+  --border: #d7e7dd;
+
+  --accent: #188a5e;
+  --accent-strong: #0f6b47;
+  --accent-ink: #0f6b47;
+  --accent-soft: #ddf2e7;
+  --brand-grad: linear-gradient(145deg, #0c5c3d, #2aa876);
+
+  --ok: #0e9f6e;
+  --ok-ink: #0b7c56;
+  --ok-soft: #e0f5ec;
+  --warn: #b97324;
+  --warn-ink: #94591a;
+  --warn-soft: #fbf0dc;
+  --err: #d05258;
+  --err-ink: #ad3a40;
+  --err-soft: #fbe6e7;
+  --info-ink: #2f7fb8;
+  --info-soft: #e2f1fb;
+
+  --donut-empty: #dbe9e1;
+  --track: #e6f0ea;
+
+  --shadow-card: 0 6px 24px rgba(20, 70, 50, .08);
+  --shadow-pop: 0 18px 44px rgba(20, 70, 50, .18);
+  --ring: rgba(24, 138, 94, .35);
+}
