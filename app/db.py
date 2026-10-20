@@ -1060,8 +1060,15 @@ def clear_logs() -> int:
 
 # ---------- 数据保留策略 ----------
 
+_CLEANUP_BATCH = 2000  # 分批删除上限：大事务会把大量页写进 WAL，磁盘紧张时引发 disk I/O error
+
+
 def _wal_checkpoint(conn: sqlite3.Connection) -> None:
-    """大批量删除后截断 WAL，及时回收磁盘空间；失败不影响主流程。"""
+    """大批量删除后截断 WAL，及时回收磁盘空间；失败不影响主流程。
+
+    必须在所有写事务提交后调用：事务内 TRUNCATE 会因未提交 WAL 帧而失败，
+    在共享内存异常的文件系统上还可能污染连接状态。
+    """
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.Error:
@@ -1073,39 +1080,59 @@ def cleanup_expired(log_days: int, round_days: int) -> dict:
 
     日志删除前，先把被删成功记录按日聚合写入 trend_daily，趋势图不因
     日志老化而归零；trend_daily 体积固定为每天一行，远小于明细日志。
+    分小事务逐批删除，避免 WAL 暴涨占满磁盘；每批「先聚合后删除」
+    在同一事务内完成，中断也不会丢趋势数据或重复聚合。
     未完结轮次（进行中/扫描中）与进行中的队列永不会被清理。
     """
     conn = get_conn()
     result = {"logs": 0, "rounds": 0, "round_files": 0}
     now = time.time()
-    with _lock, conn:
-        if round_days > 0:
-            round_cutoff = now - round_days * 86400
-            rounds = conn.execute(
-                "SELECT id FROM upload_rounds WHERE finished_at IS NOT NULL AND finished_at < ?",
-                (round_cutoff,)).fetchall()
-            if rounds:
-                ids = [row["id"] for row in rounds]
+    if round_days > 0:
+        round_cutoff = now - round_days * 86400
+        while True:
+            with _lock, conn:
+                ids = [row["id"] for row in conn.execute(
+                    "SELECT id FROM upload_rounds WHERE finished_at IS NOT NULL"
+                    " AND finished_at < ? ORDER BY id LIMIT ?",
+                    (round_cutoff, _CLEANUP_BATCH)).fetchall()]
+                if not ids:
+                    break
                 marks = ",".join("?" for _ in ids)
-                cur = conn.execute(f"DELETE FROM upload_round_files WHERE round_id IN ({marks})", ids)
-                result["round_files"] = cur.rowcount
+                cur = conn.execute(
+                    f"DELETE FROM upload_round_files WHERE round_id IN ({marks})", ids)
+                result["round_files"] += cur.rowcount
                 cur = conn.execute(f"DELETE FROM upload_rounds WHERE id IN ({marks})", ids)
-                result["rounds"] = cur.rowcount
-        if log_days > 0:
-            log_cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - log_days * 86400))
-            conn.execute(
-                """INSERT INTO trend_daily (day, files, bytes)
-                   SELECT substr(created_at, 1, 10) AS day, COUNT(*), COALESCE(SUM(size), 0)
-                   FROM logs WHERE result='success' AND created_at < ?
-                   GROUP BY day
-                   ON CONFLICT(day) DO UPDATE SET
-                     files=files+excluded.files, bytes=bytes+excluded.bytes""",
-                (log_cutoff,))
-            conn.execute("DELETE FROM log_destinations WHERE log_id IN"
-                         " (SELECT id FROM logs WHERE created_at < ?)", (log_cutoff,))
-            cur = conn.execute("DELETE FROM logs WHERE created_at < ?", (log_cutoff,))
-            result["logs"] = cur.rowcount
-        if result["logs"] or result["rounds"]:
+                result["rounds"] += cur.rowcount
+    if log_days > 0:
+        log_cutoff = time.strftime("%Y-%m-%d %H:%M:%S",
+                                   time.localtime(now - log_days * 86400))
+        # 先用时间索引定位边界 id；之后各批按主键升序推进，避免每批重复大范围排序。
+        with _lock:
+            row = conn.execute("SELECT MAX(id) FROM logs WHERE created_at < ?",
+                               (log_cutoff,)).fetchone()
+        max_id = row[0] if row else None
+        while max_id is not None:
+            with _lock, conn:
+                ids = [row["id"] for row in conn.execute(
+                    "SELECT id FROM logs WHERE id <= ? AND created_at < ?"
+                    " ORDER BY id LIMIT ?",
+                    (max_id, log_cutoff, _CLEANUP_BATCH)).fetchall()]
+                if not ids:
+                    break
+                marks = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"""INSERT INTO trend_daily (day, files, bytes)
+                        SELECT substr(created_at, 1, 10) AS day, COUNT(*), COALESCE(SUM(size), 0)
+                        FROM logs WHERE result='success' AND id IN ({marks})
+                        GROUP BY day
+                        ON CONFLICT(day) DO UPDATE SET
+                          files=files+excluded.files, bytes=bytes+excluded.bytes""",
+                    ids)
+                conn.execute(f"DELETE FROM log_destinations WHERE log_id IN ({marks})", ids)
+                cur = conn.execute(f"DELETE FROM logs WHERE id IN ({marks})", ids)
+                result["logs"] += cur.rowcount
+    if result["logs"] or result["rounds"]:
+        with _lock:  # 与其它线程串行使用连接；此时所有删除事务均已提交
             _wal_checkpoint(conn)
     return result
 

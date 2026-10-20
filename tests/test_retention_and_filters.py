@@ -95,6 +95,44 @@ class RetentionTests(unittest.TestCase):
         trend = {item["day"]: item for item in db.trend_by_day(365)}
         self.assertEqual(trend[old_day]["bytes"], 700)
 
+    def test_batched_deletion_across_many_batches(self):
+        """超过单批上限时分多批删除：结果与单批一致，且不重复聚合。"""
+        old_cache = db._CLEANUP_BATCH
+        db._CLEANUP_BATCH = 2
+        try:
+            for i in range(7):
+                self.add_log(age_days=300, size=10 + i)
+            self.add_log(age_days=1, size=1)
+            result = db.cleanup_expired(log_days=200, round_days=0)
+            self.assertEqual(result["logs"], 7)
+            self.assertEqual(db.count_logs(), 1)
+            old_day = time.strftime("%Y-%m-%d",
+                                    time.localtime(time.time() - 300 * 86400))
+            trend = {item["day"]: item for item in db.trend_by_day(365)}
+            self.assertEqual(trend[old_day]["files"], 7)
+            self.assertEqual(trend[old_day]["bytes"], sum(10 + i for i in range(7)))
+            # 二次清理不再重复聚合
+            db.cleanup_expired(log_days=200, round_days=0)
+            trend = {item["day"]: item for item in db.trend_by_day(365)}
+            self.assertEqual(trend[old_day]["files"], 7)
+        finally:
+            db._CLEANUP_BATCH = old_cache
+
+    def test_batched_round_deletion(self):
+        old_cache = db._CLEANUP_BATCH
+        db._CLEANUP_BATCH = 2
+        try:
+            old_rounds = [self.add_round(finished_days=200) for _ in range(5)]
+            active_round = self.add_round(finished_days=None)
+            result = db.cleanup_expired(log_days=0, round_days=100)
+            self.assertEqual(result["rounds"], 5)
+            self.assertEqual(result["round_files"], 5)
+            for round_id in old_rounds:
+                self.assertIsNone(db.get_round(round_id))
+            self.assertIsNotNone(db.get_round(active_round))
+        finally:
+            db._CLEANUP_BATCH = old_cache
+
 
 class TaskFilterTests(unittest.TestCase):
     def setUp(self):
