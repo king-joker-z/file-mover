@@ -3767,17 +3767,32 @@ class VerifyModeTests(unittest.TestCase):
         self.assertIn("原子转正发布 (rename)", stages)
         self.assertNotIn("复制转正发布（挂载不支持硬链接）", stages)
 
-    def test_exclusive_copy_fallback_when_rename_unsupported(self):
-        """renameat2 不可用时回退排他复制，发布语义不变。"""
+    def test_rename_fallback_when_renameat2_unsupported(self):
+        """renameat2 不可用时回退预检 + rename 转正：零数据拷贝，不写第二遍。"""
+        task = dict(self.task, verify_mode="off")
         item, content = self.video_item()
+        stages = []
+        fsync_calls = []
+        real_fsync = os.fsync
+
+        def counting_fsync(fd):
+            fsync_calls.append(fd)
+            return real_fsync(fd)
+
         with (patch.object(transfer.os, "link",
                            side_effect=OSError(errno.EOPNOTSUPP, "unsupported")),
-              patch.object(transfer, "_rename_noreplace", return_value=False)):
-            result, detail = transfer.transfer(item, self.task)
+              patch.object(transfer, "_rename_noreplace", return_value=False),
+              patch.object(transfer.os, "fsync", side_effect=counting_fsync)):
+            result, detail = transfer.transfer(item, task, stage_cb=stages.append)
         self.assertEqual(result, "success", detail)
         self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
         self.assertFalse(Path(item["src_path"]).exists())
         self.assertEqual(list(self.dst.glob(".fm-*.moving")), [])
+        # 走的是 rename 转正而非复制：仅写入临时文件时 fsync 一次，
+        # 复制转正分支会多一次目标写入 + 第二次 fsync。
+        self.assertEqual(len(fsync_calls), 1)
+        self.assertIn("转正发布 (rename 预检)", stages)
+        self.assertNotIn("复制转正发布（挂载不支持硬链接）", stages)
 
     def test_transfer_reports_fsync_and_readback_stages(self):
         item, _ = self.video_item()

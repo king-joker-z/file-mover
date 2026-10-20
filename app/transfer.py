@@ -1,8 +1,8 @@
 """单文件迁移：按任务校验强度写入目标，再按任务策略处理源文件。
 
 校验强度 verify_mode：
-- strict: 发布后读回 + 删除前暂存源/目标再读回（最稳；发布后读回读的是同一 inode
-  或复制目标的全量内容，已覆盖写入校验能力，不再重复读回临时文件）。
+- strict: 发布后读回 + 删除前暂存源/目标再读回（最稳；发布后读回读的是转正后
+  目标的同一 inode，全量内容覆盖写入校验能力，不再重复读回临时文件）。
 - fast:   仅发布后读回目标一次；删除源前不再暂存、不再重读（推荐大文件）。
 - off:    不读回内容，仅核对发布后大小；信任 fsync（最快）。
 NFO 小文件始终按 strict 处理。
@@ -205,8 +205,8 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     stage_cb=None):
     """在固定的目录描述符内原子发布；verify 决定读回强度。
 
-    strict: 发布后读回目标一次（读的是硬链接/rename 后的同一 inode 或复制目标，
-            覆盖了临时文件读回的全部校验能力，不再重复读回），删除源前暂存再读回。
+    strict: 发布后读回目标一次（读的是硬链接/rename 后的同一 inode，覆盖了临时
+            文件读回的全部校验能力，不再重复读回），删除源前暂存再读回。
     fast:   仅发布后读回目标一次（仍可发现写入损坏/截断），无暂存文件。
     off:    不读回内容，仅核对发布后大小；信任 fsync，速度最快。
     非覆盖策略不得抢占并发创建的目标。
@@ -261,30 +261,28 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                 except OSError as exc:
                     if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
                         raise
-                    # 网盘挂载通常不支持硬链接。优先 renameat2(NOREPLACE) 原子转正：
-                    # 不复制数据，避免把整个文件向挂载重复写第二遍；不支持时才回退。
+                    # 网盘挂载通常既不支持硬链接也不支持 renameat2(NOREPLACE)。
+                    # 优先 renameat2 原子转正：零数据拷贝；不支持时回退预检 + 同目录
+                    # rename——同样是零数据拷贝的元数据操作，避免把整个文件向挂载
+                    # 重复写第二遍（网盘挂载上这意味着整整多传一遍、耗时翻倍）。
                     _report_stage(stage_cb, "原子转正发布 (rename)")
                     if _rename_noreplace(parent_fd, tmp, parent_fd, name):
                         created = False  # 临时文件已转正为目标，不再存在
                     else:
-                        # 排他创建仍保护已有文件，但不保证可见性原子化。
-                        _report_stage(stage_cb, "复制转正发布（挂载不支持硬链接）")
-                        exclusive_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                               0o600, dir_fd=parent_fd)
+                        # rename 本身没有 NOREPLACE 语义，预检与 rename 之间存在极小
+                        # 的并发创建窗口；该窗口与覆盖流程最后一次校验和 os.replace
+                        # 之间的竞争同类，无法彻底消除。换取的收益是网盘挂载上少传
+                        # 一整遍文件，且排他写入 tmp 已保证绝大部分互斥语义。
+                        _report_stage(stage_cb, "转正发布 (rename 预检)")
                         try:
-                            with os.fdopen(exclusive_fd, "wb") as destination:
-                                with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
-                                                       dir_fd=parent_fd), "rb") as saved:
-                                    copied = 0
-                                    for chunk in iter(lambda: saved.read(COPY_CHUNK_SIZE), b""):
-                                        destination.write(chunk)
-                                        copied += len(chunk)
-                                        _report_progress(progress_cb, copied, expected_size)
-                                destination.flush()
-                                _report_stage(stage_cb, "等待挂载确认落盘 (fsync)")
-                                os.fsync(destination.fileno())
-                        except OSError as write_exc:
-                            raise IOError(f"目标写入不完整，源已保留；请核查 {dst}: {write_exc}") from write_exc
+                            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise FileExistsError(
+                                errno.EEXIST, os.strerror(errno.EEXIST), dst)
+                        os.rename(tmp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                        created = False  # 临时文件已转正为目标，不再存在
                 if verify == "off":
                     info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                     if created:
