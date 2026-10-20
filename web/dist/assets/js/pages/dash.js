@@ -362,6 +362,7 @@ function renderTransfers(files) {
   }
   if (!files.length) { box.innerHTML = ""; return; }
   const now = Date.now() / 1000 - store.serverClockOffset;
+  const keepScroll = box.scrollTop;   // 固定高度容器：3 秒重建后恢复滚动位置，避免阅读中断
   box.innerHTML = files.map(t => {
     const total = Number(t.total_bytes) || 0;
     const copied = Math.max(0, Number(t.copied_bytes) || 0);
@@ -388,6 +389,7 @@ function renderTransfers(files) {
       <div class="transfer-meta">${meta}</div>
     </div>`;
   }).join("");
+  box.scrollTop = keepScroll;
 }
 
 /* ================= 迁移趋势统计 ================= */

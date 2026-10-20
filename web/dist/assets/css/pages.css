@@ -132,7 +132,10 @@
   margin-top: 6px;
 }
 .status-warnings:empty { display: none; }
-.current { font-size: 14px; color: var(--text); font-weight: 600; margin-bottom: 6px; }
+.current {
+  font-size: 14px; color: var(--text); font-weight: 600; margin-bottom: 6px;
+  overflow-wrap: anywhere;   /* 长文件路径安全换行，不撑破面板 */
+}
 
 /* 最近一轮摘要 */
 .round-mini {
@@ -148,12 +151,21 @@
 .round-mini b { color: var(--text); }
 
 /* ---------- 仪表盘：迁移进度（速度 / ETA） ---------- */
+/* 迁移队列固定高度：进行中的条目在容器内滚动，
+   避免条目增减导致下方统计区跳动；空闲时收起不占位 */
 .transfer-list { display: grid; gap: 12px; margin: 2px 0 12px; }
+.transfer-list:not(:empty) {
+  height: 300px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  align-content: start;
+}
 .transfer-item {
   border: 1px solid var(--border);
   border-radius: 11px;
   background: var(--surface-2);
   padding: 12px 14px;
+  min-width: 0;   /* grid 子项默认 min-width:auto，长文件名会把轨道撑出屏幕 */
 }
 .transfer-head { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; }
 .transfer-name {
