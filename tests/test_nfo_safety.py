@@ -3745,6 +3745,48 @@ class VerifyModeTests(unittest.TestCase):
         self.assertFalse(src.exists())
         self.assertTrue(any(name.startswith(".fm-source-") for name in hashed))
 
+    def test_renameat2_publishes_without_second_copy(self):
+        """挂载不支持硬链接时优先 renameat2 原子转正：零复制，不再写第二遍。"""
+        task = dict(self.task, verify_mode="off")
+        item, content = self.video_item()
+
+        def fake_rename(src_fd, src_name, dst_fd, dst_name):
+            os.rename(self.dst / src_name, self.dst / dst_name)  # 真实转正
+            return True
+
+        stages = []
+        with (patch.object(transfer.os, "link",
+                           side_effect=OSError(errno.EOPNOTSUPP, "unsupported")),
+              patch.object(transfer, "_rename_noreplace", side_effect=fake_rename)):
+            result, detail = transfer.transfer(item, task, stage_cb=stages.append)
+        self.assertEqual(result, "success", detail)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        # tmp 已通过 rename 转正：无残留，且排他复制分支未执行（否则 O_EXCL 碰撞必然报错）
+        self.assertEqual(list(self.dst.glob(".fm-*.moving")), [])
+        self.assertIn("原子转正发布 (rename)", stages)
+        self.assertNotIn("复制转正发布（挂载不支持硬链接）", stages)
+
+    def test_exclusive_copy_fallback_when_rename_unsupported(self):
+        """renameat2 不可用时回退排他复制，发布语义不变。"""
+        item, content = self.video_item()
+        with (patch.object(transfer.os, "link",
+                           side_effect=OSError(errno.EOPNOTSUPP, "unsupported")),
+              patch.object(transfer, "_rename_noreplace", return_value=False)):
+            result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual(list(self.dst.glob(".fm-*.moving")), [])
+
+    def test_transfer_reports_fsync_and_readback_stages(self):
+        item, _ = self.video_item()
+        stages = []
+        result, detail = transfer.transfer(item, self.task, stage_cb=stages.append)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("等待挂载确认落盘 (fsync)", stages)
+        self.assertIn("读回校验目标内容", stages)
+
     def test_stale_temp_files_cleaned_in_destination(self):
         item, _ = self.video_item()
         stale = self.dst / ".fm-deadbeef.moving"

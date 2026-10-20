@@ -7,6 +7,7 @@
 - off:    不读回内容，仅核对发布后大小；信任 fsync（最快）。
 NFO 小文件始终按 strict 处理。
 """
+import ctypes
 import errno
 import hashlib
 import logging
@@ -36,6 +37,58 @@ STALE_TEMP_SECONDS = 24 * 3600
 STALE_TEMP_SCAN_INTERVAL = 600
 _stale_temp_scan_at: dict[str, float] = {}
 _stale_temp_lock = threading.Lock()
+
+# renameat2(RENAME_NOREPLACE) 仅 Linux（glibc ≥ 2.28 / musl）提供；
+# macOS 等平台加载不到符号时回退排他复制。
+_renameat2 = None
+
+
+def _load_renameat2():
+    global _renameat2
+    if _renameat2 is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            fn = libc.renameat2
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                           ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            _renameat2 = fn
+        except (OSError, AttributeError):
+            _renameat2 = False
+    return _renameat2
+
+
+def _rename_noreplace(src_fd: int, src_name: str, dst_fd: int, dst_name: str) -> bool:
+    """renameat2(RENAME_NOREPLACE) 原子转正：绝不覆盖已存在的目标。
+
+    True = 发布成功且临时文件已转正（无需也不能再清理）；
+    False = 平台/文件系统不支持，调用方回退排他复制；
+    目标被并发创建时抛 EEXIST，与排他创建语义一致。
+    """
+    fn = _load_renameat2()
+    if fn is False:
+        return False
+    while True:
+        result = fn(src_fd, os.fsencode(src_name), dst_fd, os.fsencode(dst_name), 1)
+        if result == 0:
+            return True
+        err = ctypes.get_errno()
+        if err == errno.EINTR:
+            continue
+        if err in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP,
+                   getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)):
+            return False
+        raise OSError(err, os.strerror(err), dst_name)
+
+
+def _report_stage(stage_cb, name: str) -> None:
+    """阶段上报；回调异常不得影响迁移本身。"""
+    if stage_cb is None:
+        return
+    try:
+        stage_cb(name)
+    except Exception:
+        pass
 
 
 def _size(path: str) -> int:
@@ -148,7 +201,8 @@ def _report_progress(progress_cb, copied: int, total) -> None:
 
 
 def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None,
-                    overwrite: bool = False, verify: str = "strict", progress_cb=None):
+                    overwrite: bool = False, verify: str = "strict", progress_cb=None,
+                    stage_cb=None):
     """在固定的目录描述符内原子发布；verify 决定读回强度。
 
     strict: 发布后读回目标一次（读的是硬链接/rename 后的同一 inode 或复制目标，
@@ -196,6 +250,7 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                         exc._filemover_eio_origin = 'source'
                         raise
                 stream.flush()
+                _report_stage(stage_cb, "等待挂载确认落盘 (fsync)")
                 os.fsync(stream.fileno())
             expected_hash = digest.hexdigest()
             if not overwrite:
@@ -206,33 +261,44 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                 except OSError as exc:
                     if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
                         raise
-                    # 某些网盘不支持硬链接：排他创建仍保护已有文件，但不保证可见性原子化。
-                    exclusive_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                           0o600, dir_fd=parent_fd)
-                    try:
-                        with os.fdopen(exclusive_fd, "wb") as destination:
-                            with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
-                                                   dir_fd=parent_fd), "rb") as saved:
-                                copied = 0
-                                for chunk in iter(lambda: saved.read(COPY_CHUNK_SIZE), b""):
-                                    destination.write(chunk)
-                                    copied += len(chunk)
-                                    _report_progress(progress_cb, copied, expected_size)
-                            destination.flush()
-                            os.fsync(destination.fileno())
-                    except OSError as write_exc:
-                        raise IOError(f"目标写入不完整，源已保留；请核查 {dst}: {write_exc}") from write_exc
+                    # 网盘挂载通常不支持硬链接。优先 renameat2(NOREPLACE) 原子转正：
+                    # 不复制数据，避免把整个文件向挂载重复写第二遍；不支持时才回退。
+                    _report_stage(stage_cb, "原子转正发布 (rename)")
+                    if _rename_noreplace(parent_fd, tmp, parent_fd, name):
+                        created = False  # 临时文件已转正为目标，不再存在
+                    else:
+                        # 排他创建仍保护已有文件，但不保证可见性原子化。
+                        _report_stage(stage_cb, "复制转正发布（挂载不支持硬链接）")
+                        exclusive_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                               0o600, dir_fd=parent_fd)
+                        try:
+                            with os.fdopen(exclusive_fd, "wb") as destination:
+                                with os.fdopen(os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW,
+                                                       dir_fd=parent_fd), "rb") as saved:
+                                    copied = 0
+                                    for chunk in iter(lambda: saved.read(COPY_CHUNK_SIZE), b""):
+                                        destination.write(chunk)
+                                        copied += len(chunk)
+                                        _report_progress(progress_cb, copied, expected_size)
+                                destination.flush()
+                                _report_stage(stage_cb, "等待挂载确认落盘 (fsync)")
+                                os.fsync(destination.fileno())
+                        except OSError as write_exc:
+                            raise IOError(f"目标写入不完整，源已保留；请核查 {dst}: {write_exc}") from write_exc
                 if verify == "off":
                     info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                    os.unlink(tmp, dir_fd=parent_fd)
-                    created = False
+                    if created:
+                        os.unlink(tmp, dir_fd=parent_fd)
+                        created = False
                     if info.st_size != expected_size:
                         raise IOError("目标文件大小与写入内容不符，源文件已保留")
                     return expected_hash
+                _report_stage(stage_cb, "读回校验目标内容")
                 size, digest = _fd_digest(os.open(name, os.O_RDONLY | os.O_NOFOLLOW,
                                                   dir_fd=parent_fd))
-                os.unlink(tmp, dir_fd=parent_fd)
-                created = False
+                if created:
+                    os.unlink(tmp, dir_fd=parent_fd)
+                    created = False
                 if (size, digest) != (expected_size, expected_hash):
                     raise IOError("目标文件读回校验失败，源文件已保留")
                 return expected_hash
@@ -285,8 +351,10 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                     pass
 
 
-def _write_nfo(dst: str, content: bytes, root: str = None, overwrite: bool = False):
-    _write_verified(dst, content=content, root=root, overwrite=overwrite)
+def _write_nfo(dst: str, content: bytes, root: str = None, overwrite: bool = False,
+               stage_cb=None):
+    _write_verified(dst, content=content, root=root, overwrite=overwrite,
+                    stage_cb=stage_cb)
 
 
 def _mount_identity(path: str):
@@ -642,7 +710,8 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
             target_device = _mount_identity(task["dst_dir"])
             wrote_target = not _verified_nfo(final_dst, content)
             if wrote_target:
-                _write_nfo(final_dst, content, root=task["dst_dir"], overwrite=how == "overwrite")
+                _write_nfo(final_dst, content, root=task["dst_dir"], overwrite=how == "overwrite",
+                           stage_cb=_stage)
             if not _verified_nfo(final_dst, content):
                 raise IOError("NFO 目标文件读回校验失败，源文件已保留")
             item["dst_path"] = final_dst
@@ -669,7 +738,7 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
         source_stat = os.lstat(src)
         source_hash = _write_verified(final_dst, source=src, root=task["dst_dir"],
                                       overwrite=how == "overwrite", verify=verify,
-                                      progress_cb=progress_cb)
+                                      progress_cb=progress_cb, stage_cb=_stage)
         item["dst_path"] = final_dst
         current_stat = os.lstat(src)
         identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
