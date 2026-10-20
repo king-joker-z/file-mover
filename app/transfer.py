@@ -606,7 +606,7 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
     verify = task.get("verify_mode") or "strict"
     if verify not in ("strict", "fast", "off"):
         verify = "strict"  # 未知取值按最稳妥的历史行为执行
-    direct_publish = bool(cfg.get("direct_publish"))
+    direct_publish = bool(task.get("direct_publish"))
     try:
         source_info = os.lstat(src)
     except FileNotFoundError:

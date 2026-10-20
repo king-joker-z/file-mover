@@ -124,6 +124,7 @@ def _init_schema(conn: sqlite3.Connection):
             async_transfer INTEGER NOT NULL DEFAULT 0,
             transfer_workers INTEGER NOT NULL DEFAULT 1,
             verify_mode TEXT NOT NULL DEFAULT 'strict',
+direct_publish INTEGER NOT NULL DEFAULT 0,
             min_size_mb REAL NOT NULL DEFAULT 0,
             max_size_mb REAL NOT NULL DEFAULT 0,
             min_age_minutes INTEGER NOT NULL DEFAULT 0,
@@ -242,6 +243,8 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks ADD COLUMN async_transfer INTEGER NOT NULL DEFAULT 0")
     if "verify_mode" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN verify_mode TEXT NOT NULL DEFAULT 'strict'")
+    if "direct_publish" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN direct_publish INTEGER NOT NULL DEFAULT 0")
     if "transfer_workers" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN transfer_workers INTEGER NOT NULL DEFAULT 1")
     if "rule_epoch" not in cols:
@@ -365,9 +368,9 @@ def create_task(data: dict) -> int:
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
                run_windows, filename_nfo_enabled, manual_only, async_transfer,
-               transfer_workers, verify_mode, min_size_mb, max_size_mb, min_age_minutes,
+               transfer_workers, verify_mode, direct_publish, min_size_mb, max_size_mb, min_age_minutes,
                enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
@@ -377,6 +380,7 @@ def create_task(data: dict) -> int:
              1 if data.get("async_transfer") else 0,
              normalize_transfer_workers(data.get("transfer_workers")),
              normalize_verify_mode(data.get("verify_mode")),
+             1 if data.get("direct_publish") else 0,
              normalize_size_mb(data.get("min_size_mb")),
              normalize_size_mb(data.get("max_size_mb")),
              normalize_min_age_minutes(data.get("min_age_minutes")),
@@ -391,7 +395,7 @@ def update_task(task_id: int, data: dict):
               "include_patterns", "exclude_patterns", "conflict_policy",
               "path_rule", "after_action", "run_windows",
               "filename_nfo_enabled", "manual_only", "async_transfer",
-              "transfer_workers", "verify_mode",
+              "transfer_workers", "verify_mode", "direct_publish",
               "min_size_mb", "max_size_mb", "min_age_minutes",
               "enabled"):
         if k in data:

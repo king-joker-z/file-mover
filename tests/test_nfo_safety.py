@@ -3796,10 +3796,9 @@ class VerifyModeTests(unittest.TestCase):
 
     def test_direct_publish_skips_rename_and_writes_final_name(self):
         """direct_publish：目标名独占创建直写，不经任何硬链接/rename 转正。"""
-        task = dict(self.task, verify_mode="off")
+        task = dict(self.task, verify_mode="off", direct_publish=True)
         item, content = self.video_item()
         stages = []
-        self.settings["direct_publish"] = True
 
         def forbidden(*args, **kwargs):
             raise AssertionError("direct 模式不得触发硬链接或 rename")
@@ -3815,9 +3814,8 @@ class VerifyModeTests(unittest.TestCase):
 
     def test_direct_publish_failure_cleans_partial_target(self):
         """直写发布中途失败：清理部分写入的目标，源文件保留待重试。"""
-        task = dict(self.task, verify_mode="off")
+        task = dict(self.task, verify_mode="off", direct_publish=True)
         item, content = self.video_item()
-        self.settings["direct_publish"] = True
 
         def stalled_fsync(fd):
             raise OSError(errno.EIO, "mount stalled")
@@ -3890,6 +3888,7 @@ class VerifyModeTests(unittest.TestCase):
         db.DB_PATH, db._conn = str(legacy), None
         columns = {row[1] for row in db.get_conn().execute("PRAGMA table_info(tasks)")}
         self.assertIn("verify_mode", columns)
+        self.assertIn("direct_publish", columns)
         task_id = db.create_task({"name": "v", "src_dir": str(self.src) + "-v",
                                   "dst_dir": str(self.dst) + "-v"})
         self.assertEqual(db.get_task(task_id)["verify_mode"], "strict")

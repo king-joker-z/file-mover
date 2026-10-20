@@ -21,8 +21,6 @@ DEFAULTS = {
     "nfo_fix_enabled": True,   # 迁移前自动修正 nfo（actor 数字UID name→role 等）
     "douyin_nfo_enabled": False,  # 对无 nfo 的抖音视频自动生成简易 nfo
     "max_async_transfers": 2,     # 异步迁移线程数：开启异步的任务可与其它任务并行迁移
-    "direct_publish": False,      # 直写发布：目标名独占创建后直接写入，跳过 rename 转正；
-                                  # workaround：部分网盘挂载对刚上传完的大文件 rename 会无限卡死
     "log_retention_days": 365,    # 迁移日志保留天数，0=永久；过期日志删除前先把按日趋势聚合存档
     "round_retention_days": 90,   # 已完结上传轮次的保留天数，0=永久
 }
@@ -46,7 +44,7 @@ def _validate(data: dict) -> None:
             if type(value) not in expected or not minimum <= value <= maximum:
                 raise ValueError(f"配置项 {key} 超出允许范围")
     for key in ("stable_check", "safe_mode", "verify_size", "remove_empty_dirs",
-                "nfo_fix_enabled", "douyin_nfo_enabled", "direct_publish"):
+                "nfo_fix_enabled", "douyin_nfo_enabled"):
         if key in data and type(data[key]) is not bool:
             raise ValueError(f"配置项 {key} 必须是布尔值")
     for key in ("retry_backoff_seconds", "ignore_suffixes"):

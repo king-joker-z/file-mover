@@ -115,6 +115,7 @@ function taskCard(t) {
     t.verify_mode === "fast" ? `<span class="badge accent" title="单次读回，无暂存文件，校验提速">快速校验</span>`
       : t.verify_mode === "off" ? `<span class="badge warn" title="不读回内容，仅核对大小，最快但信任网盘写入">不读回校验</span>`
       : `<span class="badge ok" title="发布后读回 + 删除前暂存核对">严格校验</span>`,
+t.direct_publish ? `<span class="badge warn" title="跳过 rename 转正，目标名独占创建直写（挂载 rename 卡死大文件时启用）">直写发布</span>` : "",
     t.async_transfer ? `<span class="badge accent" title="与其它任务并行迁移">异步</span>` : "",
     t.transfer_workers > 1 ? `<span class="badge accent" title="同一任务最多 ${t.transfer_workers} 个文件同时迁移">并发×${t.transfer_workers}</span>` : "",
     t.manual_only ? `<span class="badge warn" title="不参与自动定时扫描，需手动触发">仅手动扫描</span>` : "",
@@ -279,11 +280,14 @@ function modalFormHtml(t) {
             <option value="keep">保留（复制）</option></select>`)}
       </div>
       <div class="row">
-        ${field("校验强度", `<select id="f-verify">
-            <option value="strict">严格：发布后读回 + 删除前暂存（默认）</option>
-            <option value="fast">快速：单次读回，无暂存（大文件推荐）</option>
-            <option value="off">极速：仅核对大小（信任网盘写入）</option></select>`)}
-      </div>
+${field("校验强度", `<select id="f-verify">
+<option value="strict">严格：发布后读回 + 删除前暂存（默认）</option>
+<option value="fast">快速：单次读回，无暂存（大文件推荐）</option>
+<option value="off">极速：仅核对大小（信任网盘写入）</option></select>`)}
+${field("发布方式", `<select id="f-direct">
+<option value="0">rename 转正（默认，原子性最好）</option>
+<option value="1">直写：目标名独占创建（挂载 rename 卡死大文件时启用）</option></select>`)}
+</div>
       <div class="field-hint" id="verify-hint"></div>
     </section>
 
@@ -341,11 +345,13 @@ function bindModalEvents(modal, closeFn) {
     set("f-workers", String(t.transfer_workers || 1));
     set("f-manual", t.manual_only ? "1" : "0");
     set("f-verify", t.verify_mode || "strict");
+set("f-direct", t.direct_publish ? "1" : "0");
     set("f-minsize", t.min_size_mb || 0); set("f-maxsize", t.max_size_mb || 0);
     set("f-age", t.min_age_minutes || 0);
   } else {
     set("f-conflict", "skip"); set("f-path", "keep_structure"); set("f-after", "delete");
     set("f-verify", "strict"); set("f-manual", "0"); set("f-async", "0");
+set("f-direct", "0");
     set("f-workers", "1"); set("f-filename-nfo", "0");
     set("f-minsize", "0"); set("f-maxsize", "0"); set("f-age", "0");
   }
@@ -436,6 +442,7 @@ async function submitTask(modal, closeFn) {
     transfer_workers: +val("f-workers") || 1,
     manual_only: val("f-manual") === "1",
     verify_mode: val("f-verify") || "strict",
+    direct_publish: val("f-direct") === "1",
     min_size_mb: +val("f-minsize") || 0,
     max_size_mb: +val("f-maxsize") || 0,
     min_age_minutes: +val("f-age") || 0,

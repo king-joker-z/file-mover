@@ -88,6 +88,9 @@ class TaskIn(BaseModel):
     # 校验强度：strict=发布后读回+删除前暂存（最稳）；fast=单次读回无暂存（大文件推荐）；
     # off=不读回仅核对大小（最快，信任网盘写入）。NFO 小文件始终按 strict 处理。
     verify_mode: Literal["strict", "fast", "off"] = "strict"
+    # 直写发布：新目标跳过 tmp + rename 转正，目标名独占创建后直接写入；
+    # workaround：部分网盘挂载对刚上传完的大文件执行 rename 会无限卡死。
+    direct_publish: bool = False
     # 文件范围过滤：0 = 不限制。min/max 单位 MB；min_age_minutes = 只迁移
     # 最后修改时间至少在 X 分钟前的文件（避开刚下载/正在写入的大文件）。
     min_size_mb: float = Field(default=0, ge=0, le=1048576, allow_inf_nan=False)
@@ -135,9 +138,6 @@ class SettingsIn(BaseModel):
     douyin_nfo_enabled: Optional[bool] = None
     # 异步迁移线程数：开启异步的任务可与其它任务并行迁移的最大线程数
     max_async_transfers: Optional[int] = Field(default=None, ge=1, le=8)
-    # 直写发布：新目标跳过 tmp + rename 转正，目标名独占创建后直接写入；
-    # workaround：部分网盘挂载对刚上传完的大文件执行 rename 会无限卡死。
-    direct_publish: Optional[bool] = None
     # 数据保留：0 = 永久保留；过期日志删除前会先把按日趋势聚合归档。
     log_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
     round_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
