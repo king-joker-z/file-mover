@@ -6,6 +6,9 @@
 - fast:   仅发布后读回目标一次；删除源前不再暂存、不再重读（推荐大文件）。
 - off:    不读回内容，仅核对发布后大小；信任 fsync（最快）。
 NFO 小文件始终按 strict 处理。
+发布方式：默认 tmp + 原子/预检 rename 转正；全局设置 direct_publish 开启后，
+新目标改为最终文件名 O_EXCL 独占创建直写（workaround：部分网盘挂载对
+刚上传完的大文件执行 rename 会无限卡死）。
 """
 import ctypes
 import errno
@@ -202,13 +205,15 @@ def _report_progress(progress_cb, copied: int, total) -> None:
 
 def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None,
                     overwrite: bool = False, verify: str = "strict", progress_cb=None,
-                    stage_cb=None):
+                    stage_cb=None, direct: bool = False):
     """在固定的目录描述符内原子发布；verify 决定读回强度。
 
     strict: 发布后读回目标一次（读的是硬链接/rename 后的同一 inode，覆盖了临时
             文件读回的全部校验能力，不再重复读回），删除源前暂存再读回。
     fast:   仅发布后读回目标一次（仍可发现写入损坏/截断），无暂存文件。
     off:    不读回内容，仅核对发布后大小；信任 fsync，速度最快。
+    direct: 直写发布（仅作用于新目标；覆盖流程仍需硬链接备份，不受影响）：
+            目标名 O_EXCL 独占创建后直接写入，跳过 tmp 与 rename 转正。
     非覆盖策略不得抢占并发创建的目标。
     progress_cb(copied, total)：按 COPY_CHUNK_SIZE 块上报复制进度，供仪表盘展示速度/ETA。
     """
@@ -218,11 +223,19 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
         root = os.path.dirname(dst)
     name = os.path.basename(dst)
     tmp = f".fm-{uuid.uuid4().hex}.moving"
+    pending = tmp  # 失败时需要清理的半成品文件名（direct 模式下是最终目标名）
     with _target_parent(dst, root) as parent_fd:
         created = False
         backup = None
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            if not overwrite and direct:
+                # 直写发布：跳过 tmp 与 rename 转正，目标名 O_EXCL 独占创建后直接
+                # 写入。适用场景：部分网盘挂载对刚上传完的大文件执行 rename 会
+                # 长时间卡死。互斥语义由 O_EXCL 保留；写入中途失败会在 finally
+                # 清理半成品，仅进程被硬杀时可能残留部分写入的目标文件。
+                _report_stage(stage_cb, "直写发布（跳过 rename）")
+                pending = name
+            fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600, dir_fd=parent_fd)
             created = True
             digest = hashlib.sha256()
@@ -254,51 +267,53 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                 os.fsync(stream.fileno())
             expected_hash = digest.hexdigest()
             if not overwrite:
-                # 硬链接的 EEXIST 检查与发布不可分割；rename 也不得覆盖外部新文件。
-                try:
-                    os.link(tmp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
-                            follow_symlinks=False)
-                except OSError as exc:
-                    if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
-                        raise
-                    # 网盘挂载通常既不支持硬链接也不支持 renameat2(NOREPLACE)。
-                    # 优先 renameat2 原子转正：零数据拷贝；不支持时回退预检 + 同目录
-                    # rename——同样是零数据拷贝的元数据操作，避免把整个文件向挂载
-                    # 重复写第二遍（网盘挂载上这意味着整整多传一遍、耗时翻倍）。
-                    _report_stage(stage_cb, "原子转正发布 (rename)")
-                    if _rename_noreplace(parent_fd, tmp, parent_fd, name):
-                        created = False  # 临时文件已转正为目标，不再存在
-                    else:
-                        # rename 本身没有 NOREPLACE 语义，预检与 rename 之间存在极小
-                        # 的并发创建窗口；该窗口与覆盖流程最后一次校验和 os.replace
-                        # 之间的竞争同类，无法彻底消除。换取的收益是网盘挂载上少传
-                        # 一整遍文件，且排他写入 tmp 已保证绝大部分互斥语义。
-                        _report_stage(stage_cb, "转正发布 (rename 预检)")
-                        try:
-                            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                        except FileNotFoundError:
-                            pass
+                if not direct:
+                    # 硬链接的 EEXIST 检查与发布不可分割；rename 也不得覆盖外部新文件。
+                    try:
+                        os.link(tmp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                                follow_symlinks=False)
+                    except OSError as exc:
+                        if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+                            raise
+                        # 网盘挂载通常既不支持硬链接也不支持 renameat2(NOREPLACE)。
+                        # 优先 renameat2 原子转正：零数据拷贝；不支持时回退预检 + 同目录
+                        # rename——同样是零数据拷贝的元数据操作，避免把整个文件向挂载
+                        # 重复写第二遍（网盘挂载上这意味着整整多传一遍、耗时翻倍）。
+                        _report_stage(stage_cb, "原子转正发布 (rename)")
+                        if _rename_noreplace(parent_fd, tmp, parent_fd, name):
+                            created = False  # 临时文件已转正为目标，不再存在
                         else:
-                            raise FileExistsError(
-                                errno.EEXIST, os.strerror(errno.EEXIST), dst)
-                        os.rename(tmp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                        created = False  # 临时文件已转正为目标，不再存在
-                if verify == "off":
-                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                            # rename 本身没有 NOREPLACE 语义，预检与 rename 之间存在极小
+                            # 的并发创建窗口；该窗口与覆盖流程最后一次校验和 os.replace
+                            # 之间的竞争同类，无法彻底消除。换取的收益是网盘挂载上少传
+                            # 一整遍文件，且排他写入 tmp 已保证绝大部分互斥语义。
+                            _report_stage(stage_cb, "转正发布 (rename 预检)")
+                            try:
+                                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                raise FileExistsError(
+                                    errno.EEXIST, os.strerror(errno.EEXIST), dst)
+                            os.rename(tmp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                            created = False  # 临时文件已转正为目标，不再存在
+                    # 发布成功后 tmp 不再需要（硬链接场景）；rename 场景 created 已为 False
                     if created:
                         os.unlink(tmp, dir_fd=parent_fd)
                         created = False
+                # direct 模式的目标文件就是最终产物：校验成功则保留，失败由 finally 清理
+                if verify == "off":
+                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                     if info.st_size != expected_size:
                         raise IOError("目标文件大小与写入内容不符，源文件已保留")
+                    created = False
                     return expected_hash
                 _report_stage(stage_cb, "读回校验目标内容")
                 size, digest = _fd_digest(os.open(name, os.O_RDONLY | os.O_NOFOLLOW,
                                                   dir_fd=parent_fd))
-                if created:
-                    os.unlink(tmp, dir_fd=parent_fd)
-                    created = False
                 if (size, digest) != (expected_size, expected_hash):
                     raise IOError("目标文件读回校验失败，源文件已保留")
+                created = False
                 return expected_hash
             # overwrite 时先为旧目标建立同目录硬链接；无法原子固定旧目标时拒绝覆盖。
             # 复制备份无法消除最后一次校验与 os.replace 间的竞争，不能作为安全回退。
@@ -344,7 +359,7 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
         finally:
             if created:
                 try:
-                    os.unlink(tmp, dir_fd=parent_fd)
+                    os.unlink(pending, dir_fd=parent_fd)
                 except OSError:
                     pass
 
@@ -591,6 +606,7 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
     verify = task.get("verify_mode") or "strict"
     if verify not in ("strict", "fast", "off"):
         verify = "strict"  # 未知取值按最稳妥的历史行为执行
+    direct_publish = bool(cfg.get("direct_publish"))
     try:
         source_info = os.lstat(src)
     except FileNotFoundError:
@@ -736,7 +752,8 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
         source_stat = os.lstat(src)
         source_hash = _write_verified(final_dst, source=src, root=task["dst_dir"],
                                       overwrite=how == "overwrite", verify=verify,
-                                      progress_cb=progress_cb, stage_cb=_stage)
+                                      progress_cb=progress_cb, stage_cb=_stage,
+                                      direct=direct_publish)
         item["dst_path"] = final_dst
         current_stat = os.lstat(src)
         identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")

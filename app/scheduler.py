@@ -15,6 +15,9 @@ logger = logging.getLogger("uvicorn.error")
 class Scheduler:
     HEARTBEAT_INTERVAL = 15  # 慢挂载无返回时持续报告所在阶段
     RETENTION_INTERVAL = 3600  # 数据保留清理周期；启动后首次延迟执行
+    STAGE_LOG_MIN_SECONDS = 10  # 阶段切换时上一阶段达到该耗时才记 INFO（过滤快速阶段噪音）
+    STAGE_WARN_SECONDS = 300  # 单阶段停留超过该时长判定疑似卡住
+    STAGE_WARN_REPEAT_SECONDS = 600  # 疑似卡住 WARNING 的重发间隔
 
     def __init__(self):
         self._stop = threading.Event()
@@ -88,7 +91,8 @@ class Scheduler:
         for task in tasks:
             self.last_scan_ts[task["id"]] = now
         for name, target in (("scanner", self._scan_loop),
-                             ("worker", self._work_loop)):
+                             ("worker", self._work_loop),
+                             ("stage-watchdog", self._stage_watchdog_loop)):
             t = threading.Thread(target=target, name=f"fm-{name}", daemon=True)
             t.start()
             self._threads.append(t)
@@ -108,6 +112,40 @@ class Scheduler:
         self._threads.clear()
         self._async_threads.clear()
         logger.info("后台线程已退出")
+
+    def _stage_watchdog_loop(self):
+        """周期巡检在途迁移：单阶段停留过久时记 WARNING，让卡点从日志可查。
+
+        慢挂载上长阶段（如大文件上传）属正常现象，日志中同时给出复制进度与
+        进度最后更新时间，便于区分「慢」与「卡」。
+        """
+        while not self._stop.wait(30):
+            now = time.time()
+            with self._stats_lock:
+                entries = [dict(entry) for entry in self._current_transfers.values()]
+            for entry in entries:
+                since = entry.get("stage_since") or entry.get("started_at") or now
+                elapsed = now - since
+                if elapsed < self.STAGE_WARN_SECONDS:
+                    continue
+                if now - entry.get("last_stage_warn_at", 0.0) < self.STAGE_WARN_REPEAT_SECONDS:
+                    continue
+                with self._stats_lock:
+                    current = self._current_transfers.get(entry["id"])
+                    if current is None or current.get("stage") != entry.get("stage"):
+                        continue
+                    current["last_stage_warn_at"] = now
+                total = entry.get("total_bytes") or 0
+                copied = entry.get("copied_bytes") or 0
+                progress_age = now - (entry.get("updated_at") or since)
+                progress = (f"{copied / 1e9:.2f}/{total / 1e9:.2f}GB" if total >= 1e9
+                            else f"{copied}/{total} 字节") if total else "无复制进度"
+                logger.warning(
+                    "迁移阶段疑似卡住：task_id=%s queue_id=%s 文件=%s 阶段=%s 已持续 %.0f 秒"
+                    "（进度 %s，进度最后更新于 %.0f 秒前）；挂载无响应、网盘风控或 rename"
+                    "卡死都会表现为此状态，请结合网络流量判断",
+                    entry.get("task_id"), entry.get("id"), entry.get("rel_path"),
+                    entry.get("stage"), elapsed, progress, progress_age)
 
     def _desired_async_workers(self, configured) -> int:
         """异步线程池目标大小：全局设置与已启用异步任务并发迁移数的最大值。
@@ -823,14 +861,26 @@ class Scheduler:
                     "id": item["id"], "rel_path": item["rel_path"],
                     "task_id": item["task_id"], "stage": stage[0],
                     "total_bytes": item.get("size") or 0, "copied_bytes": 0,
-                    "started_at": time.time()}
+                    "started_at": time.time(), "stage_since": time.time(),
+                    "last_stage_warn_at": 0.0}
 
             def report_stage(name):
-                stage[0] = name
+                now = time.time()
+                prev_stage = None
+                prev_elapsed = 0.0
                 with self._stats_lock:
                     entry = self._current_transfers.get(item["id"])
                     if entry is not None:
+                        prev_stage = entry.get("stage")
+                        prev_elapsed = now - (entry.get("stage_since") or entry.get("started_at") or now)
                         entry["stage"] = name
+                        entry["stage_since"] = now
+                        entry["last_stage_warn_at"] = 0.0
+                stage[0] = name  # 迁移中心跳读该局部列表，必须同步更新
+                # 慢阶段切换记录耗时，形成每个文件的阶段时间线；快速阶段不产生噪音
+                if prev_stage is not None and prev_elapsed >= self.STAGE_LOG_MIN_SECONDS:
+                    logger.info("迁移阶段完成：task_id=%s 文件=%s 阶段=%s 耗时=%.1fs → %s",
+                                item["task_id"], item["rel_path"], prev_stage, prev_elapsed, name)
 
             def report_progress(copied, total):
                 with self._stats_lock:

@@ -30,7 +30,9 @@ export function mount(root) {
           </div>
           <label class="settings-option"><input type="checkbox" id="g-stable">
             <span><b>双采样检测</b><small>额外检查文件大小是否稳定；静默期保护始终启用，包括立即同步。</small></span></label>
-          <div class="settings-note">安全迁移及完整性校验始终启用：复制后 hash / 读回校验，再按任务策略处理源文件。</div>
+          <label class="settings-option"><input type="checkbox" id="g-direct-publish">
+<span><b>直写发布（跳过 rename 转正）</b><small>部分网盘挂载对刚上传完的大文件执行 rename 会无限卡死；开启后新目标直接以最终文件名独占创建写入。传输中断可能在目标目录残留部分写入的文件，需手动清理。</small></span></label>
+<div class="settings-note">安全迁移及完整性校验始终启用：复制后 hash / 读回校验，再按任务策略处理源文件。</div>
         </section>
         <section class="panel settings-card"><span class="eyebrow">03 / HOUSEKEEPING</span><h2>目录整理</h2>
           <p class="log-detail">迁移完成后的本地目录处理。</p>
@@ -84,6 +86,7 @@ async function load() {
     set("g-round-retention", s.round_retention_days ?? 0);
     set("g-ignore", (s.ignore_suffixes || []).join(", "));
     setChk("g-stable", s.stable_check);
+setChk("g-direct-publish", s.direct_publish === true);
     setChk("g-empty", s.remove_empty_dirs);
     setChk("g-nfo", s.nfo_fix_enabled !== false);
     setChk("g-douyin", s.douyin_nfo_enabled);
@@ -107,6 +110,7 @@ async function onSubmit(e) {
         max_retries: +val("g-retries"),
         max_async_transfers: +val("g-async-workers"),
         stable_check: chk("g-stable"),
+direct_publish: chk("g-direct-publish"),
         remove_empty_dirs: chk("g-empty"),
         nfo_fix_enabled: chk("g-nfo"),
         douyin_nfo_enabled: chk("g-douyin"),

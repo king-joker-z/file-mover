@@ -3794,6 +3794,41 @@ class VerifyModeTests(unittest.TestCase):
         self.assertIn("转正发布 (rename 预检)", stages)
         self.assertNotIn("复制转正发布（挂载不支持硬链接）", stages)
 
+    def test_direct_publish_skips_rename_and_writes_final_name(self):
+        """direct_publish：目标名独占创建直写，不经任何硬链接/rename 转正。"""
+        task = dict(self.task, verify_mode="off")
+        item, content = self.video_item()
+        stages = []
+        self.settings["direct_publish"] = True
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("direct 模式不得触发硬链接或 rename")
+
+        with (patch.object(transfer.os, "link", side_effect=forbidden),
+              patch.object(transfer, "_rename_noreplace", side_effect=forbidden)):
+            result, detail = transfer.transfer(item, task, stage_cb=stages.append)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual(list(self.dst.glob(".fm-*.moving")), [])
+        self.assertIn("直写发布（跳过 rename）", stages)
+
+    def test_direct_publish_failure_cleans_partial_target(self):
+        """直写发布中途失败：清理部分写入的目标，源文件保留待重试。"""
+        task = dict(self.task, verify_mode="off")
+        item, content = self.video_item()
+        self.settings["direct_publish"] = True
+
+        def stalled_fsync(fd):
+            raise OSError(errno.EIO, "mount stalled")
+
+        with patch.object(transfer.os, "fsync", side_effect=stalled_fsync):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "failed")
+        self.assertFalse((self.dst / "movie.mp4").exists())
+        self.assertTrue(Path(item["src_path"]).exists())
+        self.assertEqual(list(self.dst.glob(".fm-*")), [])
+
     def test_transfer_reports_fsync_and_readback_stages(self):
         item, _ = self.video_item()
         stages = []

@@ -135,6 +135,9 @@ class SettingsIn(BaseModel):
     douyin_nfo_enabled: Optional[bool] = None
     # 异步迁移线程数：开启异步的任务可与其它任务并行迁移的最大线程数
     max_async_transfers: Optional[int] = Field(default=None, ge=1, le=8)
+    # 直写发布：新目标跳过 tmp + rename 转正，目标名独占创建后直接写入；
+    # workaround：部分网盘挂载对刚上传完的大文件执行 rename 会无限卡死。
+    direct_publish: Optional[bool] = None
     # 数据保留：0 = 永久保留；过期日志删除前会先把按日趋势聚合归档。
     log_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
     round_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
