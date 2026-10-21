@@ -2,7 +2,7 @@ version: "3"
 
 services:
   file-mover:
-    image: king-joker-z/file-mover:1.0.6   # v1.0.6，amd64 + arm64
+    image: king-joker-z/file-mover:1.9.0   # v1.9.0，amd64 + arm64
     container_name: file-mover
     restart: unless-stopped
     ports:
@@ -12,6 +12,11 @@ services:
       - /vol1/1000/docker/file-mover/local:/data/local     # 源目录：要迁移的本地文件
       - /vol2/mount/cloud-drive:/data/cloud                # 目标目录：远程网盘挂载点（rclone mount / SMB / NFS 等）
       - /vol1/1000/docker/file-mover/config:/app/config    # 配置与 SQLite 数据库持久化（必须挂载，否则重启丢队列）
+      # 需要更多源/目标目录时，按同样方式追加挂载即可，数量不限：
+      # - /vol1/1000/downloads2:/data/local2
+      # - /vol2/mount/another-cloud:/data/cloud2
+      # Web 页「选择目录」会列出 /data 下全部挂载；任务源/目标选其中任意目录即可。
+      # 若目标不在 /data/cloud 下，无需额外配置；/data/cloud 的网盘掉载保护仅作用于该挂载。
     environment:
       - TZ=Asia/Shanghai
       - FILEMOVER_API_TOKEN=${FILEMOVER_API_TOKEN:?Set FILEMOVER_API_TOKEN before exposing port 8787}

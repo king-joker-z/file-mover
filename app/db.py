@@ -123,6 +123,8 @@ def _init_schema(conn: sqlite3.Connection):
             manual_only INTEGER NOT NULL DEFAULT 0,
             async_transfer INTEGER NOT NULL DEFAULT 0,
             transfer_workers INTEGER NOT NULL DEFAULT 1,
+            paused INTEGER NOT NULL DEFAULT 0,
+            video_only INTEGER NOT NULL DEFAULT 0,
             verify_mode TEXT NOT NULL DEFAULT 'strict',
 direct_publish INTEGER NOT NULL DEFAULT 0,
             min_size_mb REAL NOT NULL DEFAULT 0,
@@ -247,6 +249,10 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks ADD COLUMN direct_publish INTEGER NOT NULL DEFAULT 0")
     if "transfer_workers" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN transfer_workers INTEGER NOT NULL DEFAULT 1")
+    if "paused" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+    if "video_only" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN video_only INTEGER NOT NULL DEFAULT 0")
     if "rule_epoch" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN rule_epoch INTEGER NOT NULL DEFAULT 0")
     for column, definition in (("min_size_mb", "REAL NOT NULL DEFAULT 0"),
@@ -368,9 +374,10 @@ def create_task(data: dict) -> int:
             """INSERT INTO tasks (name, src_dir, dst_dir, interval_seconds, scan_interval,
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
                run_windows, filename_nfo_enabled, manual_only, async_transfer,
-               transfer_workers, verify_mode, direct_publish, min_size_mb, max_size_mb, min_age_minutes,
+               transfer_workers, video_only, verify_mode, direct_publish,
+               min_size_mb, max_size_mb, min_age_minutes,
                enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
@@ -379,6 +386,7 @@ def create_task(data: dict) -> int:
              1 if data.get("manual_only") else 0,
              1 if data.get("async_transfer") else 0,
              normalize_transfer_workers(data.get("transfer_workers")),
+             1 if data.get("video_only") else 0,
              normalize_verify_mode(data.get("verify_mode")),
              1 if data.get("direct_publish") else 0,
              normalize_size_mb(data.get("min_size_mb")),
@@ -395,7 +403,8 @@ def update_task(task_id: int, data: dict):
               "include_patterns", "exclude_patterns", "conflict_policy",
               "path_rule", "after_action", "run_windows",
               "filename_nfo_enabled", "manual_only", "async_transfer",
-              "transfer_workers", "verify_mode", "direct_publish",
+              "transfer_workers", "video_only",
+              "verify_mode", "direct_publish",
               "min_size_mb", "max_size_mb", "min_age_minutes",
               "enabled"):
         if k in data:
@@ -408,6 +417,8 @@ def update_task(task_id: int, data: dict):
                 vals.append(normalize_size_mb(data[k]))
             elif k == "min_age_minutes":
                 vals.append(normalize_min_age_minutes(data[k]))
+            elif k == "video_only":
+                vals.append(1 if data[k] else 0)
             else:
                 vals.append(data[k])
     if not fields:
@@ -537,6 +548,26 @@ def clear_scan_failure(task_id: int):
         conn.execute("DELETE FROM scan_failures WHERE task_id=?", (task_id,))
 
 
+# ---------- 迁移暂停 ----------
+
+def set_task_paused(task_id: int, paused: bool) -> bool | None:
+    """暂停/恢复单个任务的迁移；正在传输的文件不中断，只停止领取新文件。"""
+    conn = get_conn()
+    with _lock, conn:
+        row = conn.execute("UPDATE tasks SET paused=?, updated_at=? WHERE id=? RETURNING paused",
+                           (1 if paused else 0, now_str(), task_id)).fetchone()
+        return bool(row[0]) if row else None
+
+
+def set_all_tasks_paused(paused: bool) -> int:
+    """暂停/恢复全部任务的迁移；返回实际变更的任务数。"""
+    conn = get_conn()
+    with _lock, conn:
+        cur = conn.execute("UPDATE tasks SET paused=?, updated_at=? WHERE paused != ?",
+                           (1 if paused else 0, now_str(), 1 if paused else 0))
+        return cur.rowcount
+
+
 # ---------- EIO failures ----------
 
 def record_eio_failure(task_id: int, queue_id: int, rel_path: str, origin: str,
@@ -637,6 +668,39 @@ def count_eio_failures(task_id=None):
             return get_conn().execute('SELECT COUNT(*) FROM eio_failures').fetchone()[0]
         return get_conn().execute('SELECT COUNT(*) FROM eio_failures WHERE task_id=?',
                                   (task_id,)).fetchone()[0]
+
+
+def delete_eio_failure(task_id: int, rel_path: str) -> bool:
+    """删除单条 EIO 故障记录（不影响任务排除规则与队列）。"""
+    conn = get_conn()
+    with _lock, conn:
+        cur = conn.execute("DELETE FROM eio_failures WHERE task_id=? AND rel_path=?",
+                           (task_id, rel_path))
+        return cur.rowcount > 0
+
+
+def clear_eio_failures(task_id: int = None, migrated_only: bool = False) -> int:
+    """批量清除 EIO 故障记录。
+
+    migrated_only=True 时仅清除已有迁移记账、且队列中不再有未完成项的记录
+    （即确实已成功迁移的文件）；返回删除条数。
+    """
+    conn = get_conn()
+    with _lock, conn:
+        conditions, params = [], []
+        if task_id is not None:
+            conditions.append("task_id=?")
+            params.append(task_id)
+        if migrated_only:
+            conditions.append(
+                "EXISTS(SELECT 1 FROM migrated_files m WHERE m.task_id=eio_failures.task_id"
+                " AND m.rel_path=eio_failures.rel_path)")
+            conditions.append(
+                "NOT EXISTS(SELECT 1 FROM queue q WHERE q.task_id=eio_failures.task_id"
+                " AND q.rel_path=eio_failures.rel_path AND q.status IN"
+                " ('pending','transferring','accounting_pending','failed'))")
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        return conn.execute("DELETE FROM eio_failures" + where, params).rowcount
 
 
 # ---------- upload rounds ----------
@@ -1222,6 +1286,43 @@ def get_migrated_dst(task_id: int, rel_path: str) -> Optional[str]:
                     and _same_file_type(log["src_path"], log["dst_path"])
                     and os.path.splitext(rel_path)[1].lower()
                     == os.path.splitext(log["dst_path"])[1].lower()):
+                return log["dst_path"]
+        return None
+
+
+def get_migrated_dst_sized(task_id: int, rel_path: str, size: int) -> Optional[str]:
+    """仅当最新迁移记录的大小与当前源文件一致时才返回旧目标。
+
+    旧目标能否复用不能只看相对路径：同名文件被重新下载（内容/大小变化）后，
+    仍沿用旧目标会让新版本命中「目标已存在」冲突，而不是作为新文件正常处理。
+    与 get_migrated_dst 相同的世代与旧库日志回退逻辑，额外要求 size 一致。
+    """
+    conn = get_conn()
+    with _lock:
+        epoch_row = conn.execute("SELECT rule_epoch FROM tasks WHERE id=?", (task_id,)).fetchone()
+        epoch = epoch_row[0] if epoch_row else 0
+        row = conn.execute(
+            "SELECT dst_path, size FROM migrated_files WHERE task_id=? AND rel_path=?"
+            " AND rule_epoch=? AND dst_path IS NOT NULL"
+            " ORDER BY migrated_at DESC, id DESC LIMIT 1",
+            (task_id, rel_path, epoch)).fetchone()
+        if row:
+            return row["dst_path"] if row["size"] == size else None
+        if epoch:
+            return None  # 切换规则后不得用旧日志恢复旧选址。
+        # 老库只有 rel_path/size 时，优先从尚存的成功日志找当时的真实目标。
+        logs = conn.execute(
+            "SELECT logs.src_path, logs.dst_path, logs.size FROM log_destinations AS d"
+            " JOIN logs ON logs.id=d.log_id"
+            " WHERE d.task_id=? AND d.rel_path=? AND logs.task_id=?"
+            " AND logs.result='success'"
+            " ORDER BY d.log_id DESC", (task_id, rel_path, task_id))
+        for log in logs:
+            if (log["src_path"] and log["src_path"].endswith(os.sep + rel_path)
+                    and _same_file_type(log["src_path"], log["dst_path"])
+                    and os.path.splitext(rel_path)[1].lower()
+                    == os.path.splitext(log["dst_path"])[1].lower()
+                    and (log["size"] or 0) == size):
                 return log["dst_path"]
         return None
 

@@ -255,6 +255,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
     filename_nfo_enabled = task.get("filename_nfo_enabled", False)
     # 两种生成格式不能在同一任务上竞争同一个 .nfo 路径。
     douyin_nfo_enabled = cfg.get("douyin_nfo_enabled", False) and not filename_nfo_enabled
+    # 仅视频模式：非视频后缀不入队；NFO 自动生成也不会执行（产物不会被迁移）。
+    video_only = bool(task.get("video_only"))
     date_str = time.strftime("%Y-%m-%d")
     quiet = max(0, float(cfg.get("stable_quiet_seconds", 60)))
     wait = cfg.get("stable_check_seconds", 2) if cfg.get("stable_check") else 0
@@ -320,7 +322,8 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
         if progress is not None:
             progress["current"] = f"处理文件: {root}"
         # 按任务选择一种补全格式；生成的新 NFO 加入本轮文件列表并经正常队列迁移。
-        if filename_nfo_enabled or douyin_nfo_enabled:
+        # 仅视频模式下生成的 NFO 不会被入队，提前跳过避免白白写入源目录。
+        if (filename_nfo_enabled or douyin_nfo_enabled) and not video_only:
             # 发现已有 NFO 时必须使用原始目录清单，不能因过滤器排除它就误补一份。
             # 封面清单则只包含本任务会迁移的文件，避免 NFO 引用被过滤的图片。
             poster_files = [name for name in files if not name.startswith(".")
@@ -384,6 +387,9 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             if fn.endswith(".moving") or any(fn.endswith(s) for s in ignores) or fn.startswith("."):
                 continue
             rel = os.path.relpath(full, src)
+            # 仅视频模式：非视频后缀直接跳过（与排除规则同语义，静默不过滤日志）。
+            if video_only and os.path.splitext(fn)[1].lower() not in VIDEO_EXTS:
+                continue
             companion_included = False
             if includes and (fn.lower().endswith(".nfo") or
                              (filename_nfo_enabled and
@@ -421,7 +427,14 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             # 任务范围过滤：大小/年龄不在范围内的文件不入队（与排除规则同语义）。
             if not _file_in_scope(current_signature, task):
                 continue
-            prior_dst = db.get_migrated_dst(task["id"], rel) if task.get("after_action", "delete") == "delete" else None
+            if task.get("after_action", "delete") == "delete":
+                # 旧目标复用按大小校验：同名重下（大小变化）不走旧目标，
+                # 让新版本按冲突策略正常处理；NFO 迁移时内容可修正，保持旧行为。
+                prior_dst = (db.get_migrated_dst(task["id"], rel)
+                             if fn.lower().endswith(".nfo")
+                             else db.get_migrated_dst_sized(task["id"], rel, size))
+            else:
+                prior_dst = None
             if (fn.lower().endswith(".nfo") and db.has_migrated_rel(task["id"], rel) and not prior_dst
                     and task.get("path_rule") == "by_date"
                     and not db.has_migrated_destination(task["id"], rel)):
@@ -434,7 +447,9 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             dst = prior_dst or compute_dst(task["dst_dir"], rel, task.get("path_rule", "keep_structure"), date_str)
             if task.get("after_action") == "keep":
                 # 保留源文件的复制任务每轮也检查实际目标；内容一致就不再重复复制/重命名。
-                recorded = db.get_migrated_dst(task["id"], rel)
+                recorded = (db.get_migrated_dst(task["id"], rel)
+                            if fn.lower().endswith(".nfo")
+                            else db.get_migrated_dst_sized(task["id"], rel, size))
                 candidate = recorded if recorded and _within_destination(recorded, task["dst_dir"]) else dst
                 try:
                     if fn.lower().endswith(".nfo"):

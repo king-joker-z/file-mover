@@ -238,5 +238,107 @@ class TaskFilterTests(unittest.TestCase):
             config.CONFIG_PATH, config._cache = old_path, old_cache
 
 
+class VideoOnlyAndPauseTests(unittest.TestCase):
+    """仅视频过滤、迁移暂停、EIO 记录清除与按大小复用旧目标的回归测试。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.src = self.root / "src"
+        self.dst = self.root / "dst"
+        self.src.mkdir()
+        self.dst.mkdir()
+        self.old_db_path, self.old_conn = db.DB_PATH, db._conn
+        db.DB_PATH, db._conn = str(self.root / "test.db"), None
+        self.addCleanup(self.restore_db)
+        self.settings = dict(config.DEFAULTS, stable_check=False, stable_quiet_seconds=0)
+        get_config = patch.object(config, "get", return_value=self.settings)
+        get_config.start()
+        self.addCleanup(get_config.stop)
+        self.task_id = db.create_task({
+            "name": "t", "src_dir": str(self.src), "dst_dir": str(self.dst),
+            "after_action": "delete",
+        })
+        self.task = dict(db.get_task(self.task_id))
+
+    def restore_db(self):
+        if db._conn is not None:
+            db._conn.close()
+        db.DB_PATH, db._conn = self.old_db_path, self.old_conn
+
+    def source(self, name, content=b"x"):
+        path = self.src / name
+        path.write_bytes(content)
+        return path
+
+    def enqueued(self):
+        scanner.scan_task(self.task, skip_stable_check=True)
+        return {row["rel_path"] for row in db.list_queue()}
+
+    def test_video_only_enqueues_only_videos(self):
+        self.task["video_only"] = 1
+        self.source("clip.mp4", b"v")
+        self.source("cover.jpg", b"i")
+        self.source("info.nfo", b"n")
+        self.assertEqual(self.enqueued(), {"clip.mp4"})
+
+    def test_video_only_skips_nfo_generation(self):
+        self.task["video_only"] = 1
+        self.source("clip.webm", b"v")
+        self.enqueued()
+        self.assertFalse((self.src / "clip.nfo").exists())
+
+    def test_video_only_off_keeps_all_files(self):
+        self.source("clip.mp4", b"v")
+        self.source("cover.jpg", b"i")
+        self.assertEqual(self.enqueued(), {"clip.mp4", "cover.jpg"})
+
+    def test_migrated_dst_reused_only_when_size_matches(self):
+        video = self.source("a.mp4", b"v1")
+        dst = self.dst / "a.mp4"
+        dst.write_bytes(b"v1")
+        db.record_migrated(self.task_id, "a.mp4", 2, str(dst))
+        size = video.stat().st_size
+        self.assertEqual(db.get_migrated_dst_sized(self.task_id, "a.mp4", size), str(dst))
+        # 同名重下（大小变化）不得沿用旧目标
+        self.assertIsNone(db.get_migrated_dst_sized(self.task_id, "a.mp4", size + 1))
+
+    def test_pause_single_and_all(self):
+        self.assertTrue(db.set_task_paused(self.task_id, True))
+        self.assertTrue(db.get_task(self.task_id)["paused"])
+        self.assertFalse(db.set_task_paused(self.task_id, False))
+        self.assertFalse(db.get_task(self.task_id)["paused"])
+        other = db.create_task({"name": "t2", "src_dir": str(self.src) + "2",
+                                "dst_dir": str(self.dst) + "2"})
+        self.assertEqual(db.set_all_tasks_paused(True), 2)
+        self.assertTrue(db.get_task(other)["paused"])
+        self.assertEqual(db.set_all_tasks_paused(True), 0)
+        self.assertEqual(db.set_all_tasks_paused(False), 2)
+        self.assertFalse(db.get_task(self.task_id)["paused"])
+
+    def test_eio_clear_single_and_migrated_only(self):
+        self.assertTrue(db.record_eio_failure(self.task_id, None, "gone.jpg", "source", "d1"))
+        # 已成功迁移且有读回凭证的记录
+        dst = self.dst / "done.jpg"
+        dst.write_bytes(b"ok")
+        self.source("done.jpg", b"ok")
+        db.record_migrated(self.task_id, "done.jpg", 2, str(dst))
+        self.assertTrue(db.record_eio_failure(self.task_id, None, "done.jpg", "source", "d2"))
+        # 队列仍有未完成项的记录不得按「已成功」清除
+        dst_busy = self.dst / "busy.jpg"
+        dst_busy.write_bytes(b"b")
+        db.record_migrated(self.task_id, "busy.jpg", 1, str(dst_busy))
+        self.assertTrue(db.record_eio_failure(self.task_id, None, "busy.jpg", "source", "d3"))
+        db.enqueue(self.task_id, str(self.src / "busy.jpg"), "busy.jpg", str(dst_busy), 1)
+        self.assertEqual(db.clear_eio_failures(migrated_only=True), 1)
+        self.assertIsNotNone(db.get_eio_failure(self.task_id, "gone.jpg"))
+        self.assertIsNotNone(db.get_eio_failure(self.task_id, "busy.jpg"))
+        self.assertIsNone(db.get_eio_failure(self.task_id, "done.jpg"))
+        self.assertTrue(db.delete_eio_failure(self.task_id, "gone.jpg"))
+        self.assertFalse(db.delete_eio_failure(self.task_id, "gone.jpg"))
+        self.assertEqual(db.clear_eio_failures(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -76,6 +76,7 @@ export async function loadTasks() {
       card.querySelector("[data-edit]")?.addEventListener("click", () => openTaskModal(t));
       card.querySelector("[data-del]")?.addEventListener("click", () => delTask(t.id));
       card.querySelector("[data-sync]")?.addEventListener("click", () => syncNow(t.id));
+      card.querySelector("[data-pause]")?.addEventListener("click", () => togglePause(t));
       card.querySelector("[data-backfill]")?.addEventListener("click", () => confirmBackfill(t.id));
       card.querySelectorAll("button[data-del-pattern]").forEach(b =>
         b.addEventListener("click", () => removeTaskPattern(t.id, b.dataset.delPattern)));
@@ -119,6 +120,8 @@ t.direct_publish ? `<span class="badge warn" title="跳过 rename 转正，目�
     t.async_transfer ? `<span class="badge accent" title="与其它任务并行迁移">异步</span>` : "",
     t.transfer_workers > 1 ? `<span class="badge accent" title="同一任务最多 ${t.transfer_workers} 个文件同时迁移">并发×${t.transfer_workers}</span>` : "",
     t.manual_only ? `<span class="badge warn" title="不参与自动定时扫描，需手动触发">仅手动扫描</span>` : "",
+    t.paused ? `<span class="badge warn" title="迁移已暂停：正在传输的文件会完成，新文件不再开始（扫描继续）">已暂停迁移</span>` : "",
+    t.video_only ? `<span class="badge" title="仅迁移视频文件（.mp4/.mkv/.mov/.flv/.webm）">仅视频</span>` : "",
     (t.min_size_mb || t.max_size_mb)
       ? `<span class="badge" title="${t.min_size_mb ? "≥" + t.min_size_mb + "MB" : ""}${t.min_size_mb && t.max_size_mb ? " 且 " : ""}${t.max_size_mb ? "≤" + t.max_size_mb + "MB" : ""}">大小过滤</span>` : "",
     t.min_age_minutes ? `<span class="badge" title="仅迁移最后修改至少 ${t.min_age_minutes} 分钟前的文件">年龄≥${t.min_age_minutes}分</span>` : "",
@@ -155,6 +158,7 @@ t.direct_publish ? `<span class="badge warn" title="跳过 rename 转正，目�
     </div>
     <footer class="task-actions">
       <button class="btn small" type="button" data-sync-id="${t.id}" data-sync>立即同步</button>
+      <button class="btn small ghost" type="button" data-pause>${t.paused ? "▶ 恢复迁移" : "⏸ 暂停迁移"}</button>
       <button class="btn small ghost" type="button" data-backfill-id="${t.id}" data-backfill
         title="逐个校验历史目标视频，缺 NFO 时读取整段视频，可能产生大量远端 I/O">补齐历史 NFO…</button>
       <span class="spacer"></span>
@@ -178,6 +182,23 @@ async function toggleTask(id, checkbox) {
     checkbox.checked = !checkbox.checked;
     toast("切换任务状态失败: " + e.message, "error");
   } finally { checkbox.disabled = false; }
+}
+
+async function togglePause(t) {
+  try {
+    const result = await api(`/api/tasks/${t.id}/pause`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: !t.paused }),
+    });
+    t.paused = result.paused;
+    const card = rootEl?.querySelector(`.task-card[data-task="${t.id}"]`);
+    const btn = card?.querySelector("[data-pause]");
+    if (btn) btn.textContent = result.paused ? "▶ 恢复迁移" : "⏸ 暂停迁移";
+    toast(result.paused
+      ? "已暂停迁移：正在传输的文件会完成，新文件不再开始（扫描继续）"
+      : "已恢复迁移", "success");
+    document.dispatchEvent(new CustomEvent("fm:data-changed"));
+  } catch (e) { toast("暂停状态切换失败: " + e.message, "error"); }
 }
 
 async function delTask(id) {
@@ -288,6 +309,12 @@ ${field("发布方式", `<select id="f-direct">
 <option value="0">rename 转正（默认，原子性最好）</option>
 <option value="1">直写：目标名独占创建（挂载 rename 卡死大文件时启用）</option></select>`)}
 </div>
+      <div class="row">
+        ${field("文件类型范围", `<select id="f-video-only">
+            <option value="0">全部文件（默认）</option>
+            <option value="1">仅视频文件</option></select>`, "",
+          "仅视频 = 只迁移 .mp4/.mkv/.mov/.flv/.webm；NFO/封面等不再迁移，NFO 自动生成也会跳过")}
+      </div>
       <div class="field-hint" id="verify-hint"></div>
     </section>
 
@@ -344,6 +371,7 @@ function bindModalEvents(modal, closeFn) {
     set("f-async", t.async_transfer ? "1" : "0");
     set("f-workers", String(t.transfer_workers || 1));
     set("f-manual", t.manual_only ? "1" : "0");
+    set("f-video-only", t.video_only ? "1" : "0");
     set("f-verify", t.verify_mode || "strict");
 set("f-direct", t.direct_publish ? "1" : "0");
     set("f-minsize", t.min_size_mb || 0); set("f-maxsize", t.max_size_mb || 0);
@@ -351,7 +379,7 @@ set("f-direct", t.direct_publish ? "1" : "0");
   } else {
     set("f-conflict", "skip"); set("f-path", "keep_structure"); set("f-after", "delete");
     set("f-verify", "strict"); set("f-manual", "0"); set("f-async", "0");
-set("f-direct", "0");
+set("f-direct", "0"); set("f-video-only", "0");
     set("f-workers", "1"); set("f-filename-nfo", "0");
     set("f-minsize", "0"); set("f-maxsize", "0"); set("f-age", "0");
   }
@@ -441,6 +469,7 @@ async function submitTask(modal, closeFn) {
     async_transfer: val("f-async") === "1",
     transfer_workers: +val("f-workers") || 1,
     manual_only: val("f-manual") === "1",
+    video_only: val("f-video-only") === "1",
     verify_mode: val("f-verify") || "strict",
     direct_publish: val("f-direct") === "1",
     min_size_mb: +val("f-minsize") || 0,

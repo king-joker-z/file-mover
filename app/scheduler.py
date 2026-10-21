@@ -366,6 +366,8 @@ class Scheduler:
                 status = "manual"
             elif self._active_scan_task_id == task_id:
                 status = "scanning"
+            elif task.get("paused"):
+                status = "paused"  # 迁移已暂停；扫描继续，只是不领取新文件
             elif now < retry_at:
                 status = "cooldown"
             elif task.get("manual_only"):
@@ -387,6 +389,7 @@ class Scheduler:
                 "interval_seconds": interval, "last_scan_at": last,
                 "next_scan_at": next_scan,
                 "manual_only": bool(task.get("manual_only")),
+                "paused": bool(task.get("paused")),
                 "async_transfer": bool(task.get("async_transfer")),
                 "transfer_workers": db.normalize_transfer_workers(task.get("transfer_workers")),
                 "status": status, "request_id": progress.get("request_id") if running else None,
@@ -755,6 +758,7 @@ class Scheduler:
         workers = {tid: db.normalize_transfer_workers(task.get("transfer_workers"))
                    for tid, task in task_map.items()}
         eligible = [tid for tid, task in task_map.items() if task.get("enabled")
+                    and not task.get("paused")
                     and not task.get("async_transfer")
                     and tid not in self._scan_retry_at
                     and self._busy_tasks.get(tid, 0) < workers[tid]
@@ -815,6 +819,7 @@ class Scheduler:
                    for tid, task in task_map.items()}
         eligible = [tid for tid, task in task_map.items() if task.get("enabled")
                     and task.get("async_transfer")
+                    and not task.get("paused")
                     and tid not in self._scan_retry_at
                     and self._busy_tasks.get(tid, 0) < workers[tid]
                     and now >= self._next_eligible.get(tid, 0)
@@ -841,7 +846,7 @@ class Scheduler:
                     logger.warning("孤儿队列清理：task_id=%s queue_id=%s", item["task_id"], item["id"])
                     db.cleanup_orphan_queue(item["id"])
                     return
-                if not task.get("enabled") or not self._in_run_window(task):
+                if not task.get("enabled") or task.get("paused") or not self._in_run_window(task):
                     db.set_status(item["id"], "pending")
                     return
             except Exception:

@@ -96,6 +96,9 @@ class TaskIn(BaseModel):
     min_size_mb: float = Field(default=0, ge=0, le=1048576, allow_inf_nan=False)
     max_size_mb: float = Field(default=0, ge=0, le=1048576, allow_inf_nan=False)
     min_age_minutes: int = Field(default=0, ge=0, le=43200)
+    # 仅迁移视频文件（.mp4/.mkv/.mov/.flv/.webm）；开启后 NFO/封面等不再入队，
+    # NFO 自动生成也不会执行（产物不会被迁移）。
+    video_only: bool = False
 
     @field_validator("run_windows")
     @classmethod
@@ -156,6 +159,12 @@ class EioRetryIn(BaseModel):
 
     task_id: int = Field(ge=1)
     rel_path: str = Field(min_length=1, max_length=1024)
+
+
+class PauseIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paused: bool
 
 
 def _split_exclude_patterns(raw: str) -> list[str]:
@@ -386,6 +395,26 @@ def api_eio_failures(task_id: Optional[int] = None, limit: int = 200, offset: in
             "total": db.count_eio_failures(task_id)}
 
 
+@app.delete("/api/eio-failures")
+def api_clear_eio_failures(task_id: Optional[int] = None, rel_path: Optional[str] = None,
+                           migrated: bool = False):
+    """清除 EIO 故障记录：单条（task_id+rel_path）、按任务或全部；
+    migrated=true 仅清除已成功迁移且队列无未完成项的记录。"""
+    if task_id is not None and task_id < 1:
+        raise HTTPException(422, "task_id 必须为正整数")
+    if rel_path is not None:
+        if task_id is None:
+            raise HTTPException(422, "删除单条记录需要 task_id 与 rel_path")
+        if not db.delete_eio_failure(task_id, rel_path):
+            raise HTTPException(404, "故障记录不存在")
+        logger.info("EIO 故障记录已清除：task_id=%s 路径=%s", task_id, rel_path)
+        return {"ok": True, "removed": 1}
+    n = db.clear_eio_failures(task_id, migrated_only=migrated)
+    logger.info("EIO 故障记录批量清除：task_id=%s 仅已成功=%s 删除=%d",
+                task_id, migrated, n)
+    return {"ok": True, "removed": n}
+
+
 @app.post("/api/eio-failures/retry")
 def api_retry_eio_failure(data: EioRetryIn):
     """一键重试：自动移除该条自动排除规则并立即重新扫描源目录。"""
@@ -460,6 +489,26 @@ def api_delete_task(task_id: int):
         raise HTTPException(409, str(exc)) from exc
     logger.info("任务删除：task_id=%s", task_id)
     return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/pause")
+def api_pause_task(task_id: int, data: PauseIn):
+    """暂停/恢复单个任务的迁移；正在传输的文件会完成，只停止领取新文件。"""
+    result = db.set_task_paused(task_id, data.paused)
+    if result is None:
+        raise HTTPException(404, "任务不存在")
+    logger.info("任务迁移暂停状态变更：task_id=%s paused=%s", task_id, data.paused)
+    scheduler.wake_scan()
+    return {"ok": True, "paused": result}
+
+
+@app.post("/api/tasks/pause-all")
+def api_pause_all_tasks(data: PauseIn):
+    """暂停/恢复全部任务的迁移；正在传输的文件会完成。"""
+    changed = db.set_all_tasks_paused(data.paused)
+    logger.info("全部任务迁移暂停状态变更：paused=%s 变更数=%d", data.paused, changed)
+    scheduler.wake_scan()
+    return {"ok": True, "changed": changed}
 
 
 @app.post("/api/tasks/{task_id}/toggle")

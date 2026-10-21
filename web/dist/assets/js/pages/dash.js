@@ -135,6 +135,7 @@ function countdownText(s) {
   if (s.status === "manual") return "手动扫描中";
   if (s.status === "scanning") return "定时扫描中";
   if (s.status === "manual_wait") return "等待手动触发";
+  if (s.status === "paused") return "迁移已暂停";
   if (s.next_scan_at == null) return "等待调度";
   const remaining = s.next_scan_at - (Date.now() / 1000 - store.serverClockOffset);
   return remaining <= 0 ? "等待调度" : formatCountdown(remaining);
@@ -160,7 +161,7 @@ function updateScanCardInPlace(card, s) {
   const active = s.status === "manual" || s.status === "scanning";
   const label = s.status === "manual" && s.backfill_nfo ? "历史 NFO 巡检"
     : ({ disabled: "已停用", manual: "手动扫描", scanning: "定时扫描", cooldown: "故障冷却",
-      manual_wait: "等待手动扫描", scheduled: "运行中" }[s.status] || "等待中");
+      manual_wait: "等待手动扫描", paused: "迁移已暂停", scheduled: "运行中" }[s.status] || "等待中");
   const tag = card.querySelector(".tag.scan-state");
   if (tag) { tag.textContent = label; tag.className = `tag scan-state ${esc(s.status)}`; }
 
@@ -217,7 +218,7 @@ function renderScanSchedules() {
   box.innerHTML = store.scanSchedules.map(s => {
     const label = s.status === "manual" && s.backfill_nfo ? "历史 NFO 巡检"
       : ({ disabled: "已停用", manual: "手动扫描", scanning: "定时扫描", cooldown: "故障冷却",
-        manual_wait: "等待手动扫描", scheduled: "运行中" }[s.status] || "等待中");
+        manual_wait: "等待手动扫描", paused: "迁移已暂停", scheduled: "运行中" }[s.status] || "等待中");
     const active = s.status === "manual" || s.status === "scanning";
     const detail = s.status === "cooldown" ? "挂载 I/O 故障后等待重试"
       : s.status === "manual_wait"

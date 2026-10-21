@@ -35,6 +35,9 @@ export function mount(root) {
         <button type="button" class="btn small gray" data-clear="conflict">清除冲突</button>
         <button type="button" class="btn small danger-ghost" data-clear="all">清空全部</button>
         <button type="button" class="btn small ghost" data-retry-failed>重试全部失败项</button>
+        <button type="button" class="btn small ghost" data-pause-all>⏸ 暂停全部迁移</button>
+        <button type="button" class="btn small ghost" data-resume-all>▶ 恢复全部迁移</button>
+        <span class="hint" id="queue-pause-hint"></span>
       </div>
       <div id="queue-list"><div class="empty">加载队列中…</div></div>
       <div class="pager" id="queue-pager"></div>
@@ -52,6 +55,8 @@ export function mount(root) {
   root.querySelectorAll("button[data-clear]").forEach(b =>
     b.addEventListener("click", () => clearQueue(b.dataset.clear)));
   root.querySelector("[data-retry-failed]").addEventListener("click", retryFailed);
+  root.querySelector("[data-pause-all]").addEventListener("click", () => setAllPaused(true));
+  root.querySelector("[data-resume-all]").addEventListener("click", () => setAllPaused(false));
 }
 
 export function show() { load(); }
@@ -67,6 +72,12 @@ export async function load() {
   try {
     const { items, total } = await api("/api/queue?" + params);
     if (id !== requestId) return;
+    try {
+      const tasks = await api("/api/tasks");
+      const pausedCount = tasks.filter(t => t.paused).length;
+      const hint = rootEl.querySelector("#queue-pause-hint");
+      if (hint) hint.textContent = pausedCount ? `已暂停迁移的任务：${pausedCount} 个` : "";
+    } catch (_) { /* 暂停提示失败不影响队列展示 */ }
     if (!items.length && total && page > 0) { page = Math.ceil(total / PAGE_SIZE) - 1; return load(); }
     const list = rootEl.querySelector("#queue-list");
     list.innerHTML = !items.length
@@ -110,6 +121,24 @@ async function clearQueue(scope) {
     load();
     document.dispatchEvent(new CustomEvent("fm:data-changed"));
   } catch (e) { toast("清除队列失败: " + e.message, "error"); }
+}
+
+async function setAllPaused(paused) {
+  const ok = await confirmDialog(
+    paused
+      ? "确认暂停全部任务的迁移？\n正在传输的文件会完成后停止，新文件不再开始；扫描与队列记录继续。"
+      : "确认恢复全部任务的迁移？",
+    { title: paused ? "暂停全部迁移" : "恢复全部迁移", okText: paused ? "暂停" : "恢复" });
+  if (!ok) return;
+  try {
+    const r = await api("/api/tasks/pause-all", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused }),
+    });
+    toast(paused ? `已暂停 ${r.changed} 个任务的迁移` : `已恢复 ${r.changed} 个任务的迁移`, "success");
+    load();
+    document.dispatchEvent(new CustomEvent("fm:data-changed"));
+  } catch (e) { toast("操作失败: " + e.message, "error"); }
 }
 
 async function retryFailed() {
