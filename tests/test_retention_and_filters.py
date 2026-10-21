@@ -318,18 +318,21 @@ class VideoOnlyAndPauseTests(unittest.TestCase):
         self.assertFalse(db.get_task(self.task_id)["paused"])
 
     def test_eio_clear_single_and_migrated_only(self):
-        self.assertTrue(db.record_eio_failure(self.task_id, None, "gone.jpg", "source", "d1"))
+        for _ in range(db.EIO_AUTO_EXCLUDE_THRESHOLD):
+            db.record_eio_failure(self.task_id, None, "gone.jpg", "source", "d1")
         # 已成功迁移且有读回凭证的记录
         dst = self.dst / "done.jpg"
         dst.write_bytes(b"ok")
         self.source("done.jpg", b"ok")
         db.record_migrated(self.task_id, "done.jpg", 2, str(dst))
-        self.assertTrue(db.record_eio_failure(self.task_id, None, "done.jpg", "source", "d2"))
+        for _ in range(db.EIO_AUTO_EXCLUDE_THRESHOLD):
+            db.record_eio_failure(self.task_id, None, "done.jpg", "source", "d2")
         # 队列仍有未完成项的记录不得按「已成功」清除
         dst_busy = self.dst / "busy.jpg"
         dst_busy.write_bytes(b"b")
         db.record_migrated(self.task_id, "busy.jpg", 1, str(dst_busy))
-        self.assertTrue(db.record_eio_failure(self.task_id, None, "busy.jpg", "source", "d3"))
+        for _ in range(db.EIO_AUTO_EXCLUDE_THRESHOLD):
+            db.record_eio_failure(self.task_id, None, "busy.jpg", "source", "d3")
         db.enqueue(self.task_id, str(self.src / "busy.jpg"), "busy.jpg", str(dst_busy), 1)
         self.assertEqual(db.clear_eio_failures(migrated_only=True), 1)
         self.assertIsNotNone(db.get_eio_failure(self.task_id, "gone.jpg"))
@@ -338,6 +341,22 @@ class VideoOnlyAndPauseTests(unittest.TestCase):
         self.assertTrue(db.delete_eio_failure(self.task_id, "gone.jpg"))
         self.assertFalse(db.delete_eio_failure(self.task_id, "gone.jpg"))
         self.assertEqual(db.clear_eio_failures(), 1)
+
+    def test_eio_auto_exclude_requires_repeated_failures(self):
+        # 首次 EIO 只记录不排除：瞬时抖动由限速重试自愈，避免误报把文件踢出队列
+        self.assertFalse(db.record_eio_failure(self.task_id, None, "flaky.jpg", "source", "d1"))
+        self.assertEqual(db.get_task(self.task_id)["exclude_patterns"], "")
+        record = db.list_eio_failures(self.task_id)[0]
+        self.assertEqual(record["occurrences"], 1)
+        self.assertFalse(record["active"])
+        # 未达阈值继续只记录
+        for _ in range(db.EIO_AUTO_EXCLUDE_THRESHOLD - 2):
+            self.assertFalse(db.record_eio_failure(
+                self.task_id, None, "flaky.jpg", "source", "d2"))
+        # 达到阈值才自动精确排除
+        self.assertTrue(db.record_eio_failure(self.task_id, None, "flaky.jpg", "source", "d3"))
+        self.assertEqual(db.get_task(self.task_id)["exclude_patterns"], "./flaky.jpg")
+        self.assertTrue(db.list_eio_failures(self.task_id)[0]["active"])
 
 
 if __name__ == "__main__":

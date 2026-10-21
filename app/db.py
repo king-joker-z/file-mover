@@ -462,7 +462,8 @@ def update_task(task_id: int, data: dict):
                                     " AND auto_excluded=1", (task_id,)).fetchall():
                 exact = './' + row['rel_path']
                 if exact in old_patterns and exact not in new_patterns:
-                    conn.execute("UPDATE eio_failures SET auto_excluded=0"
+                    # 手动移除自动排除规则视为用户判定该路径可用，重新计数。
+                    conn.execute("UPDATE eio_failures SET auto_excluded=0, occurrences=0"
                                  " WHERE task_id=? AND rel_path=?", (task_id, row['rel_path']))
             for queue_id in excluded_ids:
                 conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
@@ -570,9 +571,14 @@ def set_all_tasks_paused(paused: bool) -> int:
 
 # ---------- EIO failures ----------
 
+# 同一路径累计 EIO 达到该次数才自动排除；瞬时抖动靠限速重试自愈，
+# 避免一次误报就把文件永久踢出队列。
+EIO_AUTO_EXCLUDE_THRESHOLD = 3
+
+
 def record_eio_failure(task_id: int, queue_id: int, rel_path: str, origin: str,
                        detail: str) -> bool:
-    """首次 EIO 即记录并精确排除对应的源路径；不删除源文件。
+    """记录 EIO 故障并累计次数；达到阈值才精确排除对应源路径，不删除源文件。
 
     迁移时队列项必须已标记 failed；扫描时 queue_id=None，目录异常仅排除该目录。
     """
@@ -601,6 +607,10 @@ def record_eio_failure(task_id: int, queue_id: int, rel_path: str, origin: str,
         row = conn.execute("SELECT occurrences, auto_excluded FROM eio_failures"
                            " WHERE task_id=? AND rel_path=?", (task_id, rel_path)).fetchone()
         if row['auto_excluded']:
+            return False
+        # 单次/偶发 EIO 多为挂载瞬时抖动，限速重试即可恢复；只有反复失败的
+        # 路径才值得精确排除，避免一次抖动把文件永久踢出队列。
+        if row['occurrences'] < EIO_AUTO_EXCLUDE_THRESHOLD:
             return False
         # 不根据含糊的异常字符串或目录路径生成通配规则；只加入这一文件的精确路径。
         # 排除输入以逗号分隔，含逗号的路径无法安全表示；其他特殊字符由 ./ 精确匹配。

@@ -977,10 +977,17 @@ class Scheduler:
                     db.set_status(item["id"], "conflict")
                 elif result == "failed":
                     if transient_source_io or item.get("_transient_io"):
-                        # 源/目标挂载 EIO 不消耗迁移重试额度，需成功扫描后才恢复写入。
-                        logger.warning("迁移暂停并等待扫描恢复：task_id=%s queue_id=%s 源=%s",
-                                       task["id"], item["id"], item["src_path"])
-                        self._pause_task_for_scan(task["id"])
+                        # 源/目标挂载 EIO 不消耗迁移重试额度。普通任务需成功扫描后才
+                        # 恢复写入；仅手动扫描的任务没有自动扫描来解除冷却，若同样
+                        # 熔断会永久冻结直到人工再触发，因此只做 60s 限速重试探测，
+                        # 由重试前的源 lstat 与传输校验充当挂载恢复的安全检查。
+                        if task.get("manual_only"):
+                            logger.warning("迁移遇挂载 I/O 故障，等待限速重试：task_id=%s queue_id=%s 源=%s",
+                                           task["id"], item["id"], item["src_path"])
+                        else:
+                            logger.warning("迁移暂停并等待扫描恢复：task_id=%s queue_id=%s 源=%s",
+                                           task["id"], item["id"], item["src_path"])
+                            self._pause_task_for_scan(task["id"])
                         db.set_status(item["id"], "failed", next_retry_at=time.time() + 60)
                         detail += "；挂载 I/O 故障，60s 后限速探测恢复"
                         if item.get('_eio_origin'):
