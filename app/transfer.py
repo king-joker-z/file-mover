@@ -109,8 +109,44 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _matching_digest(src: str, dst: str) -> Optional[str]:
-    """仅内容不同或目标缺失返回 None；I/O 错误上抛，禁止据此删源/覆盖。"""
+# 等大小文件去重判定的采样窗口：头尾各读 16MB（源为本地盘代价可忽略，
+# 目标云挂载读 32MB 即完成判定），替代云挂载上的全量读回。
+DEDUPE_SAMPLE_SPAN = 16 << 20
+
+
+def _sampled_stream_digest(stream, size: int) -> str:
+    """头尾各 DEDUPE_SAMPLE_SPAN 字节的采样摘要；等大小文件的低成本同一性判定。"""
+    digest = hashlib.sha256()
+
+    def absorb(limit):
+        remaining = limit
+        while remaining > 0:
+            chunk = stream.read(min(COPY_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+
+    stream.seek(0)
+    absorb(DEDUPE_SAMPLE_SPAN)
+    if size > DEDUPE_SAMPLE_SPAN:
+        stream.seek(max(0, size - DEDUPE_SAMPLE_SPAN))
+        absorb(DEDUPE_SAMPLE_SPAN)
+    return digest.hexdigest()
+
+
+def _sampled_digest(path: str) -> str:
+    with open(path, "rb") as stream:
+        return _sampled_stream_digest(stream, os.stat(path).st_size)
+
+
+def _matching_digest(src: str, dst: str, verify: str = "strict") -> Optional[str]:
+    """仅内容不同或目标缺失返回 None；I/O 错误上抛，禁止据此删源/覆盖。
+
+    strict 全量比对；fast/off 用头尾采样比对（等大小 + 头尾一致即判定同一），
+    避免云挂载全量读回把大文件去重拖成小时级。返回值：strict 为全量摘要，
+    fast/off 为采样摘要——调用方须以 trusted=False 落凭证，记账按采样复核。
+    """
     try:
         target = os.lstat(dst)
     except FileNotFoundError:
@@ -120,8 +156,25 @@ def _matching_digest(src: str, dst: str) -> Optional[str]:
     source_size = os.stat(src).st_size
     if source_size != target.st_size:
         return None
+    if verify in ("fast", "off"):
+        source_sample = _sampled_digest(src)
+        return source_sample if source_sample == _sampled_digest(dst) else None
     digest = _sha256(src)
     return digest if digest == _sha256(dst) else None
+
+
+# 同名封面自动保留：媒体库的 poster/fanart/thumb 等门面图以文件夹为单位，
+# 同名文件夹（重下批次）内的新版本与云端旧版本语义等价，保留目标即可，
+# 不必逐个落冲突等人工处理。
+_COMPANION_STEMS = {"poster", "fanart", "thumb", "banner", "clearart", "logo",
+                    "folder", "disc", "keyart", "landscape"}
+_COMPANION_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
+def _is_companion_artwork(dst: str) -> bool:
+    stem, ext = os.path.splitext(os.path.basename(dst))
+    return (stem.lower() in _COMPANION_STEMS
+            and ext.lower() in _COMPANION_IMAGE_EXTS)
 
 
 def _verified_nfo(dst: str, expected: bytes) -> bool:
@@ -602,7 +655,11 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
     progress_cb(copied, total) 用于上报复制进度字节，供仪表盘计算速度与 ETA。
     task.verify_mode 决定读回强度：strict（默认，发布后读回+删除前暂存）、
     fast（单次读回，无暂存文件）、off（不读回，仅核对大小）；NFO 与普通文件
-    遵循同一组设置（含 direct_publish）。
+    遵循同一组设置（含 direct_publish）。目标已存在的等大小去重比对也按模式
+    分级：strict 全量哈希，fast/off 头尾各 16MB 采样判定（大文件不再整段
+    读回）；采样判定的凭证标记 trusted=False，记账恢复按采样复核。
+    task.companion_auto_keep 开启时，poster/fanart/thumb 等同名封面与目标
+    冲突不逐个落冲突记录：保留云端版本并按迁移语义删除源。
     """
     def _stage(name: str):
         if stage_cb is None:
@@ -661,11 +718,41 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
 
     try:
         _stage("检查目标文件")
+        # 同名封面自动保留：媒体库的 poster/fanart/thumb 等门面图以文件夹为
+        # 单位，同名文件夹（重下批次）内的新版本与云端旧版本语义等价——保留
+        # 目标并按迁移语义删源，不逐个落冲突等人工处理。
+        if (not is_nfo and task.get("companion_auto_keep") and policy != "overwrite"
+                and _is_companion_artwork(dst)):
+            try:
+                existing = os.lstat(dst)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and stat.S_ISREG(existing.st_mode):
+                target_hash = _sha256(dst)  # 封面是小文件，全量读回即可
+                source_hash = _sha256(src)
+                if task.get("after_action", "delete") == "delete":
+                    _stage("保留目标封面并删除源文件")
+                    if verify == "strict":
+                        deleted, reason = _remove_verified_source(
+                            src, dst, source_info, task["dst_dir"],
+                            _mount_identity(task["dst_dir"]),
+                            (source_info.st_size, source_hash),
+                            (existing.st_size, target_hash))
+                    else:
+                        deleted, reason = _unlink_verified_source(
+                            src, source_info, dst, existing.st_size)
+                    if not deleted:
+                        return "failed", reason
+                    if cfg.get("remove_empty_dirs"):
+                        _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
+                item["_verified_target"] = (existing.st_size, target_hash, True,
+                                             source_info.st_size, source_hash)
+                return "success", "ok (同名封面保留目标版本)"
         resolved = _resolve_conflict(dst, policy)
         # 目标已经是相同内容时不再覆盖或重命名；直接进入读回并删源流程。
         if resolved is not None and resolved[1] != "none":
             same = (_verified_nfo(dst, content) if is_nfo else
-                    _matching_digest(src, dst) is not None)
+                    _matching_digest(src, dst, verify) is not None)
             if same:
                 resolved = None
         # 故障期间不应把“源可读、目标暂时不可读”当成可覆盖。
@@ -677,6 +764,11 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
             if existing is not None and stat.S_ISREG(existing.st_mode):
                 if is_nfo:
                     _verified_nfo(dst, content)
+                elif verify in ("fast", "off"):
+                    # fast/off：旧目标即将被覆盖，读它只为探测挂载可读性，
+                    # 读首块即可；strict 保留全量读回的探测语义。
+                    with open(dst, "rb") as stream:
+                        stream.read(COPY_CHUNK_SIZE)
                 else:
                     _sha256(dst)
     except OSError as exc:
@@ -720,7 +812,7 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
         elif not is_nfo:
             try:
                 _stage("比对目标与源内容")
-                matching_hash = _matching_digest(src, dst)
+                matching_hash = _matching_digest(src, dst, verify)
             except OSError as exc:
                 return _failed_io(item, "目标或源文件读回失败，未删除或覆盖", exc)
             if matching_hash is None:
@@ -735,7 +827,7 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
                             src, dst, source_stat, task["dst_dir"], target_device,
                             (source_stat.st_size, matching_hash))
                     else:
-                        # fast/off：目标内容刚经过全量比对一致，直接删除源，不产生暂存文件。
+                        # fast/off：目标与源刚经头尾采样判定一致，直接删除源，不产生暂存文件。
                         deleted, reason = _unlink_verified_source(
                             src, source_stat, dst, source_stat.st_size)
                     if not deleted:
@@ -744,9 +836,15 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
                     return _failed_io(item, "源文件删除失败", exc)
                 if cfg.get("remove_empty_dirs"):
                     _remove_empty_parent_dirs(os.path.dirname(src), stop_at=task["src_dir"])
-            item["_verified_target"] = (_size(dst), matching_hash, True,
-                                         _size(dst), matching_hash)
-            return "success", "ok (目标内容一致)"
+            if verify == "strict":
+                item["_verified_target"] = (_size(dst), matching_hash, True,
+                                             _size(dst), matching_hash)
+                return "success", "ok (目标内容一致)"
+            # fast/off：头尾采样判定的同一性。凭证 trusted=False 标记采样强度，
+            # 记账恢复按采样复核；migrated_files 不落采样摘要（dst_sha256 为空）。
+            item["_verified_target"] = (_size(dst), matching_hash, False,
+                                         source_info.st_size, matching_hash)
+            return "success", "ok (目标内容一致，头尾采样)"
         else:
             if is_nfo:
                 return "conflict", f"NFO 目标已存在且内容不同: {dst}；需人工确认，不自动覆盖（策略 skip）"

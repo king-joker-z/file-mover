@@ -719,18 +719,25 @@ class Scheduler:
                 before = os.fstat(target_fd)
                 if not stat.S_ISREG(before.st_mode) or before.st_size != item['verified_size']:
                     raise OSError('目标大小或类型已变化，需人工核查')
-                digest = hashlib.sha256() if rehash else None
                 if rehash:
                     with os.fdopen(os.dup(target_fd), 'rb') as stream:
-                        for chunk in iter(lambda: stream.read(transfer.COPY_CHUNK_SIZE), b''):
-                            digest.update(chunk)
+                        if item['verified_trusted']:
+                            digest = hashlib.sha256()
+                            for chunk in iter(lambda: stream.read(transfer.COPY_CHUNK_SIZE), b''):
+                                digest.update(chunk)
+                            actual = digest.hexdigest()
+                        else:
+                            # 采样凭证（trusted=False）按同等强度做头尾采样复核
+                            actual = transfer._sampled_stream_digest(stream, before.st_size)
+                else:
+                    actual = None
                 after = os.fstat(target_fd)
                 named = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
                 identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
-                if ((rehash and digest.hexdigest() != item['verified_sha256'])
+                if ((rehash and actual != item['verified_sha256'])
                         or identity(before) != identity(after)
                         or identity(after) != identity(named)):
-                    raise OSError('目标完整读回与已校验哈希不一致，需人工核查')
+                    raise OSError('目标读回复核与已校验哈希不一致，需人工核查')
             finally:
                 os.close(target_fd)
         finally:
@@ -741,13 +748,20 @@ class Scheduler:
             if not item['verified_trusted']:
                 raise OSError('未授权目标且源文件缺失，需人工核查')
         else:
-            expected = ((item['source_size'], item['source_sha256'])
-                        if src.lower().endswith('.nfo') else
-                        (item['verified_size'], item['verified_sha256']))
+            if src.lower().endswith('.nfo'):
+                expected, source_digest = ((item['source_size'], item['source_sha256']),
+                                           transfer._sha256(src))
+            elif item['verified_trusted']:
+                expected, source_digest = ((item['verified_size'], item['verified_sha256']),
+                                           transfer._sha256(src))
+            else:
+                # 采样凭证：源同样按头尾采样复核，与凭证判定强度一致
+                expected, source_digest = ((item['verified_size'], item['verified_sha256']),
+                                           transfer._sampled_digest(src))
             if (not stat.S_ISREG(source_stat.st_mode)
                     or os.path.commonpath((src_root, os.path.realpath(src))) != src_root
                     or expected[1] is None
-                    or (source_stat.st_size, transfer._sha256(src)) != expected):
+                    or (source_stat.st_size, source_digest) != expected):
                 raise OSError('源文件身份不匹配，需人工核查')
 
     def _retry_accounting(self):

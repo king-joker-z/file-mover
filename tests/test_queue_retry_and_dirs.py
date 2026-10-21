@@ -1,5 +1,6 @@
 """队列重试 / 目录浏览 / 记账重试与日志结果回归测试（仅使用临时目录）。"""
 import errno
+import hashlib
 import os
 import tempfile
 import time
@@ -134,6 +135,51 @@ class QueueRetryAndDirsTests(unittest.TestCase):
         self.assertTrue(response.json()["accounting"])
         self.assertNotIn(item["id"], worker._accounting_blocked)
         self.assertEqual(db.list_queue()[0]["status"], "accounting_pending")
+
+    # ---------- 采样凭证（trusted=False）的记账恢复 ----------
+
+    def test_retry_accounting_sampled_credential_reverifies_by_sampling(self):
+        # fast/off 去重落下的采样凭证：恢复时按采样复核，dst_sha256 不落采样摘要
+        _, item = self.enqueue_item(content=b"x" * 4096)
+        target = self.dst / "movie.mp4"
+        target.write_bytes(b"x" * 4096)
+        sampled = transfer._sampled_digest(str(target))
+        db.set_status(item["id"], "transferring")
+        db.persist_accounting_pending(item["id"], item, (4096, sampled, 0, 4096, sampled))
+
+        worker = scheduler.Scheduler()
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._retry_accounting()
+
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+        # 采样凭证不写 dst_sha256：不进入已迁移视频列表（无完整哈希可依）
+        self.assertEqual(db.list_migrated_videos(item["task_id"], {".mp4"}), [])
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT dst_sha256 FROM migrated_files WHERE rel_path='movie.mp4'").fetchone()
+        self.assertIsNone(row[0])
+
+    def test_retry_accounting_sampled_credential_detects_tail_change(self):
+        # 目标尾部被改写：采样复核发现摘要不一致，转人工核查而非记账完成
+        content = bytes(range(256)) * 8   # 2048 字节
+        _, item = self.enqueue_item(content=content)
+        target = self.dst / "movie.mp4"
+        with patch.object(transfer, "DEDUPE_SAMPLE_SPAN", 16):
+            target.write_bytes(content)
+            sampled = transfer._sampled_digest(str(target))
+            changed = bytearray(content)
+            changed[-1] ^= 0xFF
+            target.write_bytes(bytes(changed))
+            db.set_status(item["id"], "transferring")
+            db.persist_accounting_pending(item["id"], item, (2048, sampled, 0, 2048, sampled))
+
+        worker = scheduler.Scheduler()
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._retry_accounting()
+
+        self.assertEqual(db.list_queue()[0]["status"], "accounting_pending")
+        self.assertIn(item["id"], worker._accounting_blocked)
+        self.assertIn("人工核查", worker.last_accounting_error)
 
     # ---------- M6: 发布后读回失败清理已转正目标 ----------
 

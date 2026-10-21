@@ -91,6 +91,9 @@ class TaskIn(BaseModel):
     # 直写发布：新目标跳过 tmp + rename 转正，目标名独占创建后直接写入；
     # workaround：部分网盘挂载对刚上传完的大文件执行 rename 会无限卡死。
     direct_publish: bool = False
+    # 同名封面保留目标：同名文件夹（如重下批次）的 poster/fanart/thumb 等门面图
+    # 与云端已有版本同名时，保留目标并删除源，不落冲突等人工处理。
+    companion_auto_keep: bool = False
     # 文件范围过滤：0 = 不限制。min/max 单位 MB；min_age_minutes = 只迁移
     # 最后修改时间至少在 X 分钟前的文件（避开刚下载/正在写入的大文件）。
     min_size_mb: float = Field(default=0, ge=0, le=1048576, allow_inf_nan=False)

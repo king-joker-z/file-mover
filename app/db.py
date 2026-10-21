@@ -127,6 +127,7 @@ def _init_schema(conn: sqlite3.Connection):
             video_only INTEGER NOT NULL DEFAULT 0,
             verify_mode TEXT NOT NULL DEFAULT 'strict',
 direct_publish INTEGER NOT NULL DEFAULT 0,
+            companion_auto_keep INTEGER NOT NULL DEFAULT 0,
             min_size_mb REAL NOT NULL DEFAULT 0,
             max_size_mb REAL NOT NULL DEFAULT 0,
             min_age_minutes INTEGER NOT NULL DEFAULT 0,
@@ -256,6 +257,8 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks ADD COLUMN verify_mode TEXT NOT NULL DEFAULT 'strict'")
     if "direct_publish" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN direct_publish INTEGER NOT NULL DEFAULT 0")
+    if "companion_auto_keep" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN companion_auto_keep INTEGER NOT NULL DEFAULT 0")
     if "transfer_workers" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN transfer_workers INTEGER NOT NULL DEFAULT 1")
     if "paused" not in cols:
@@ -384,9 +387,10 @@ def create_task(data: dict) -> int:
                include_patterns, exclude_patterns, conflict_policy, path_rule, after_action,
                run_windows, filename_nfo_enabled, manual_only, async_transfer,
                transfer_workers, video_only, verify_mode, direct_publish,
+               companion_auto_keep,
                min_size_mb, max_size_mb, min_age_minutes,
                enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["name"], data["src_dir"], data["dst_dir"], data.get("interval_seconds", 5),
              data.get("scan_interval", 30), data.get("include_patterns", ""),
              data.get("exclude_patterns", ""), data.get("conflict_policy", "skip"),
@@ -398,6 +402,7 @@ def create_task(data: dict) -> int:
              1 if data.get("video_only") else 0,
              normalize_verify_mode(data.get("verify_mode")),
              1 if data.get("direct_publish") else 0,
+             1 if data.get("companion_auto_keep") else 0,
              normalize_size_mb(data.get("min_size_mb")),
              normalize_size_mb(data.get("max_size_mb")),
              normalize_min_age_minutes(data.get("min_age_minutes")),
@@ -413,7 +418,7 @@ def update_task(task_id: int, data: dict):
               "path_rule", "after_action", "run_windows",
               "filename_nfo_enabled", "manual_only", "async_transfer",
               "transfer_workers", "video_only",
-              "verify_mode", "direct_publish",
+              "verify_mode", "direct_publish", "companion_auto_keep",
               "min_size_mb", "max_size_mb", "min_age_minutes",
               "enabled"):
         if k in data:
@@ -426,7 +431,7 @@ def update_task(task_id: int, data: dict):
                 vals.append(normalize_size_mb(data[k]))
             elif k == "min_age_minutes":
                 vals.append(normalize_min_age_minutes(data[k]))
-            elif k == "video_only":
+            elif k in ("video_only", "companion_auto_keep"):
                 vals.append(1 if data[k] else 0)
             else:
                 vals.append(data[k])

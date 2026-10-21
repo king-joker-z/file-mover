@@ -1,6 +1,7 @@
 """NFO 扫描与迁移数据安全回归测试（仅使用临时目录）。"""
 import asyncio
 import errno
+import hashlib
 import json
 import os
 import sqlite3
@@ -3940,6 +3941,157 @@ class VerifyModeTests(unittest.TestCase):
         self.assertIn("+nfo:role", detail)
         self.assertFalse(src.exists())            # 长度核对用修正后内容，删除成功
         self.assertEqual((self.dst / "fix.nfo").read_bytes(), fixed)
+
+    # ---------- 头尾采样去重：fast/off 的等大小比对不再全量哈希 ----------
+
+    def test_off_mode_dedup_uses_sampled_digest_without_full_hash(self):
+        # 等大小目标在 off 模式下用头尾采样判定同一：不再对大文件做全量哈希
+        task = dict(self.task, verify_mode="off")
+        item, content = self.video_item()
+        (self.dst / "movie.mp4").write_bytes(content)
+
+        def no_full_hash(path):
+            raise AssertionError("off 去重不应做全量哈希")
+
+        with patch.object(transfer, "_sha256", side_effect=no_full_hash):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("头尾采样", detail)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual((self.dst / "movie.mp4").read_bytes(), content)
+        size, digest, trusted, _, _ = item["_verified_target"]
+        self.assertEqual(size, len(content))
+        self.assertFalse(trusted)   # 采样凭证：migrated_files.dst_sha256 不落采样摘要
+        self.assertEqual(digest, transfer._sampled_digest(str(self.dst / "movie.mp4")))
+
+    def test_fast_mode_dedup_midfile_difference_still_matches(self):
+        # 采样边界：中段差异不在头尾窗口内，fast 判定同一（速度换精度的边界）
+        content = bytes(range(256)) * 8   # 2048 字节
+        with patch.object(transfer, "DEDUPE_SAMPLE_SPAN", 16):
+            item, _ = self.video_item(content=content)
+            target = bytearray(content)
+            target[1000] ^= 0xFF          # 中段差异
+            (self.dst / "movie.mp4").write_bytes(bytes(target))
+            result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("头尾采样", detail)
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertTrue(item["_verified_target"][2] is False)
+
+    def test_fast_mode_dedup_tail_difference_conflicts(self):
+        content = bytes(range(256)) * 8
+        with patch.object(transfer, "DEDUPE_SAMPLE_SPAN", 16):
+            item, _ = self.video_item(content=content)
+            target = bytearray(content)
+            target[-1] ^= 0xFF            # 尾部差异在采样窗口内
+            (self.dst / "movie.mp4").write_bytes(bytes(target))
+            result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "conflict", detail)
+        self.assertTrue(Path(item["src_path"]).exists())    # 冲突保留源
+
+    def test_strict_mode_dedup_midfile_difference_conflicts(self):
+        # strict 去重保持全量比对：中段差异也判定冲突，且凭证 trusted=True
+        task = dict(self.task, verify_mode="strict")
+        content = bytes(range(256)) * 8
+        with patch.object(transfer, "DEDUPE_SAMPLE_SPAN", 16):
+            item, _ = self.video_item(content=content)
+            target = bytearray(content)
+            target[1000] ^= 0xFF
+            (self.dst / "movie.mp4").write_bytes(bytes(target))
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "conflict", detail)
+        self.assertTrue(Path(item["src_path"]).exists())
+
+    def test_strict_mode_dedup_credential_is_trusted_full_digest(self):
+        task = dict(self.task, verify_mode="strict")
+        item, content = self.video_item()
+        (self.dst / "movie.mp4").write_bytes(content)
+        result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        size, digest, trusted, _, _ = item["_verified_target"]
+        self.assertTrue(trusted)
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+
+    # ---------- 同名封面保留目标（companion_auto_keep） ----------
+
+    def test_companion_auto_keep_conflict_keeps_target_and_deletes_source(self):
+        task = dict(self.task, companion_auto_keep=True)
+        item, _ = self.video_item(name="poster.jpg", content=b"new artwork")
+        (self.dst / "poster.jpg").write_bytes(b"cloud artwork")
+        result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("同名封面", detail)
+        self.assertEqual((self.dst / "poster.jpg").read_bytes(), b"cloud artwork")  # 云端版本保留
+        self.assertFalse(Path(item["src_path"]).exists())                          # 源删除
+        self.assertEqual(list(self.src.iterdir()), [])                             # 无暂存残留
+        size, digest, trusted, _, _ = item["_verified_target"]
+        self.assertEqual(size, len(b"cloud artwork"))
+        self.assertTrue(trusted)
+        self.assertEqual(digest, hashlib.sha256(b"cloud artwork").hexdigest())
+
+    def test_companion_auto_keep_strict_mode_stages_and_cleans(self):
+        task = dict(self.task, verify_mode="strict", companion_auto_keep=True)
+        item, _ = self.video_item(name="fanart.png", content=b"local fan")
+        (self.dst / "fanart.png").write_bytes(b"cloud fan")
+        counts, hashed = {"fd": 0, "sha": 0}, []
+        fd_cb, sha_cb = self._counting_hashes(counts, hashed)
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual((self.dst / "fanart.png").read_bytes(), b"cloud fan")
+        self.assertFalse(Path(item["src_path"]).exists())
+        self.assertEqual(list(self.src.iterdir()), [])   # 暂存文件随删除清理
+        self.assertTrue(any(name.startswith(".fm-source-") for name in hashed))  # strict 走暂存删除
+
+    def test_companion_auto_keep_missing_target_migrates_normally(self):
+        # 目标不存在时开关不生效：正常写入新文件
+        task = dict(self.task, companion_auto_keep=True)
+        item, content = self.video_item(name="thumb.jpg", content=b"thumb")
+        result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertNotIn("同名封面", detail)
+        self.assertEqual((self.dst / "thumb.jpg").read_bytes(), content)
+        self.assertFalse(Path(item["src_path"]).exists())
+
+    def test_companion_auto_keep_disabled_conflicts_normally(self):
+        # 未开启开关：同名封面按冲突策略处理
+        item, _ = self.video_item(name="poster.jpg", content=b"new artwork")
+        (self.dst / "poster.jpg").write_bytes(b"cloud artwork")
+        result, detail = transfer.transfer(item, self.task)
+        self.assertEqual(result, "conflict", detail)
+        self.assertTrue(Path(item["src_path"]).exists())
+
+    def test_companion_auto_keep_ignores_non_artwork_files(self):
+        # 视频等非门面图不适用开关：内容不同即冲突
+        task = dict(self.task, companion_auto_keep=True)
+        item, _ = self.video_item(name="movie.mp4", content=b"new video")
+        (self.dst / "movie.mp4").write_bytes(b"old video")
+        result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "conflict", detail)
+        self.assertTrue(Path(item["src_path"]).exists())
+
+    def test_companion_auto_keep_respects_overwrite_policy(self):
+        # 覆盖策略优先：明确要求覆盖时不保留目标
+        task = dict(self.task, companion_auto_keep=True, conflict_policy="overwrite")
+        item, _ = self.video_item(name="poster.jpg", content=b"brand new")
+        (self.dst / "poster.jpg").write_bytes(b"old cloud")
+        result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual((self.dst / "poster.jpg").read_bytes(), b"brand new")
+        self.assertFalse(Path(item["src_path"]).exists())
+
+    def test_is_companion_artwork_boundary(self):
+        checks = {
+            "poster.jpg": True, "FanArt.PNG": True, "folder.jpeg": True,
+            "movie.jpg": False,       # 词干不是门面图名
+            "poster.mp4": False,      # 图片词干但非图片扩展
+            "a-poster.jpg": False,    # 必须整个文件名（词干）等于门面图名
+            "poster.txt": False, "thumb.webp": True, "disc.gif": True,
+        }
+        for name, expected in checks.items():
+            self.assertEqual(transfer._is_companion_artwork(str(self.dst / name)),
+                             expected, name)
 
     def test_renameat2_publishes_without_second_copy(self):
         """挂载不支持硬链接时优先 renameat2 原子转正：零复制，不再写第二遍。"""
