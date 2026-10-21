@@ -204,6 +204,15 @@ direct_publish INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (task_id, rel_path)
         );
         CREATE INDEX IF NOT EXISTS idx_eio_failures_last ON eio_failures(last_at DESC);
+        CREATE TABLE IF NOT EXISTS queue_exclusions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            src_path TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE (task_id, rel_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_exclusions_task ON queue_exclusions(task_id, id DESC);
         CREATE TABLE IF NOT EXISTS upload_rounds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER NOT NULL,
@@ -510,6 +519,7 @@ def delete_task(task_id: int):
             raise ValueError("任务仍有正在迁移或待记账的文件，请等待完成或先核查异常")
         conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         conn.execute("DELETE FROM queue WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM queue_exclusions WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM migrated_files WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM scan_failures WHERE task_id=?", (task_id,))
         # 保留故障审计记录，与轮次历史一样可在删除任务后查看。
@@ -1146,6 +1156,80 @@ def delete_queue_item(queue_id: int) -> bool:
         conn.execute("DELETE FROM queue WHERE id=?", (queue_id,))
         _finish_rounds(conn)
         return True
+
+
+# ---------- 永久排除：人工移除且之后不再入队 ----------
+
+def delete_queue_item_permanently(queue_id: int):
+    """永久移除队列项：登记排除并清理该路径全部未完成队列行。
+
+    done/conflict 历史行保留；排除以 (task_id, rel_path) 精确匹配，扫描时跳过。
+    返回 {task_id, rel_path, src_path, deleted_ids}；队列项不存在返回 None。
+    """
+    conn = get_conn()
+    with _lock, conn:
+        row = conn.execute("SELECT task_id, rel_path, src_path FROM queue WHERE id=?",
+                           (queue_id,)).fetchone()
+        if row is None:
+            return None
+        rel_path = row["rel_path"]
+        if (not rel_path or os.path.isabs(rel_path) or any(
+                part in ('', '.', '..') for part in rel_path.split(os.sep))):
+            raise ValueError("队列项相对路径不安全，拒绝登记排除")
+        conn.execute("INSERT OR IGNORE INTO queue_exclusions"
+                     " (task_id, rel_path, src_path, created_at) VALUES (?,?,?,?)",
+                     (row["task_id"], rel_path, row["src_path"], now_str()))
+        ids = [entry["id"] for entry in conn.execute(
+            "SELECT id FROM queue WHERE task_id=? AND rel_path=? AND status NOT IN"
+            " ('done','conflict')", (row["task_id"], rel_path))]
+        for item_id in ids:
+            conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                         " WHERE status NOT IN ('done','conflict') AND queue_id=? AND round_id IN"
+                         " (SELECT id FROM upload_rounds WHERE finished_at IS NULL)", (item_id,))
+            conn.execute("DELETE FROM queue WHERE id=?", (item_id,))
+        _finish_rounds(conn)
+        return {"task_id": row["task_id"], "rel_path": rel_path,
+                "src_path": row["src_path"], "deleted_ids": ids}
+
+
+def task_excluded_paths(task_id: int) -> set[str]:
+    """扫描用：该任务被永久排除的 rel_path 集合。"""
+    with _lock:
+        return {row["rel_path"] for row in get_conn().execute(
+            "SELECT rel_path FROM queue_exclusions WHERE task_id=?", (task_id,))}
+
+
+def list_exclusions(task_id=None, limit=50, offset=0):
+    where = " WHERE q.task_id=?" if task_id is not None else ""
+    params = (task_id,) if task_id is not None else ()
+    with _lock:
+        rows = get_conn().execute(
+            f"SELECT q.id, q.task_id, q.rel_path, q.src_path, q.created_at,"
+            f" t.name task_name FROM queue_exclusions q LEFT JOIN tasks t ON t.id=q.task_id"
+            f"{where} ORDER BY q.id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_exclusions(task_id=None) -> int:
+    where = " WHERE task_id=?" if task_id is not None else ""
+    params = (task_id,) if task_id is not None else ()
+    with _lock:
+        row = get_conn().execute(
+            f"SELECT COUNT(*) n FROM queue_exclusions{where}", params).fetchone()
+    return row["n"]
+
+
+def delete_exclusion(exclusion_id: int):
+    """恢复：删除排除项；返回 {task_id, rel_path}，不存在返回 None。"""
+    conn = get_conn()
+    with _lock, conn:
+        row = conn.execute("SELECT task_id, rel_path FROM queue_exclusions WHERE id=?",
+                           (exclusion_id,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM queue_exclusions WHERE id=?", (exclusion_id,))
+        return dict(row)
 
 
 def clear_logs() -> int:

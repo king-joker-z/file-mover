@@ -251,6 +251,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
         progress["current"] = "检查目标挂载"
     initial_device = transfer._mount_identity(task["dst_dir"])
     excludes = _exclude_patterns(task.get("exclude_patterns"), src)
+    permanent_excludes = db.task_excluded_paths(task["id"])
     ignores = cfg.get("ignore_suffixes", [])
     filename_nfo_enabled = task.get("filename_nfo_enabled", False)
     # 两种生成格式不能在同一任务上竞争同一个 .nfo 路径。
@@ -292,6 +293,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             rel = os.path.relpath(path, src)
             if (name.startswith(".") or name.endswith(".moving")
                     or any(name.endswith(s) for s in ignores)
+                    or (permanent_excludes and rel in permanent_excludes)
                     or (excludes and _match_any(rel, name, excludes))):
                 # 传输中断残留的源暂存文件（产生时目标已校验完成）超期自动清理。
                 if name.startswith(".fm-source-") and name.endswith(".moving"):
@@ -343,6 +345,7 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
                 if (fn.startswith(".")
                         or any(fn.endswith(s) for s in ignores)
                         or (includes and not _match_any(rel_video, fn, includes))
+                        or (permanent_excludes and rel_video in permanent_excludes)
                         or (excludes and _match_any(rel_video, fn, excludes))
                         or not _file_in_scope(samples.get(full_p), task)
                         or not _stable(full_p, wait)):
@@ -410,6 +413,9 @@ def _scan_task(task: dict, progress: Optional[dict] = None, on_dir=None,
             if includes and not (_match_any(rel, fn, includes) or companion_included):
                 continue
             if excludes and _match_any(rel, fn, excludes):
+                continue
+            # 永久排除（人工移除且选择不再入队）：精确 rel_path 匹配，静默跳过。
+            if permanent_excludes and rel in permanent_excludes:
                 continue
             # 已静默且仍是本轮枚举的普通文件才入队。
             if not _stable(full, wait):

@@ -237,6 +237,86 @@ class QueueRetryAndDirsTests(unittest.TestCase):
         # 移除后任务可正常删除
         db.delete_task(task_id)
 
+    # ---------- 永久排除：移除后不再入队，可恢复 ----------
+
+    def test_permanent_remove_deletes_row_and_excludes_path(self):
+        task_id = db.create_task(dict(self.task, name="perm", interval_seconds=0))
+        src = self.source("a.mp4", b"x")
+        db.enqueue(task_id, str(src), "a.mp4", str(self.dst / "a.mp4"), 1)
+        other = self.source("b.mp4", b"y")
+        db.enqueue(task_id, str(other), "b.mp4", str(self.dst / "b.mp4"), 1)
+        # b 已完成：永久移除 a 时 done 历史行不受波及
+        db.set_status(next(r["id"] for r in db.list_queue() if r["rel_path"] == "b.mp4"),
+                      "done")
+        first_a = next(r["id"] for r in db.list_queue() if r["rel_path"] == "a.mp4")
+
+        info = db.delete_queue_item_permanently(first_a)
+        self.assertEqual(info["rel_path"], "a.mp4")
+        self.assertEqual(info["deleted_ids"], [first_a])
+        self.assertEqual([(r["rel_path"], r["status"]) for r in db.list_queue()],
+                         [("b.mp4", "done")])
+        self.assertEqual(db.task_excluded_paths(task_id), {"a.mp4"})
+        # 重复永久移除同一路径（如换一行再次触发）幂等：排除不重复登记
+        again = db.delete_queue_item_permanently(first_a)
+        self.assertIsNone(again)                            # 行已不存在
+        self.assertEqual(db.count_exclusions(task_id), 1)
+
+    def test_scanner_skips_and_restore_reenqueues(self):
+        task_id = db.create_task(dict(self.task, name="scan", interval_seconds=0,
+                                      enabled=True))
+        task = db.get_task(task_id)
+        self.source("skip.mp4", b"z")
+        scanner.scan_task(task, skip_stable_check=True)
+        self.assertEqual(len(db.list_queue()), 1)
+        item = db.list_queue()[0]
+
+        db.delete_queue_item_permanently(item["id"])
+        scanner.scan_task(task, skip_stable_check=True)
+        self.assertEqual(db.list_queue(), [])             # 永久排除后不再入队
+
+        restored = db.delete_exclusion(db.list_exclusions()[0]["id"])
+        self.assertEqual(restored["rel_path"], "skip.mp4")
+        scanner.scan_task(task, skip_stable_check=True)
+        self.assertEqual([r["rel_path"] for r in db.list_queue()], ["skip.mp4"])
+
+    def test_delete_task_drops_exclusions(self):
+        task_id = db.create_task(dict(self.task, name="del", interval_seconds=0))
+        src = self.source("c.mp4", b"w")
+        db.enqueue(task_id, str(src), "c.mp4", str(self.dst / "c.mp4"), 1)
+        db.delete_queue_item_permanently(db.list_queue()[0]["id"])
+        self.assertEqual(db.count_exclusions(), 1)
+        db.delete_task(task_id)
+        self.assertEqual(db.count_exclusions(), 0)
+
+    def test_api_permanent_remove_and_restore(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id, item = self.enqueue_item()
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            missing = client.delete("/api/queue/99999?permanent=true", headers=headers)
+            self.assertEqual(missing.status_code, 404)
+            response = client.delete(f"/api/queue/{item['id']}?permanent=true",
+                                     headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["permanent"])
+            self.assertEqual(db.list_queue(), [])
+
+            listed = client.get("/api/exclusions", headers=headers).json()
+            self.assertEqual(listed["total"], 1)
+            self.assertEqual(listed["items"][0]["rel_path"], "movie.mp4")
+            self.assertEqual(listed["items"][0]["task_name"], "test")
+
+            gone = client.delete("/api/exclusions/99999", headers=headers)
+            self.assertEqual(gone.status_code, 404)
+            restored = client.delete(f"/api/exclusions/{listed['items'][0]['id']}",
+                                     headers=headers)
+            self.assertEqual(restored.status_code, 200)
+            self.assertEqual(restored.json()["rel_path"], "movie.mp4")
+            self.assertEqual(db.count_exclusions(), 0)
+
     # ---------- L6: 扫描收尾异常不得泄漏 scanning 标记 ----------
 
     def test_run_scan_finally_resets_active_marker_on_db_error(self):

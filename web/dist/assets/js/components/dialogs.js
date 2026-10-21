@@ -29,6 +29,29 @@ export function confirmDialog(message, { title = "请确认", okText = "确定",
 }
 
 /**
+ * 多选对话框：choices 为 [{ text, value, danger?, gray? }]，点「取消」或关闭返回 null。
+ */
+export function choiceDialog(message, { title = "请选择", choices = [] } = {}) {
+  return new Promise(resolve => {
+    const foot = document.createElement("div");
+    foot.style.cssText = "display:flex;gap:10px;justify-content:flex-end;width:100%";
+    foot.innerHTML =
+      `<button type="button" class="btn gray" data-act="cancel">取消</button>` +
+      choices.map((c, i) =>
+        `<button type="button" class="btn ${c.danger ? "red" : c.gray ? "gray" : ""}" data-act="${i}">${c.text}</button>`).join("");
+    const modal = openModal({ title, body: `<div class="dialog-msg"></div>`, footer: foot,
+      dialogClass: "dialog-card", onClose: () => done(null) });
+    modal.body.querySelector(".dialog-msg").textContent = message;
+    let settled = false;
+    const done = value => { if (!settled) { settled = true; resolve(value); modal.close(); } };
+    foot.querySelector('[data-act="cancel"]').onclick = () => done(null);
+    choices.forEach((c, i) => {
+      foot.querySelector(`[data-act="${i}"]`).onclick = () => done(c.value);
+    });
+  });
+}
+
+/**
  * 输入对话框。
  * @returns {Promise<string|null>} 取消返回 null
  */

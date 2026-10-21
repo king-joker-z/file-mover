@@ -15,6 +15,7 @@ import * as tasks from "./pages/tasks.js";
 import * as rounds from "./pages/rounds.js";
 import * as eio from "./pages/eio.js";
 import * as queue from "./pages/queue.js";
+import * as exclusions from "./pages/exclusions.js";
 import * as logs from "./pages/logs.js";
 import * as settings from "./pages/settings.js";
 import * as browse from "./pages/browse.js";
@@ -26,6 +27,7 @@ const TABS = [
   { id: "rounds", label: "上传轮次", page: rounds },
   { id: "eio", label: "EIO 故障", page: eio },
   { id: "queue", label: "队列", page: queue },
+  { id: "exclusions", label: "永久排除", page: exclusions },
   { id: "logs", label: "日志", page: logs },
   { id: "settings", label: "设置", page: settings },
   { id: "browse", label: "文件浏览", page: browse },
@@ -139,6 +141,7 @@ function startPolling() {
     if (store.activeTab === "tasks") tasks.loadTasks();
     if (store.activeTab === "eio") eio.load();
     if (store.activeTab === "queue") queue.load();
+    if (store.activeTab === "exclusions") exclusions.load();
   });
 }
 

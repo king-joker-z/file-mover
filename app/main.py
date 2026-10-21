@@ -649,13 +649,61 @@ def api_retry_failed():
 
 
 @app.delete("/api/queue/{queue_id}")
-def api_delete_queue_item(queue_id: int):
-    """人工移除单个队列项：清卡死记录（待记账/迁移中无出路的项等）。"""
+def api_delete_queue_item(queue_id: int, permanent: bool = False):
+    """人工移除单个队列项：清卡死记录（待记账/迁移中无出路的项等）。
+
+    permanent=true 额外登记永久排除：该文件之后扫描不再入队（可在「永久排除」页恢复）。
+    """
+    if permanent:
+        try:
+            info = db.delete_queue_item_permanently(queue_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if info is None:
+            raise HTTPException(404, "队列项不存在")
+        for item_id in info["deleted_ids"]:
+            scheduler.forget_queue_item(item_id)
+        logger.warning("永久移除队列项：queue_id=%s task_id=%s 路径=%s 清理行数=%d",
+                       queue_id, info["task_id"], info["rel_path"], len(info["deleted_ids"]))
+        return {"ok": True, "removed": True, "permanent": True,
+                "deleted_ids": info["deleted_ids"]}
     if not db.delete_queue_item(queue_id):
         raise HTTPException(404, "队列项不存在")
     scheduler.forget_queue_item(queue_id)
     logger.warning("人工移除队列项：queue_id=%s", queue_id)
-    return {"ok": True, "removed": True}
+    return {"ok": True, "removed": True, "permanent": False}
+
+
+# ---------- 永久排除 ----------
+
+@app.get("/api/exclusions")
+def api_list_exclusions(task_id: Optional[int] = None, limit: int = 50, offset: int = 0):
+    if not 1 <= limit <= 1000 or offset < 0:
+        raise HTTPException(400, "分页参数不合法")
+    return {"items": db.list_exclusions(task_id, limit, offset),
+            "total": db.count_exclusions(task_id)}
+
+
+@app.delete("/api/exclusions/{exclusion_id}")
+def api_delete_exclusion(exclusion_id: int):
+    """恢复永久排除的文件：移除排除项并立即重扫，文件将重新入队。"""
+    info = db.delete_exclusion(exclusion_id)
+    if info is None:
+        raise HTTPException(404, "排除项不存在")
+    task = db.get_task(info["task_id"])
+    if task is not None and not task.get("enabled"):
+        logger.info("恢复永久排除项：id=%s task_id=%s 路径=%s（任务停用，待启用后扫描入队）",
+                    exclusion_id, info["task_id"], info["rel_path"])
+        return {"ok": True, "task_id": info["task_id"], "rel_path": info["rel_path"],
+                "rescan": False, "message": "任务已停用，恢复后下次扫描将重新入队"}
+    result = scheduler.sync_now(info["task_id"])
+    if not result.get("ok"):
+        # 排除项已移除；扫描触发失败只提示，任务下轮定时扫描仍会重新入队。
+        raise HTTPException(503, result.get("message", "重新扫描触发失败"))
+    logger.info("恢复永久排除项：id=%s task_id=%s 路径=%s", exclusion_id,
+                info["task_id"], info["rel_path"])
+    return {"ok": True, "task_id": info["task_id"], "rel_path": info["rel_path"],
+            "rescan": True, "message": "已移除排除项并触发重新扫描"}
 
 
 @app.delete("/api/queue")

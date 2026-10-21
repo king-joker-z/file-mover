@@ -3,7 +3,7 @@
  * ============================================================ */
 
 import { api } from "../api.js";
-import { confirmDialog } from "../components/dialogs.js";
+import { choiceDialog, confirmDialog } from "../components/dialogs.js";
 import { renderPager } from "../components/pager.js";
 import { PAGE_SIZE } from "../features/rounds.js";
 import { esc, toast, fmtSize, debounce } from "../utils.js";
@@ -118,12 +118,19 @@ async function retryOne(id) {
 }
 
 async function removeOne(id) {
-  const ok = await confirmDialog(
-    "确认从队列移除该记录？\n· 待记账/迁移中项：移除后不再补记账，已写入的目标文件保留不清理\n· 源文件仍存在的项：下次扫描会重新入队（需永久排除请用任务的排除规则）",
-    { title: "移除队列项", danger: true, okText: "移除" });
-  if (!ok) return;
+  const choice = await choiceDialog(
+    "确认从队列移除该记录？\n· 待记账/迁移中项：移除后不再补记账，已写入的目标文件保留不清理\n· 源文件仍存在的项：仅移除本轮时下次扫描会重新入队",
+    { title: "移除队列项", choices: [
+      { text: "仅移除本轮", value: "round", gray: true },
+      { text: "永久移除（不再入队）", value: "permanent", danger: true },
+    ] });
+  if (!choice) return;
   try {
-    await api(`/api/queue/${id}`, { method: "DELETE" });
+    await api(`/api/queue/${id}${choice === "permanent" ? "?permanent=true" : ""}`,
+      { method: "DELETE" });
+    if (choice === "permanent") {
+      toast("已永久移除：该文件之后扫描不再入队，可在「永久排除」页恢复", "success");
+    }
     load();
     document.dispatchEvent(new CustomEvent("fm:data-changed"));
   } catch (e) { toast("移除失败: " + e.message, "error"); }
