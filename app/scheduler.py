@@ -24,23 +24,16 @@ class Scheduler:
     # 的限流阈值最低，表现为 EIO 与读回不一致。串行化只针对小文件，大文件仍
     # 按 transfer_workers 并发。
     SMALL_TRANSFER_SERIAL_BYTES = 8 << 20
-    # 挂载级自适应熔断：任一传输遇挂载瞬时 I/O 故障（网盘限流的主要表现）时，
-    # 对故障挂载做指数退避冷却，并在降级窗口内把该挂载的全部传输（含大文件）
-    # 串行，避免多线程同时撞限流把一次抖动放大成整批失败；传输成功即复位。
-    # 参数取舍：瞬时抖动靠内联重试就地吸收（秒级冷却即可），持续故障快速落
-    # 失败队列走 60s 常规重试 + 任务暂停恢复，不再用分钟级冷却惩罚在途传输——
-    # 旧参数（base=10/max=120/escalate=30）下几分钟的持续抖动就把等级推到顶，
-    # 单文件 3 次内联重试每次等 120s，工人线程可见地停摆数分钟。
-    MOUNT_BACKOFF_BASE_SECONDS = 5
-    MOUNT_BACKOFF_MAX_SECONDS = 30
+    # 挂载级瞬时 I/O 防护：任一传输遇挂载瞬时 I/O 故障（网盘限流的主要表现）时
+    # 打开降级窗口——窗口内该挂载的全部传输（含大文件）串行，避免多线程同时
+    # 撞限流把一次抖动放大成整批失败；窗口到期自动恢复并发。失败项不再加
+    # 挂载冷却：工人线程绝不空等挂载，瞬时抖动由内联重试就地吸收，持续故障
+    # 快速落失败队列走 60s 常规重试 + 任务暂停恢复（与用户只见一套倒计时）。
     MOUNT_DEGRADED_WINDOW_SECONDS = 120
-    # 同一挂载的失败等级最小爬升间隔：多线程同一波撞限流会连续上报失败，
-    # 若每次都升档，一次抖动就直达长退避；按时间限速让退避随故障持续时间
-    # 平滑加正。两分钟内反复故障才算「持续性」，升一档；单次抖动只记一档。
-    MOUNT_LEVEL_ESCALATE_SECONDS = 120
-    # 单文件因挂载瞬时 I/O 放弃前最多尝试次数（含首次）；重试间隔由挂载退避
-    # 冷却控制。内联吸收成功则不计失败，落到失败/EIO 队列的只剩持续性故障。
+    # 单文件因挂载瞬时 I/O 放弃前最多尝试次数（含首次）；尝试之间短暂停顿，
+    # 给读回缓存/限流一个恢复窗口。内联吸收成功则不计失败。
     MOUNT_TRANSIENT_ATTEMPTS = 3
+    MOUNT_TRANSIENT_RETRY_DELAY = 2
     # 多个手动同步排队时，两次扫描之间的让位时长：迁移线程可趁机领取新文件，
     # 冷却到期的恢复扫描也能插队，避免连续整树扫描把上传长时间完全饿死。
     SCAN_QUEUE_YIELD_SECONDS = 3
@@ -84,8 +77,8 @@ class Scheduler:
         self._unstarted_claims = set()  # DB 故障期间待释放的迁移前认领
         self._busy_tasks = {}  # task_id -> 在途迁移数；同一任务最多并发 transfer_workers 个
         self._small_locks = {}  # 挂载 realpath -> 传输互斥锁（小文件常串行；降级窗口内全部串行）
-        self._mount_breaker = {}  # 挂载 realpath -> 自适应熔断状态（退避截止/降级截止/失败等级）
-        self._mount_transient_absorbed = 0  # 内联重试吸收的挂载瞬时 I/O 次数（供仪表盘解释冷却）
+        self._mount_breaker = {}  # 挂载 realpath -> 降级串行窗口截止时间
+        self._mount_transient_absorbed = 0  # 内联重试吸收的挂载瞬时 I/O 次数（供仪表盘解释串行保护）
         self._stats_lock = threading.Lock()
         self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
         self._next_retention_at = time.monotonic() + 60  # 启动后稍作延迟再首次清理
@@ -914,25 +907,12 @@ class Scheduler:
         self._execute_transfer(item, task_map, track_phase=False)
         return True
 
-    # ---------- 挂载级自适应熔断 ----------
+    # ---------- 挂载级瞬时 I/O 防护 ----------
 
     @staticmethod
     def _mount_key(path: str) -> str:
         """挂载标识：realpath 归一化后按挂载聚合限流状态。"""
         return os.path.realpath(path)
-
-    def _mount_wait_ready(self, *mount_keys, stage_cb=None) -> None:
-        """任一相关挂载处于熔断冷却期时阻塞等待；冷却结束或 stop 即返回。"""
-        while not self._stop.is_set():
-            with self._stats_lock:
-                until = max(self._mount_breaker.get(key, {}).get("backoff_until", 0.0)
-                            for key in mount_keys)
-            remaining = until - time.monotonic()
-            if remaining <= 0:
-                return
-            if stage_cb is not None:
-                stage_cb(f"等待挂载冷却（剩 {int(remaining + 0.5)}s）")
-            time.sleep(min(remaining, 0.5))
 
     def _mount_degraded(self, mount_key) -> bool:
         """降级窗口内返回 True：该挂载的所有传输串行，遏制并发放大限流。"""
@@ -941,33 +921,14 @@ class Scheduler:
             return bool(state and time.monotonic() < state["degraded_until"])
 
     def _mount_report_failure(self, mount_key) -> None:
-        """传输遇挂载瞬时 I/O 故障：指数退避冷却 + 降级串行窗口。
+        """传输遇挂载瞬时 I/O 故障：打开降级串行窗口，遏制并发放大限流。
 
-        失败等级按 MOUNT_LEVEL_ESCALATE_SECONDS 限速爬升：并发线程同一波
-        撞限流只记一档，避免一次抖动被多线程上报瞬间推到长退避。
+        不再加冷却退避、也不让工人线程等待：瞬时抖动由内联重试就地吸收
+        （秒级停顿），持续故障快速落失败队列走 60s 常规重试 + 任务暂停恢复。
         """
         with self._stats_lock:
-            now = time.monotonic()
-            # 首次失败即取第 1 档并把爬升时钟锚定在创建时刻：level_at 若默认 0，
-            # 刚开机（单调钟 < 爬升间隔）的机器上爬升分支不执行，level 永不写入（KeyError）。
-            state = self._mount_breaker.setdefault(
-                mount_key, {"level": 1, "level_at": now})
-            if now - state.get("level_at", 0.0) >= self.MOUNT_LEVEL_ESCALATE_SECONDS:
-                state["level"] = min(state.get("level", 0) + 1, 8)
-                state["level_at"] = now
-            delay = min(self.MOUNT_BACKOFF_BASE_SECONDS * (2 ** (state["level"] - 1)),
-                        self.MOUNT_BACKOFF_MAX_SECONDS)
-            state["backoff_until"] = max(state.get("backoff_until", 0.0), now + delay)
-            state["degraded_until"] = now + self.MOUNT_DEGRADED_WINDOW_SECONDS
-
-    def _mount_report_success(self, mount_key) -> None:
-        """传输成功即复位退避；降级窗口自然到期，避免刚恢复又立刻打满并发。"""
-        with self._stats_lock:
-            state = self._mount_breaker.get(mount_key)
-            if state:
-                state["level"] = 0
-                state["level_at"] = 0.0
-                state["backoff_until"] = 0.0
+            self._mount_breaker.setdefault(mount_key, {})["degraded_until"] = \
+                time.monotonic() + self.MOUNT_DEGRADED_WINDOW_SECONDS
 
     def _mount_serial_lock(self, mount_key) -> threading.Lock:
         """按挂载返回传输互斥锁；不同挂载互不阻塞。"""
@@ -978,30 +939,26 @@ class Scheduler:
             return lock
 
     def _mount_breaker_snapshot(self) -> list:
-        """当前处于冷却/降级窗口的挂载：让「等待挂载冷却」在仪表盘上可解释。
+        """当前处于降级串行窗口的挂载：让「串行保护」在仪表盘上可解释。
 
-        瞬时 I/O 被内联重试吸收后队列与日志页只显示成功，冷却若不可见
-        就成了「没报错却在等」的谜团；这里把状态与累计吸收数一起暴露。
+        瞬时 I/O 被内联重试吸收后队列与日志页只显示成功；窗口若不可见，
+        传输变慢就成了「没报错却在等」的谜团，这里把状态暴露出来。
         """
         now = time.monotonic()
         with self._stats_lock:
             snapshot = []
             for mount, state in self._mount_breaker.items():
-                backoff = max(0.0, state.get("backoff_until", 0.0) - now)
                 degraded = max(0.0, state.get("degraded_until", 0.0) - now)
-                if backoff > 0 or degraded > 0:
-                    snapshot.append({
-                        "mount": mount, "level": state.get("level", 0),
-                        "backoff_seconds": int(backoff + 0.5),
-                        "degraded_seconds": int(degraded + 0.5),
-                    })
+                if degraded > 0:
+                    snapshot.append({"mount": mount,
+                                     "degraded_seconds": int(degraded + 0.5)})
             return snapshot
 
     def _transfer_with_mount_state(self, item, task, dst_key, src_key,
                                    stage_cb, progress_cb):
-        """按小文件规则与挂载熔断状态决定传输串行或并发。
+        """按小文件规则与降级窗口决定传输串行或并发。
 
-        小文件始终按目标挂载串行（RPC 密度高，并发只放大限流）；熔断降级
+        小文件始终按目标挂载串行（RPC 密度高，并发只放大限流）；降级
         窗口内该挂载的所有传输（含大文件）也串行；多把锁按固定顺序获取，
         避免源/目标挂载同时降级时交叉等待死锁。
         """
@@ -1111,9 +1068,6 @@ class Scheduler:
                     # 每次尝试重置瞬时故障标记，只有最后一次尝试的结果进入失败分支。
                     item.pop("_transient_io", None)
                     item.pop("_eio_origin", None)
-                    # 源/目标挂载处于熔断冷却时先等待再尝试，避免多线程同时撞限流。
-                    self._mount_wait_ready(mount_key, source_mount_key,
-                                           stage_cb=report_stage)
                     try:
                         source_stat = os.lstat(item["src_path"])
                     except FileNotFoundError:
@@ -1142,21 +1096,20 @@ class Scheduler:
                             result, detail = "failed", f"迁移异常: {exc}"
                     if not (transient_source_io or item.get("_transient_io")):
                         break
-                    # 挂载瞬时 I/O 故障（网盘限流的主要表现）：先升级挂载级退避并
-                    # 内联重试，把一次限流抖动就地吸收；只有内联重试耗尽才落失败
-                    # 状态与 EIO 记录，避免并发线程同时撞限流刷爆失败/EIO 队列。
+                    # 挂载瞬时 I/O 故障（网盘限流的主要表现）：打开降级串行窗口，
+                    # 短暂停顿后内联重试，把一次限流抖动就地吸收；只有内联重试
+                    # 耗尽才落失败状态与 EIO 记录，避免刷爆失败/EIO 队列。
                     if failed_mount is None:
                         failed_mount = (source_mount_key
                                         if item.get("_eio_origin") == "source" else mount_key)
                     self._mount_report_failure(failed_mount)
                     if attempt < self.MOUNT_TRANSIENT_ATTEMPTS:
-                        logger.warning("迁移遇挂载 I/O 故障，冷却后内联重试（%d/%d）："
+                        report_stage(f"挂载瞬时 I/O，{self.MOUNT_TRANSIENT_RETRY_DELAY}s 后重试")
+                        self._stop.wait(self.MOUNT_TRANSIENT_RETRY_DELAY)
+                        logger.warning("迁移遇挂载 I/O 故障，短暂停顿后内联重试（%d/%d）："
                                        "task_id=%s queue_id=%s 源=%s",
                                        attempt, self.MOUNT_TRANSIENT_ATTEMPTS - 1,
                                        task["id"], item["id"], item["src_path"])
-                if result == "success":
-                    self._mount_report_success(mount_key)
-                    self._mount_report_success(source_mount_key)
                 duration_ms = int((time.monotonic() - started) * 1000)
                 report_stage("更新队列与记账")
                 accounted = False
@@ -1166,8 +1119,8 @@ class Scheduler:
                         if attempt > 1:
                             self._mount_transient_absorbed += attempt - 1
                     if attempt > 1:
-                        # 瞬时 I/O 被内联重试吸收：队列/日志页只显示成功，冷却期却会
-                        # 出现在迁移中心；把吸收次数写进详情，冷却从「无报错之谜」变可解释。
+                        # 瞬时 I/O 被内联重试吸收：队列/日志页只显示成功，串行窗口
+                        # 却会体现在迁移速度上；把吸收次数写进详情，避免「无报错之谜」。
                         detail += f"；挂载瞬时 I/O 内联重试 {attempt - 1} 次后成功"
                     try:
                         db.persist_accounting_pending(item['id'], item, item.get('_verified_target'))

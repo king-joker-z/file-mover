@@ -1,8 +1,7 @@
-"""挂载级自适应熔断与瞬时 I/O 内联重试回归测试（仅使用临时目录）。"""
+"""挂载级瞬时 I/O 防护（降级串行窗口）与内联重试回归测试（仅使用临时目录）。"""
 import os
 import shutil
 import tempfile
-import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -12,58 +11,33 @@ from app.scheduler import Scheduler
 
 
 class BreakerStateTests(unittest.TestCase):
-    """熔断状态机：指数退避、成功复位、降级窗口。"""
+    """降级串行窗口：故障打开窗口、持续故障延长、到期自动解除。"""
 
     def setUp(self):
         self.sched = Scheduler()
 
-    def test_failure_escalates_backoff_and_degrades(self):
+    def test_failure_opens_degraded_window(self):
         key = "/mnt/dst"
-
-        def current_delay():
-            before = time.monotonic()
-            self.sched._mount_report_failure(key)
-            with self.sched._stats_lock:
-                state = self.sched._mount_breaker[key]
-                return state["backoff_until"] - before
-
-        self.assertTrue(4 <= current_delay() <= 6)
-        # 快速连续失败（多线程同一波上报）：等级限速，不叠加升档
-        self.assertTrue(4 <= current_delay() <= 6)
-        self.assertTrue(4 <= current_delay() <= 6)
-        # 故障持续超过爬升间隔（120s）后逐档加正：5 → 10 → 20
-        with self.sched._stats_lock:
-            self.sched._mount_breaker[key]["level_at"] = time.monotonic() - 130
-        self.assertTrue(9 <= current_delay() <= 11)
-        with self.sched._stats_lock:
-            self.sched._mount_breaker[key]["level_at"] = time.monotonic() - 130
-        self.assertTrue(19 <= current_delay() <= 21)
-        self.assertTrue(self.sched._mount_degraded(key)
-                        and self.sched._mount_breaker[key]["level"] == 3)
-
-    def test_first_failure_on_fresh_boot_sets_level_one(self):
-        # 刚开机（单调钟小于爬升间隔）的机器上，首个失败必须初始化第 1 档
-        # 并进入降级窗口，而不是让 level 永不写入（KeyError 打崩迁移线程）。
-        self.sched.MOUNT_LEVEL_ESCALATE_SECONDS = 10 ** 9
-        key = "/mnt/fresh-boot"
+        self.assertFalse(self.sched._mount_degraded(key))
+        before = time.monotonic()
         self.sched._mount_report_failure(key)
+        after = time.monotonic()
         with self.sched._stats_lock:
-            state = self.sched._mount_breaker[key]
-        self.assertEqual(state["level"], 1)
+            until = self.sched._mount_breaker[key]["degraded_until"]
         self.assertTrue(self.sched._mount_degraded(key))
-        self.assertGreater(state["backoff_until"], 0.0)
+        self.assertTrue(before + self.sched.MOUNT_DEGRADED_WINDOW_SECONDS
+                        <= until <= after + self.sched.MOUNT_DEGRADED_WINDOW_SECONDS)
 
-    def test_success_resets_backoff_but_window_persists(self):
+    def test_persistent_failure_extends_window(self):
+        # 持续故障期间每次上报都把窗口续满：风暴不放大，但不会等到工人线程
         key = "/mnt/dst"
         self.sched._mount_report_failure(key)
-        self.sched._mount_report_failure(key)
-        self.sched._mount_report_success(key)
         with self.sched._stats_lock:
-            state = self.sched._mount_breaker[key]
-        self.assertEqual(state["level"], 0)
-        self.assertEqual(state["backoff_until"], 0.0)
-        # 降级窗口不因单次成功立即解除，避免刚恢复又打满并发
-        self.assertTrue(self.sched._mount_degraded(key))
+            self.sched._mount_breaker[key]["degraded_until"] = time.monotonic() + 1
+        self.sched._mount_report_failure(key)
+        with self.sched._stats_lock:
+            until = self.sched._mount_breaker[key]["degraded_until"]
+        self.assertGreater(until, time.monotonic() + 1)
 
     def test_degraded_window_expiry(self):
         key = "/mnt/dst"
@@ -72,40 +46,13 @@ class BreakerStateTests(unittest.TestCase):
             self.sched._mount_breaker[key]["degraded_until"] = time.monotonic() - 1
         self.assertFalse(self.sched._mount_degraded(key))
 
-    def test_wait_ready_returns_after_cooldown(self):
+    def test_failure_never_blocks_worker(self):
+        # 防护层已无任何「等待冷却」入口：上报失败立即返回，工人线程绝不空等
         key = "/mnt/dst"
+        start = time.monotonic()
         self.sched._mount_report_failure(key)
-        with self.sched._stats_lock:
-            self.sched._mount_breaker[key]["backoff_until"] = time.monotonic() + 0.3
-        stages = []
-        start = time.monotonic()
-        self.sched._mount_wait_ready(key, stage_cb=stages.append)
-        self.assertGreaterEqual(time.monotonic() - start, 0.25)
-        self.assertTrue(stages)  # 等待期间持续上报心跳阶段
-
-    def test_wait_ready_no_block_without_breaker(self):
-        start = time.monotonic()
-        self.sched._mount_wait_ready("/mnt/a", "/mnt/b")
         self.assertLess(time.monotonic() - start, 0.5)
-
-    def test_concurrent_threads_wait_shared_cooldown(self):
-        """跨线程协同：线程 A 触发熔断后，线程 B 的后续传输必须等到冷却结束。"""
-        key = "/mnt/dst"
-        self.sched._mount_report_failure(key)
-        with self.sched._stats_lock:
-            self.sched._mount_breaker[key]["backoff_until"] = time.monotonic() + 0.4
-        done = threading.Event()
-
-        def waiter():
-            self.sched._mount_wait_ready(key)
-            done.set()
-
-        thread = threading.Thread(target=waiter)
-        thread.start()
-        self.assertFalse(done.wait(timeout=0.15),
-                         "冷却期内线程 B 不应放行")
-        self.assertTrue(done.wait(timeout=2), "冷却结束后线程 B 应放行")
-        thread.join()
+        self.assertTrue(self.sched._mount_degraded(key))
 
 
 class LockSelectionTests(unittest.TestCase):
@@ -181,9 +128,8 @@ class InlineRetryTests(unittest.TestCase):
             "after_action": "delete"})
         self.task = db.get_task(self.task_id)
         self.sched = Scheduler()
-        # 测试提速：退避归零（等待立即返回），保留降级窗口语义
-        self.sched.MOUNT_BACKOFF_BASE_SECONDS = 0
-        self.sched.MOUNT_BACKOFF_MAX_SECONDS = 0
+        # 测试提速：内联重试停顿归零，保留降级串行窗口语义
+        self.sched.MOUNT_TRANSIENT_RETRY_DELAY = 0
 
     def restore_db(self):
         if db._conn is not None:
@@ -225,7 +171,7 @@ class InlineRetryTests(unittest.TestCase):
         eio = db.get_eio_failure(self.task_id, "a.bin")
         self.assertIsNotNone(eio)
         self.assertEqual(eio["occurrences"], 1)
-        # 故障挂载进入熔断：退避 + 降级窗口
+        # 故障挂载打开降级串行窗口（工人线程不空等，仅同挂载传输排队）
         self.assertTrue(self.sched._mount_degraded(self.sched._mount_key(self.dst_dir)))
 
     def test_transient_then_success_not_marked_failed(self):
@@ -253,12 +199,12 @@ class InlineRetryTests(unittest.TestCase):
             "SELECT status FROM queue WHERE id=(SELECT MAX(id) FROM queue)").fetchone()
         self.assertEqual(row["status"], "done")
         self.assertIsNone(db.get_eio_failure(self.task_id, "a.bin"))
-        # 成功复位退避；源/目标挂载熔断等级清零
-        for key in (self.sched._mount_key(self.dst_dir),
-                    self.sched._mount_key(self.src_dir)):
-            with self.sched._stats_lock:
-                state = self.sched._mount_breaker.get(key, {})
-            self.assertEqual(state.get("level", 0), 0)
+        # 单次成功不关闭降级串行窗口：避免刚恢复又打满并发；工人不等待
+        self.assertTrue(self.sched._mount_degraded(self.sched._mount_key(self.dst_dir)))
+        with self.sched._stats_lock:
+            state = self.sched._mount_breaker[self.sched._mount_key(self.dst_dir)]
+        self.assertNotIn("backoff_until", state)
+        self.assertNotIn("level", state)
 
     def test_transient_then_success_reports_absorbed_retries(self):
         src, dst = self.add_source()
@@ -280,20 +226,21 @@ class InlineRetryTests(unittest.TestCase):
         with patch.object(scheduler.transfer, "transfer", fake_transfer):
             self.sched._execute_transfer(self.claim(), {self.task_id: self.task})
 
-        # 吸收痕迹必须可见：成功日志详情标注内联重试次数，仪表盘能解释冷却来源
+        # 吸收痕迹必须可见：成功日志详情标注内联重试次数，仪表盘能解释串行保护来源
         log = db.list_logs()[0]
         self.assertEqual(log["result"], "success")
         self.assertIn("挂载瞬时 I/O 内联重试 1 次后成功", log["detail"])
         self.assertEqual(self.sched._mount_transient_absorbed, 1)
+        # 快照只暴露降级串行窗口剩余秒数（已无冷却字段）
         snapshot = self.sched._mount_breaker_snapshot()
-        self.assertEqual(len(snapshot), 1)  # 成功已复位退避；降级串行窗口仍在
-        self.assertEqual(snapshot[0]["backoff_seconds"], 0)
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(snapshot[0]["mount"], self.sched._mount_key(self.dst_dir))
         self.assertGreater(snapshot[0]["degraded_seconds"], 0)
+        self.assertNotIn("backoff_seconds", snapshot[0])
 
     def test_breaker_snapshot_empty_without_active_state(self):
         self.sched._mount_report_failure("/mnt/quiet")
         with self.sched._stats_lock:
-            self.sched._mount_breaker["/mnt/quiet"]["backoff_until"] = time.monotonic() - 1
             self.sched._mount_breaker["/mnt/quiet"]["degraded_until"] = time.monotonic() - 1
         self.assertEqual(self.sched._mount_breaker_snapshot(), [])
 
@@ -312,7 +259,7 @@ class InlineRetryTests(unittest.TestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["retries"], 1)
         self.assertIsNone(db.get_eio_failure(self.task_id, "a.bin"))
-        # 非瞬时故障不触发挂载熔断
+        # 非瞬时故障不打开降级串行窗口
         self.assertFalse(self.sched._mount_degraded(self.sched._mount_key(self.dst_dir)))
 
 

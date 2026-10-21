@@ -327,8 +327,8 @@ export async function loadDash() {
     if (d.last_accounting_error) warnings.push(d.last_accounting_error);
     if (d.last_retention_error) warnings.push("数据保留清理失败: " + d.last_retention_error);
     if (Array.isArray(d.mount_breakers) && d.mount_breakers.length) {
-      const mounts = d.mount_breakers.map(b => `${b.mount}（冷却剩 ${b.backoff_seconds}s，串行保护剩 ${b.degraded_seconds}s）`);
-      warnings.push(`挂载瞬时 I/O 保护中: ${mounts.join("、")}——网盘抖动已被自动重试吸收（本次运行累计 ${d.mount_transient_absorbed ?? 0} 次），不是故障，无需处理`);
+      const mounts = d.mount_breakers.map(b => `${b.mount}（串行保护剩 ${b.degraded_seconds}s）`);
+      warnings.push(`挂载瞬时 I/O 保护中: ${mounts.join("、")}——该挂载暂时串行传输防限流放大，抖动已被自动重试吸收（累计 ${d.mount_transient_absorbed ?? 0} 次），不是故障，无需处理`);
     }
     $("#status-warnings").textContent = warnings.join("\n");
     const excludeBtn = $("#exclude-error-dir");
