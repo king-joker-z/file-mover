@@ -933,8 +933,11 @@ class Scheduler:
         撞限流只记一档，避免一次抖动被多线程上报瞬间推到长退避。
         """
         with self._stats_lock:
-            state = self._mount_breaker.setdefault(mount_key, {})
             now = time.monotonic()
+            # 首次失败即取第 1 档并把爬升时钟锚定在创建时刻：level_at 若默认 0，
+            # 刚开机（单调钟 < 爬升间隔）的机器上爬升分支不执行，level 永不写入（KeyError）。
+            state = self._mount_breaker.setdefault(
+                mount_key, {"level": 1, "level_at": now})
             if now - state.get("level_at", 0.0) >= self.MOUNT_LEVEL_ESCALATE_SECONDS:
                 state["level"] = min(state.get("level", 0) + 1, 8)
                 state["level_at"] = now

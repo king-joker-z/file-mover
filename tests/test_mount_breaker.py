@@ -41,6 +41,18 @@ class BreakerStateTests(unittest.TestCase):
         self.assertTrue(self.sched._mount_degraded(key)
                         and self.sched._mount_breaker[key]["level"] == 3)
 
+    def test_first_failure_on_fresh_boot_sets_level_one(self):
+        # 刚开机（单调钟小于爬升间隔）的机器上，首个失败必须初始化第 1 档
+        # 并进入降级窗口，而不是让 level 永不写入（KeyError 打崩迁移线程）。
+        self.sched.MOUNT_LEVEL_ESCALATE_SECONDS = 10 ** 9
+        key = "/mnt/fresh-boot"
+        self.sched._mount_report_failure(key)
+        with self.sched._stats_lock:
+            state = self.sched._mount_breaker[key]
+        self.assertEqual(state["level"], 1)
+        self.assertTrue(self.sched._mount_degraded(key))
+        self.assertGreater(state["backoff_until"], 0.0)
+
     def test_success_resets_backoff_but_window_persists(self):
         key = "/mnt/dst"
         self.sched._mount_report_failure(key)
