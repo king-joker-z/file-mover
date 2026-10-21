@@ -3870,20 +3870,76 @@ class VerifyModeTests(unittest.TestCase):
         self.assertEqual(result, "success", detail)
         self.assertEqual(counts["fd"], 1)  # strict 的发布后读回（与 fast 相同强度，仅多暂存核对）
 
-    def test_nfo_always_uses_strict_verification(self):
-        task = dict(self.task, verify_mode="off")
+    def test_nfo_follows_task_verify_mode(self):
+        """NFO 与普通文件遵循 verify_mode/direct_publish：off 直写、无读回、删除不暂存。"""
+        task = dict(self.task, verify_mode="off", direct_publish=True)
         src = self.src / "show.nfo"
         src.write_bytes(b"<tvshow/>")
         db.enqueue(task["id"], str(src), src.name, str(self.dst / src.name), len(b"<tvshow/>"))
         item = db.take_next_pending(claim=False)
-        counts, hashed = {"fd": 0, "sha": 0}, []
+        counts, hashed, stages = {"fd": 0, "sha": 0, "nfo": 0}, [], []
         fd_cb, sha_cb = self._counting_hashes(counts, hashed)
+        real_verified = transfer._verified_nfo
+
+        def counting_verified(dst, expected):
+            counts["nfo"] += 1
+            return real_verified(dst, expected)
+
         with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
-              patch.object(transfer, "_sha256", side_effect=sha_cb)):
+              patch.object(transfer, "_sha256", side_effect=sha_cb),
+              patch.object(transfer, "_verified_nfo", side_effect=counting_verified)):
+            result, detail = transfer.transfer(item, task, stage_cb=stages.append)
+        self.assertEqual(result, "success", detail)
+        self.assertEqual(counts["fd"], 0)        # off：无任何内容读回
+        self.assertEqual(counts["sha"], 0)       # 删除不暂存重读
+        self.assertEqual(counts["nfo"], 1)       # 仅写前比对一次（新文件为 ENOENT 探测）
+        self.assertIn("直写发布（跳过 rename）", stages)
+        self.assertFalse(src.exists())
+        self.assertEqual((self.dst / "show.nfo").read_bytes(), b"<tvshow/>")
+        self.assertEqual(list(self.src.iterdir()), [])   # 无 .fm-source-*.moving 残留
+        self.assertEqual(list(self.dst.glob(".fm-*")), [])
+
+    def test_nfo_fast_mode_single_readback_without_staging(self):
+        task = dict(self.task, verify_mode="fast")
+        src = self.src / "show.nfo"
+        src.write_bytes(b"<tvshow/>")
+        db.enqueue(task["id"], str(src), src.name, str(self.dst / src.name), len(b"<tvshow/>"))
+        item = db.take_next_pending(claim=False)
+        counts, hashed, nfo_reads = {"fd": 0, "sha": 0}, [], {"n": 0}
+        fd_cb, sha_cb = self._counting_hashes(counts, hashed)
+        real_verified = transfer._verified_nfo
+
+        def counting_verified(dst, expected):
+            nfo_reads["n"] += 1
+            return real_verified(dst, expected)
+
+        with (patch.object(transfer, "_fd_digest", side_effect=fd_cb),
+              patch.object(transfer, "_sha256", side_effect=sha_cb),
+              patch.object(transfer, "_verified_nfo", side_effect=counting_verified)):
             result, detail = transfer.transfer(item, task)
         self.assertEqual(result, "success", detail)
+        self.assertEqual(counts["fd"], 1)        # 发布后单次读回（写入路径内），无叠加读回
+        self.assertEqual(counts["sha"], 0)       # 删除不暂存重读
+        self.assertEqual(nfo_reads["n"], 1)      # 仅写前比对一次
         self.assertFalse(src.exists())
-        self.assertTrue(any(name.startswith(".fm-source-") for name in hashed))
+        self.assertEqual((self.dst / "show.nfo").read_bytes(), b"<tvshow/>")
+        self.assertEqual(list(self.src.iterdir()), [])
+
+    def test_nfo_off_mode_delete_uses_fixed_content_length(self):
+        # nfo 修正会改变内容长度：off 模式删除核对必须按修正后长度，否则误保留源
+        task = dict(self.task, verify_mode="off", direct_publish=True)
+        src = self.src / "fix.nfo"
+        src.write_bytes(b"<actor>123</actor>")
+        db.enqueue(task["id"], str(src), src.name, str(self.dst / src.name), 15)
+        item = db.take_next_pending(claim=False)
+        fixed = b"<actor>123</actor><role>123</role>"
+        with patch.object(transfer.nfo_fix, "prepare_nfo",
+                          return_value=(fixed, ["role"])):
+            result, detail = transfer.transfer(item, task)
+        self.assertEqual(result, "success", detail)
+        self.assertIn("+nfo:role", detail)
+        self.assertFalse(src.exists())            # 长度核对用修正后内容，删除成功
+        self.assertEqual((self.dst / "fix.nfo").read_bytes(), fixed)
 
     def test_renameat2_publishes_without_second_copy(self):
         """挂载不支持硬链接时优先 renameat2 原子转正：零复制，不再写第二遍。"""

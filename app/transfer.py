@@ -394,9 +394,9 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
 
 
 def _write_nfo(dst: str, content: bytes, root: str = None, overwrite: bool = False,
-               stage_cb=None):
+               stage_cb=None, verify: str = "strict", direct: bool = False):
     _write_verified(dst, content=content, root=root, overwrite=overwrite,
-                    stage_cb=stage_cb)
+                    stage_cb=stage_cb, verify=verify, direct=direct)
 
 
 def _mount_identity(path: str):
@@ -601,7 +601,8 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
     便于仪表盘展示大文件长时间停留在校验环节的进度。
     progress_cb(copied, total) 用于上报复制进度字节，供仪表盘计算速度与 ETA。
     task.verify_mode 决定读回强度：strict（默认，发布后读回+删除前暂存）、
-    fast（单次读回，无暂存文件）、off（不读回，仅核对大小）；NFO 始终按 strict。
+    fast（单次读回，无暂存文件）、off（不读回，仅核对大小）；NFO 与普通文件
+    遵循同一组设置（含 direct_publish）。
     """
     def _stage(name: str):
         if stage_cb is None:
@@ -693,9 +694,14 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
                 _stage("校验并删除源文件")
                 try:
                     target_device = _mount_identity(task["dst_dir"])
-                    deleted, reason = _remove_verified_source(
-                        src, dst, source_info, task["dst_dir"], target_device,
-                        (len(raw), source_hash), (len(content), target_hash))
+                    if verify == "strict":
+                        deleted, reason = _remove_verified_source(
+                            src, dst, source_info, task["dst_dir"], target_device,
+                            (len(raw), source_hash), (len(content), target_hash))
+                    else:
+                        # fast/off：目标内容刚经全量比对一致，直接删除源，不产生暂存文件。
+                        deleted, reason = _unlink_verified_source(
+                            src, source_info, dst, len(content))
                 except OSError as exc:
                     return _failed_io(item, "NFO 源文件删除失败", exc)
                 if not deleted:
@@ -754,17 +760,24 @@ def transfer(item: dict, task: dict, stage_cb=None, progress_cb=None) -> Tuple[s
             wrote_target = not _verified_nfo(final_dst, content)
             if wrote_target:
                 _write_nfo(final_dst, content, root=task["dst_dir"], overwrite=how == "overwrite",
-                           stage_cb=_stage)
-            if not _verified_nfo(final_dst, content):
+                           stage_cb=_stage, verify=verify, direct=direct_publish)
+            # strict 已在写入路径读回一次，此处是并发替换的最后防线；fast/off
+            # 的读回强度由 _write_verified 按模式执行，不再叠加第二次读回。
+            if verify == "strict" and not _verified_nfo(final_dst, content):
                 raise IOError("NFO 目标文件读回校验失败，源文件已保留")
             item["dst_path"] = final_dst
             target_hash = hashlib.sha256(content).hexdigest()
             source_hash = hashlib.sha256(raw).hexdigest()
             if task.get("after_action", "delete") == "delete":
                 _stage("校验并删除源文件")
-                deleted, reason = _remove_verified_source(
-                    src, final_dst, source_info, task["dst_dir"], target_device,
-                    (len(raw), source_hash), (len(content), target_hash))
+                if verify == "strict":
+                    deleted, reason = _remove_verified_source(
+                        src, final_dst, source_info, task["dst_dir"], target_device,
+                        (len(raw), source_hash), (len(content), target_hash))
+                else:
+                    # fast/off：写入路径已按模式读回/核对大小，删除源不再暂存重读。
+                    deleted, reason = _unlink_verified_source(
+                        src, source_info, final_dst, len(content))
                 if not deleted:
                     return "failed", reason
                 if cfg.get("remove_empty_dirs"):
