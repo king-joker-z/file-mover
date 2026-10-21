@@ -1,4 +1,5 @@
 """后台线程：扫描循环 + 迁移主循环（节流逐个迁移）"""
+import contextlib
 import errno
 import hashlib
 import logging
@@ -23,6 +24,19 @@ class Scheduler:
     # 的限流阈值最低，表现为 EIO 与读回不一致。串行化只针对小文件，大文件仍
     # 按 transfer_workers 并发。
     SMALL_TRANSFER_SERIAL_BYTES = 8 << 20
+    # 挂载级自适应熔断：任一传输遇挂载瞬时 I/O 故障（网盘限流的主要表现）时，
+    # 对故障挂载做指数退避冷却，并在降级窗口内把该挂载的全部传输（含大文件）
+    # 串行，避免多线程同时撞限流把一次抖动放大成整批失败；传输成功即复位。
+    MOUNT_BACKOFF_BASE_SECONDS = 10
+    MOUNT_BACKOFF_MAX_SECONDS = 120
+    MOUNT_DEGRADED_WINDOW_SECONDS = 180
+    # 同一挂载的失败等级最小爬升间隔：多线程同一波撞限流会连续上报失败，
+    # 若每次都升档，一次抖动就直达长退避；按时间限速让退避随故障持续时间
+    # 平滑加正，单次抖动只记一档。
+    MOUNT_LEVEL_ESCALATE_SECONDS = 30
+    # 单文件因挂载瞬时 I/O 放弃前最多尝试次数（含首次）；重试间隔由挂载退避
+    # 冷却控制。内联吸收成功则不计失败，落到失败/EIO 队列的只剩持续性故障。
+    MOUNT_TRANSIENT_ATTEMPTS = 3
     # 多个手动同步排队时，两次扫描之间的让位时长：迁移线程可趁机领取新文件，
     # 冷却到期的恢复扫描也能插队，避免连续整树扫描把上传长时间完全饿死。
     SCAN_QUEUE_YIELD_SECONDS = 3
@@ -65,7 +79,8 @@ class Scheduler:
         self._accounting_retry_at = {}  # 数据库暂不可用时限速重试
         self._unstarted_claims = set()  # DB 故障期间待释放的迁移前认领
         self._busy_tasks = {}  # task_id -> 在途迁移数；同一任务最多并发 transfer_workers 个
-        self._small_locks = {}  # 目标挂载 realpath -> 小文件传输互斥锁（懒创建）
+        self._small_locks = {}  # 挂载 realpath -> 传输互斥锁（小文件常串行；降级窗口内全部串行）
+        self._mount_breaker = {}  # 挂载 realpath -> 自适应熔断状态（退避截止/降级截止/失败等级）
         self._stats_lock = threading.Lock()
         self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
         self._next_retention_at = time.monotonic() + 60  # 启动后稍作延迟再首次清理
@@ -869,14 +884,89 @@ class Scheduler:
         self._execute_transfer(item, task_map, track_phase=False)
         return True
 
-    def _small_transfer_lock(self, task) -> threading.Lock:
-        """按目标挂载返回小文件传输互斥锁；不同挂载互不阻塞。"""
-        root = os.path.realpath(task["dst_dir"])
+    # ---------- 挂载级自适应熔断 ----------
+
+    @staticmethod
+    def _mount_key(path: str) -> str:
+        """挂载标识：realpath 归一化后按挂载聚合限流状态。"""
+        return os.path.realpath(path)
+
+    def _mount_wait_ready(self, *mount_keys, stage_cb=None) -> None:
+        """任一相关挂载处于熔断冷却期时阻塞等待；冷却结束或 stop 即返回。"""
+        while not self._stop.is_set():
+            with self._stats_lock:
+                until = max(self._mount_breaker.get(key, {}).get("backoff_until", 0.0)
+                            for key in mount_keys)
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return
+            if stage_cb is not None:
+                stage_cb(f"等待挂载冷却（剩 {int(remaining + 0.5)}s）")
+            time.sleep(min(remaining, 0.5))
+
+    def _mount_degraded(self, mount_key) -> bool:
+        """降级窗口内返回 True：该挂载的所有传输串行，遏制并发放大限流。"""
         with self._stats_lock:
-            lock = self._small_locks.get(root)
+            state = self._mount_breaker.get(mount_key)
+            return bool(state and time.monotonic() < state["degraded_until"])
+
+    def _mount_report_failure(self, mount_key) -> None:
+        """传输遇挂载瞬时 I/O 故障：指数退避冷却 + 降级串行窗口。
+
+        失败等级按 MOUNT_LEVEL_ESCALATE_SECONDS 限速爬升：并发线程同一波
+        撞限流只记一档，避免一次抖动被多线程上报瞬间推到长退避。
+        """
+        with self._stats_lock:
+            state = self._mount_breaker.setdefault(mount_key, {})
+            now = time.monotonic()
+            if now - state.get("level_at", 0.0) >= self.MOUNT_LEVEL_ESCALATE_SECONDS:
+                state["level"] = min(state.get("level", 0) + 1, 8)
+                state["level_at"] = now
+            delay = min(self.MOUNT_BACKOFF_BASE_SECONDS * (2 ** (state["level"] - 1)),
+                        self.MOUNT_BACKOFF_MAX_SECONDS)
+            state["backoff_until"] = max(state.get("backoff_until", 0.0), now + delay)
+            state["degraded_until"] = now + self.MOUNT_DEGRADED_WINDOW_SECONDS
+
+    def _mount_report_success(self, mount_key) -> None:
+        """传输成功即复位退避；降级窗口自然到期，避免刚恢复又立刻打满并发。"""
+        with self._stats_lock:
+            state = self._mount_breaker.get(mount_key)
+            if state:
+                state["level"] = 0
+                state["level_at"] = 0.0
+                state["backoff_until"] = 0.0
+
+    def _mount_serial_lock(self, mount_key) -> threading.Lock:
+        """按挂载返回传输互斥锁；不同挂载互不阻塞。"""
+        with self._stats_lock:
+            lock = self._small_locks.get(mount_key)
             if lock is None:
-                lock = self._small_locks[root] = threading.Lock()
+                lock = self._small_locks[mount_key] = threading.Lock()
             return lock
+
+    def _transfer_with_mount_state(self, item, task, dst_key, src_key,
+                                   stage_cb, progress_cb):
+        """按小文件规则与挂载熔断状态决定传输串行或并发。
+
+        小文件始终按目标挂载串行（RPC 密度高，并发只放大限流）；熔断降级
+        窗口内该挂载的所有传输（含大文件）也串行；多把锁按固定顺序获取，
+        避免源/目标挂载同时降级时交叉等待死锁。
+        """
+        keys = []
+        if (item.get("size") or 0) <= self.SMALL_TRANSFER_SERIAL_BYTES:
+            keys.append(dst_key)
+        for key in (dst_key, src_key):
+            if key not in keys and self._mount_degraded(key):
+                keys.append(key)
+        keys.sort()  # 单锁无影响；多锁固定顺序防交叉等待
+        if not keys:
+            return transfer.transfer(item, task, stage_cb=stage_cb,
+                                     progress_cb=progress_cb)
+        with contextlib.ExitStack() as stack:
+            for key in keys:
+                stack.enter_context(self._mount_serial_lock(key))
+            return transfer.transfer(item, task, stage_cb=stage_cb,
+                                     progress_cb=progress_cb)
 
     def _execute_transfer(self, item, task_map, track_phase=True):
         """执行已认领队列项的迁移；串行与异步迁移线程共用。
@@ -959,36 +1049,61 @@ class Scheduler:
             threading.Thread(target=heartbeat, name=f"fm-work-report-{item['id']}", daemon=True).start()
             try:
                 # 无持久化凭证的 transferring 重启后回退；已删源不可重传或盲目补记。
-                transient_source_io = False
-                try:
-                    source_stat = os.lstat(item["src_path"])
-                except FileNotFoundError:
-                    result, detail = "conflict", "源文件缺失，可能迁移成功但记账丢失；需人工核查目标与记录"
-                except OSError as exc:
-                    transient_source_io = exc.errno in (
-                        errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY)
-                    if exc.errno == errno.EIO:
-                        item['_eio_origin'] = 'source'
-                    result, detail = "failed", f"源路径读取失败，已保留待重试: {exc}"
-                else:
-                    if not stat.S_ISREG(source_stat.st_mode):
-                        result, detail = "conflict", "源不是普通文件，可能是历史残留；需人工核查目标与记录"
+                mount_key = self._mount_key(task["dst_dir"])
+                source_mount_key = self._mount_key(task["src_dir"])
+                result, detail = "failed", "迁移未执行"
+                for attempt in range(1, self.MOUNT_TRANSIENT_ATTEMPTS + 1):
+                    transient_source_io = False
+                    failed_mount = None
+                    # 每次尝试重置瞬时故障标记，只有最后一次尝试的结果进入失败分支。
+                    item.pop("_transient_io", None)
+                    item.pop("_eio_origin", None)
+                    # 源/目标挂载处于熔断冷却时先等待再尝试，避免多线程同时撞限流。
+                    self._mount_wait_ready(mount_key, source_mount_key,
+                                           stage_cb=report_stage)
+                    try:
+                        source_stat = os.lstat(item["src_path"])
+                    except FileNotFoundError:
+                        result, detail = "conflict", "源文件缺失，可能迁移成功但记账丢失；需人工核查目标与记录"
+                        break
+                    except OSError as exc:
+                        transient_source_io = exc.errno in (
+                            errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.ETIMEDOUT, errno.EBUSY)
+                        if transient_source_io:
+                            failed_mount = source_mount_key
+                        if exc.errno == errno.EIO:
+                            item['_eio_origin'] = 'source'
+                        result, detail = "failed", f"源路径读取失败，已保留待重试: {exc}"
                     else:
+                        if not stat.S_ISREG(source_stat.st_mode):
+                            result, detail = "conflict", "源不是普通文件，可能是历史残留；需人工核查目标与记录"
+                            break
                         try:
                             report_stage("复制并校验目标")
-                            if (item.get("size") or 0) <= self.SMALL_TRANSFER_SERIAL_BYTES:
-                                with self._small_transfer_lock(task):
-                                    result, detail = transfer.transfer(
-                                        item, task, stage_cb=report_stage,
-                                        progress_cb=report_progress)
-                            else:
-                                result, detail = transfer.transfer(
-                                    item, task, stage_cb=report_stage,
-                                    progress_cb=report_progress)
+                            result, detail = self._transfer_with_mount_state(
+                                item, task, mount_key, source_mount_key,
+                                stage_cb=report_stage, progress_cb=report_progress)
                         except Exception as exc:
                             logger.exception("迁移执行异常：task_id=%s queue_id=%s 文件=%s",
                                              item["task_id"], item["id"], item["rel_path"])
                             result, detail = "failed", f"迁移异常: {exc}"
+                    if not (transient_source_io or item.get("_transient_io")):
+                        break
+                    # 挂载瞬时 I/O 故障（网盘限流的主要表现）：先升级挂载级退避并
+                    # 内联重试，把一次限流抖动就地吸收；只有内联重试耗尽才落失败
+                    # 状态与 EIO 记录，避免并发线程同时撞限流刷爆失败/EIO 队列。
+                    if failed_mount is None:
+                        failed_mount = (source_mount_key
+                                        if item.get("_eio_origin") == "source" else mount_key)
+                    self._mount_report_failure(failed_mount)
+                    if attempt < self.MOUNT_TRANSIENT_ATTEMPTS:
+                        logger.warning("迁移遇挂载 I/O 故障，冷却后内联重试（%d/%d）："
+                                       "task_id=%s queue_id=%s 源=%s",
+                                       attempt, self.MOUNT_TRANSIENT_ATTEMPTS - 1,
+                                       task["id"], item["id"], item["src_path"])
+                if result == "success":
+                    self._mount_report_success(mount_key)
+                    self._mount_report_success(source_mount_key)
                 duration_ms = int((time.monotonic() - started) * 1000)
                 report_stage("更新队列与记账")
                 if result == "success":
