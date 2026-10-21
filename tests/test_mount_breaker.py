@@ -27,17 +27,17 @@ class BreakerStateTests(unittest.TestCase):
                 state = self.sched._mount_breaker[key]
                 return state["backoff_until"] - before
 
-        self.assertTrue(9 <= current_delay() <= 11)
+        self.assertTrue(4 <= current_delay() <= 6)
         # 快速连续失败（多线程同一波上报）：等级限速，不叠加升档
-        self.assertTrue(9 <= current_delay() <= 11)
-        self.assertTrue(9 <= current_delay() <= 11)
-        # 故障持续超过爬升间隔后逐档加正
+        self.assertTrue(4 <= current_delay() <= 6)
+        self.assertTrue(4 <= current_delay() <= 6)
+        # 故障持续超过爬升间隔（120s）后逐档加正：5 → 10 → 20
         with self.sched._stats_lock:
-            self.sched._mount_breaker[key]["level_at"] = time.monotonic() - 60
+            self.sched._mount_breaker[key]["level_at"] = time.monotonic() - 130
+        self.assertTrue(9 <= current_delay() <= 11)
+        with self.sched._stats_lock:
+            self.sched._mount_breaker[key]["level_at"] = time.monotonic() - 130
         self.assertTrue(19 <= current_delay() <= 21)
-        with self.sched._stats_lock:
-            self.sched._mount_breaker[key]["level_at"] = time.monotonic() - 60
-        self.assertTrue(39 <= current_delay() <= 41)
         self.assertTrue(self.sched._mount_degraded(key)
                         and self.sched._mount_breaker[key]["level"] == 3)
 

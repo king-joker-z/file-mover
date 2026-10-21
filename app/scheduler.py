@@ -27,13 +27,17 @@ class Scheduler:
     # 挂载级自适应熔断：任一传输遇挂载瞬时 I/O 故障（网盘限流的主要表现）时，
     # 对故障挂载做指数退避冷却，并在降级窗口内把该挂载的全部传输（含大文件）
     # 串行，避免多线程同时撞限流把一次抖动放大成整批失败；传输成功即复位。
-    MOUNT_BACKOFF_BASE_SECONDS = 10
-    MOUNT_BACKOFF_MAX_SECONDS = 120
-    MOUNT_DEGRADED_WINDOW_SECONDS = 180
+    # 参数取舍：瞬时抖动靠内联重试就地吸收（秒级冷却即可），持续故障快速落
+    # 失败队列走 60s 常规重试 + 任务暂停恢复，不再用分钟级冷却惩罚在途传输——
+    # 旧参数（base=10/max=120/escalate=30）下几分钟的持续抖动就把等级推到顶，
+    # 单文件 3 次内联重试每次等 120s，工人线程可见地停摆数分钟。
+    MOUNT_BACKOFF_BASE_SECONDS = 5
+    MOUNT_BACKOFF_MAX_SECONDS = 30
+    MOUNT_DEGRADED_WINDOW_SECONDS = 120
     # 同一挂载的失败等级最小爬升间隔：多线程同一波撞限流会连续上报失败，
     # 若每次都升档，一次抖动就直达长退避；按时间限速让退避随故障持续时间
-    # 平滑加正，单次抖动只记一档。
-    MOUNT_LEVEL_ESCALATE_SECONDS = 30
+    # 平滑加正。两分钟内反复故障才算「持续性」，升一档；单次抖动只记一档。
+    MOUNT_LEVEL_ESCALATE_SECONDS = 120
     # 单文件因挂载瞬时 I/O 放弃前最多尝试次数（含首次）；重试间隔由挂载退避
     # 冷却控制。内联吸收成功则不计失败，落到失败/EIO 队列的只剩持续性故障。
     MOUNT_TRANSIENT_ATTEMPTS = 3
