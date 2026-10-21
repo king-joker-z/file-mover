@@ -18,6 +18,11 @@ class Scheduler:
     STAGE_LOG_MIN_SECONDS = 10  # 阶段切换时上一阶段达到该耗时才记 INFO（过滤快速阶段噪音）
     STAGE_WARN_SECONDS = 300  # 单阶段停留超过该时长判定疑似卡住
     STAGE_WARN_REPEAT_SECONDS = 600  # 疑似卡住 WARNING 的重发间隔
+    # 不超过该大小的文件按目标挂载串行传输：小文件单耗时极短，并发几乎不提升
+    # 吞吐，却把每秒 RPC 数量放大 N 倍，网盘挂载（CloudDrive2/115 等）对小请求
+    # 的限流阈值最低，表现为 EIO 与读回不一致。串行化只针对小文件，大文件仍
+    # 按 transfer_workers 并发。
+    SMALL_TRANSFER_SERIAL_BYTES = 8 << 20
 
     def __init__(self):
         self._stop = threading.Event()
@@ -57,6 +62,7 @@ class Scheduler:
         self._accounting_retry_at = {}  # 数据库暂不可用时限速重试
         self._unstarted_claims = set()  # DB 故障期间待释放的迁移前认领
         self._busy_tasks = {}  # task_id -> 在途迁移数；同一任务最多并发 transfer_workers 个
+        self._small_locks = {}  # 目标挂载 realpath -> 小文件传输互斥锁（懒创建）
         self._stats_lock = threading.Lock()
         self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
         self._next_retention_at = time.monotonic() + 60  # 启动后稍作延迟再首次清理
@@ -845,6 +851,15 @@ class Scheduler:
         self._execute_transfer(item, task_map, track_phase=False)
         return True
 
+    def _small_transfer_lock(self, task) -> threading.Lock:
+        """按目标挂载返回小文件传输互斥锁；不同挂载互不阻塞。"""
+        root = os.path.realpath(task["dst_dir"])
+        with self._stats_lock:
+            lock = self._small_locks.get(root)
+            if lock is None:
+                lock = self._small_locks[root] = threading.Lock()
+            return lock
+
     def _execute_transfer(self, item, task_map, track_phase=True):
         """执行已认领队列项的迁移；串行与异步迁移线程共用。
 
@@ -943,9 +958,15 @@ class Scheduler:
                     else:
                         try:
                             report_stage("复制并校验目标")
-                            result, detail = transfer.transfer(
-                                item, task, stage_cb=report_stage,
-                                progress_cb=report_progress)
+                            if (item.get("size") or 0) <= self.SMALL_TRANSFER_SERIAL_BYTES:
+                                with self._small_transfer_lock(task):
+                                    result, detail = transfer.transfer(
+                                        item, task, stage_cb=report_stage,
+                                        progress_cb=report_progress)
+                            else:
+                                result, detail = transfer.transfer(
+                                    item, task, stage_cb=report_stage,
+                                    progress_cb=report_progress)
                         except Exception as exc:
                             logger.exception("迁移执行异常：task_id=%s queue_id=%s 文件=%s",
                                              item["task_id"], item["id"], item["rel_path"])

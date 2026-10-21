@@ -2512,6 +2512,64 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), b"video")
         self.assertFalse(target.exists())
 
+    def test_small_transfers_serialize_per_mount_large_stay_concurrent(self):
+        task_id = db.create_task(dict(self.task, name="serial small", enabled=True,
+                                      async_transfer=True, interval_seconds=0))
+        task = db.get_task(task_id)
+
+        def make_items(size):
+            made = []
+            for i in range(2):
+                path = self.source(f"movie{size}-{i}.mp4", b"video")
+                db.enqueue(task_id, str(path), path.name,
+                           str(self.dst / path.name), size)
+                made.append(db.list_queue()[-1])
+            return made
+
+        worker = scheduler.Scheduler()
+        worker.HEARTBEAT_INTERVAL = 3600
+        active, max_active = [], [0]
+        guard = threading.Lock()
+        barrier = threading.Barrier(2)
+        inner = threading.Barrier(2)
+        expect_overlap = [False]
+
+        def fake_transfer(item, task, **kwargs):
+            with guard:
+                active.append(item["id"])
+                max_active[0] = max(max_active[0], len(active))
+            if expect_overlap[0]:
+                # 等第二个线程也进入传输，确保「并发」是真实发生的而非时序巧合
+                inner.wait(timeout=5)
+            else:
+                time.sleep(0.05)
+            with guard:
+                active.remove(item["id"])
+            return "failed", "test"
+
+        def run(item):
+            barrier.wait()
+            worker._execute_transfer(item, {task_id: task}, track_phase=False)
+
+        def measure(items):
+            active.clear()
+            max_active[0] = 0
+            threads = [threading.Thread(target=run, args=(it,)) for it in items]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            return max_active[0]
+
+        with patch.object(transfer, "transfer", side_effect=fake_transfer):
+            # 小文件：同一目标挂载串行传输，避免 RPC 密度触发挂载限流
+            small = make_items(100)
+            self.assertEqual(measure(small), 1)
+            # 大文件：保持 transfer_workers 并发不受影响
+            large = make_items(scheduler.Scheduler.SMALL_TRANSFER_SERIAL_BYTES + 1)
+            expect_overlap[0] = True
+            self.assertEqual(measure(large), 2)
+
     def test_scan_eio_circuit_breaker_blocks_queue_until_successful_scan(self):
         task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
         source = self.source("movie.mp4", b"video")
@@ -3500,13 +3558,17 @@ class LaneSchedulingTests(unittest.TestCase):
         self.assertFalse(first.is_alive())
 
     def test_transfer_workers_allow_parallel_files_per_task(self):
-        """transfer_workers>1 时，同一任务可同时迁移多个文件，达到上限后拒绝再领取。"""
+        """transfer_workers>1 时，同一任务可同时迁移多个文件，达到上限后拒绝再领取。
+
+        用大文件尺寸避开小文件串行化逻辑，单独验证并行领取语义。
+        """
         task_id = db.create_task(dict(self.task, name="parallel", enabled=True,
                                       interval_seconds=0, async_transfer=True,
                                       transfer_workers=2))
         for name in ("a.mp4", "b.mp4"):
             source = self.source(name, name.encode())
-            db.enqueue(task_id, str(source), name, str(self.dst / name), len(name))
+            db.enqueue(task_id, str(source), name, str(self.dst / name),
+                       scheduler.Scheduler.SMALL_TRANSFER_SERIAL_BYTES + 1)
         worker = scheduler.Scheduler()
         first_entered, second_entered = threading.Event(), threading.Event()
         release = threading.Event()
