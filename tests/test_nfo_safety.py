@@ -2570,6 +2570,49 @@ class NfoSafetyTests(unittest.TestCase):
             expect_overlap[0] = True
             self.assertEqual(measure(large), 2)
 
+    def test_queued_sync_requests_process_one_per_call(self):
+        src_a, dst_a = self.src / "qa", self.dst / "qa"
+        src_b, dst_b = self.src / "qb", self.dst / "qb"
+        for d in (src_a, dst_a, src_b, dst_b):
+            d.mkdir(parents=True, exist_ok=True)
+        task_a = db.create_task(dict(self.task, name="qa", enabled=True,
+                                     src_dir=str(src_a), dst_dir=str(dst_a)))
+        task_b = db.create_task(dict(self.task, name="qb", enabled=True,
+                                     src_dir=str(src_b), dst_dir=str(dst_b)))
+        worker = scheduler.Scheduler()
+        worker.SCAN_QUEUE_YIELD_SECONDS = 0
+        self.assertTrue(worker.sync_now(task_a)["ok"])
+        self.assertTrue(worker.sync_now(task_b)["ok"])
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._process_sync_requests()
+        done = [t for t in (task_a, task_b) if worker.sync_progress[t]["done"]]
+        self.assertEqual(len(done), 1)  # 每次调用只处理一个请求，扫描间留出让位窗口
+        self.assertEqual(len(worker._sync_requests), 1)
+        with patch.object(worker, "_task_paths_safe", return_value=True):
+            worker._process_sync_requests()
+        self.assertTrue(all(worker.sync_progress[t]["done"] for t in (task_a, task_b)))
+        self.assertEqual(worker._sync_requests, set())
+
+    def test_recovery_scan_interleaves_with_pending_manual_requests(self):
+        src_r, dst_r = self.src / "rr", self.dst / "rr"
+        src_n, dst_n = self.src / "rn", self.dst / "rn"
+        for d in (src_r, dst_r, src_n, dst_n):
+            d.mkdir(parents=True, exist_ok=True)
+        recovery = db.create_task(dict(self.task, name="rr", enabled=True,
+                                       src_dir=str(src_r), dst_dir=str(dst_r)))
+        normal = db.create_task(dict(self.task, name="rn", enabled=True,
+                                     src_dir=str(src_n), dst_dir=str(dst_n)))
+        worker = scheduler.Scheduler()
+        worker._scan_retry_at[recovery] = time.time() - 1  # 熔断冷却已到期
+        self.assertTrue(worker.sync_now(normal)["ok"])  # 手动请求排队中
+        with (patch.object(worker, "_task_paths_safe", return_value=True),
+              patch.object(scanner, "scan_task", wraps=scanner.scan_task) as scan):
+            worker._scan_due_tasks(dict(config.DEFAULTS), db.list_tasks(), time.time())
+        scanned = {call.args[0]["id"] for call in scan.call_args_list}
+        self.assertIn(recovery, scanned)  # 冷却到期的恢复扫描插队执行
+        self.assertNotIn(normal, scanned)  # 其余自动扫描仍让位于手动请求
+        self.assertEqual(worker._sync_requests, {normal})
+
     def test_scan_eio_circuit_breaker_blocks_queue_until_successful_scan(self):
         task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
         source = self.source("movie.mp4", b"video")

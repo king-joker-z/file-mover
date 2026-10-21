@@ -23,6 +23,9 @@ class Scheduler:
     # 的限流阈值最低，表现为 EIO 与读回不一致。串行化只针对小文件，大文件仍
     # 按 transfer_workers 并发。
     SMALL_TRANSFER_SERIAL_BYTES = 8 << 20
+    # 多个手动同步排队时，两次扫描之间的让位时长：迁移线程可趁机领取新文件，
+    # 冷却到期的恢复扫描也能插队，避免连续整树扫描把上传长时间完全饿死。
+    SCAN_QUEUE_YIELD_SECONDS = 3
 
     def __init__(self):
         self._stop = threading.Event()
@@ -288,22 +291,26 @@ class Scheduler:
             self._active_scan_state = None
 
     def _process_sync_requests(self):
-        """在 _scan_loop 线程内执行：处理待处理的立即同步请求"""
-        while True:
-            with self._requests_lock:
-                if not self._sync_requests:
-                    return
-                task_id = self._sync_requests.pop()
-            prog = self.sync_progress.get(task_id)
-            if not prog:
-                continue
-            self._last_scan_phase = (task_id, "立即同步准备中", time.monotonic())
-            try:
-                if time.time() < self._scan_retry_at.get(task_id, 0):
-                    prog["error"] = "目录故障后冷却中，请至少等待 60 秒再同步"
-                    logger.warning("立即同步冷却中：task_id=%s 剩余=%.1fs", task_id,
-                                   self._scan_retry_at[task_id] - time.time())
-                    continue
+        """在 _scan_loop 线程内执行：每次处理一个立即同步请求。
+
+        多个任务同时触发手动同步时逐个处理，且两次扫描之间短暂让出
+        （此时 _scan_io_waiting 已清除）：迁移线程可趁机领取新文件，
+        避免背靠背的整树扫描把上传长时间完全饿死。
+        """
+        with self._requests_lock:
+            if not self._sync_requests:
+                return
+            task_id = self._sync_requests.pop()
+        prog = self.sync_progress.get(task_id)
+        if not prog:
+            return
+        self._last_scan_phase = (task_id, "立即同步准备中", time.monotonic())
+        try:
+            if time.time() < self._scan_retry_at.get(task_id, 0):
+                prog["error"] = "目录故障后冷却中，请至少等待 60 秒再同步"
+                logger.warning("立即同步冷却中：task_id=%s 剩余=%.1fs", task_id,
+                               self._scan_retry_at[task_id] - time.time())
+            else:
                 prog["current"] = "读取任务配置"
                 self._last_scan_phase = (task_id, "读取任务配置", time.monotonic())
                 task = db.get_task(task_id)
@@ -317,16 +324,18 @@ class Scheduler:
                 else:
                     prog["error"] = "任务不存在或已停用"
                     logger.warning("立即同步跳过：task_id=%s 任务不存在或已停用", task_id)
-            except Exception as e:
-                logger.error("立即同步失败：task_id=%s 阶段=%s", task_id, prog.get("current"))
-                self._scan_failed(e, task_id)
-                self._pause_task_for_scan(task_id)
-                prog["error"] = str(e)
-            finally:
-                self.last_scan_ts[task_id] = time.time()
-                prog["done"] = True
-                prog["running"] = False
-                prog["current"] = ""
+        except Exception as e:
+            logger.error("立即同步失败：task_id=%s 阶段=%s", task_id, prog.get("current"))
+            self._scan_failed(e, task_id)
+            self._pause_task_for_scan(task_id)
+            prog["error"] = str(e)
+        finally:
+            self.last_scan_ts[task_id] = time.time()
+            prog["done"] = True
+            prog["running"] = False
+            prog["current"] = ""
+        if self._sync_requests and not self._stop.is_set():
+            self._stop.wait(self.SCAN_QUEUE_YIELD_SECONDS)
 
     # ---------- 统计 ----------
 
@@ -467,32 +476,7 @@ class Scheduler:
                     now = time.time()
                     self._last_scan_phase = (None, "读取任务列表", time.monotonic())
                     tasks = db.list_tasks()
-                    for task in tasks:
-                        if self._sync_requests:
-                            break
-                        # 仅手动扫描的任务不参与自动调度，等待「立即扫描」触发。
-                        if not task.get("enabled") or task.get("manual_only"):
-                            continue
-                        interval = task.get("scan_interval") or cfg["scan_interval"]
-                        retry_at = self._scan_retry_at.get(task["id"])
-                        if ((retry_at is not None and now < retry_at) or
-                                (retry_at is None and now - self.last_scan_ts.get(task["id"], 0) < interval)):
-                            continue
-                        if self._sync_requests or not self._scan_lock.acquire(timeout=0.1):
-                            break
-                        try:
-                            self._last_scan_phase = None  # 由扫描自身的心跳报告具体阶段
-                            self._run_scan(task)
-                            self.last_scan_success_at = time.time()
-                            self._scan_succeeded(task["id"])
-                        except Exception as exc:
-                            self._scan_failed(exc, task["id"])
-                            # 不依赖用户设置的扫描间隔，持续 EIO 最多每分钟重试一次。
-                            self._pause_task_for_scan(task["id"])
-                        finally:
-                            self.last_scan_ts[task["id"]] = time.time()
-                            self._scan_lock.release()
-                            self._last_scan_phase = None
+                    self._scan_due_tasks(cfg, tasks, now)
                     self._last_scan_phase = (None, "处理立即同步请求", time.monotonic())
                     self._process_sync_requests()
                     now_monotonic = time.monotonic()
@@ -524,6 +508,40 @@ class Scheduler:
         retry_at = time.time() + 60
         self._scan_retry_at[task_id] = retry_at
         db.set_scan_failure(task_id, retry_at)
+
+    def _scan_due_tasks(self, cfg, tasks, now):
+        """扫描到期任务；手动同步排队期间仅放行冷却到期的恢复扫描。
+
+        传输 EIO 熔断的任务需要一次成功扫描才能恢复；若恢复扫描被排队的
+        手动请求完全挡住，熔断会随着排队时长被无限拉长，因此让冷却到期的
+        任务插队，其余自动扫描仍让位于手动请求。
+        """
+        for task in tasks:
+            if self._sync_requests and task["id"] not in self._scan_retry_at:
+                continue
+            # 仅手动扫描的任务不参与自动调度，等待「立即扫描」触发。
+            if not task.get("enabled") or task.get("manual_only"):
+                continue
+            interval = task.get("scan_interval") or cfg["scan_interval"]
+            retry_at = self._scan_retry_at.get(task["id"])
+            if ((retry_at is not None and now < retry_at) or
+                    (retry_at is None and now - self.last_scan_ts.get(task["id"], 0) < interval)):
+                continue
+            if not self._scan_lock.acquire(timeout=0.1):
+                break
+            try:
+                self._last_scan_phase = None  # 由扫描自身的心跳报告具体阶段
+                self._run_scan(task)
+                self.last_scan_success_at = time.time()
+                self._scan_succeeded(task["id"])
+            except Exception as exc:
+                self._scan_failed(exc, task["id"])
+                # 不依赖用户设置的扫描间隔，持续 EIO 最多每分钟重试一次。
+                self._pause_task_for_scan(task["id"])
+            finally:
+                self.last_scan_ts[task["id"]] = time.time()
+                self._scan_lock.release()
+                self._last_scan_phase = None
 
     def _scan_failed(self, exc, task_id=None):
         logger.error("扫描故障：task_id=%s 错误=%s", task_id, exc,
