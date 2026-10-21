@@ -226,6 +226,12 @@ class Scheduler:
         logger.info("人工重试记账：queue_id=%s", queue_id)
         return True
 
+    def forget_queue_item(self, queue_id: int) -> None:
+        """人工移除队列项后清理内存跟踪，避免补偿/限速/回退认领状态残留。"""
+        self._accounting_blocked.discard(queue_id)
+        self._accounting_retry_at.pop(queue_id, None)
+        self._unstarted_claims.discard(queue_id)
+
     def request_retention(self):
         """请求尽快执行一次数据保留清理（如设置页刚改过保留天数）。"""
         self._next_retention_at = 0.0

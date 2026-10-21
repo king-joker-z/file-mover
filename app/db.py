@@ -1129,6 +1129,25 @@ def clear_queue(status=None) -> int:
         return cur.rowcount
 
 
+def delete_queue_item(queue_id: int) -> bool:
+    """人工移除单个队列项（清卡死记录）。轮次明细标记取消，与批量清除同语义。
+
+    源文件仍存在的项下次扫描会重新入队；待记账项源已删，移除即永久放弃补记账。
+    迁移中项允许移除：在途线程后续的状态写入/凭证落盘均为条件更新，行不存在时
+    干净失败，不会损坏数据——移除只丢跟踪记录，不清理已写入的目标。
+    """
+    conn = get_conn()
+    with _lock, conn:
+        if conn.execute("SELECT 1 FROM queue WHERE id=?", (queue_id,)).fetchone() is None:
+            return False
+        conn.execute("UPDATE upload_round_files SET status='cancelled', retry_at=NULL"
+                     " WHERE status NOT IN ('done','conflict') AND queue_id=? AND round_id IN"
+                     " (SELECT id FROM upload_rounds WHERE finished_at IS NULL)", (queue_id,))
+        conn.execute("DELETE FROM queue WHERE id=?", (queue_id,))
+        _finish_rounds(conn)
+        return True
+
+
 def clear_logs() -> int:
     conn = get_conn()
     with _lock, conn:

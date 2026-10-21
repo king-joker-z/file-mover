@@ -648,6 +648,16 @@ def api_retry_failed():
     return {"ok": True, "retried": count}
 
 
+@app.delete("/api/queue/{queue_id}")
+def api_delete_queue_item(queue_id: int):
+    """人工移除单个队列项：清卡死记录（待记账/迁移中无出路的项等）。"""
+    if not db.delete_queue_item(queue_id):
+        raise HTTPException(404, "队列项不存在")
+    scheduler.forget_queue_item(queue_id)
+    logger.warning("人工移除队列项：queue_id=%s", queue_id)
+    return {"ok": True, "removed": True}
+
+
 @app.delete("/api/queue")
 def api_clear_queue(status: Optional[str] = None):
     """清空队列。默认只清 done；传 status=failed/conflict/all 按需清除"""

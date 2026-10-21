@@ -191,6 +191,52 @@ class QueueRetryAndDirsTests(unittest.TestCase):
         self.assertEqual(db.list_queue()[0]["status"], "accounting_pending")
         self.assertEqual(db.list_logs()[0]["result"], "accounting_pending")
 
+    # ---------- 单条移除：清卡死记录 ----------
+
+    def test_delete_queue_item_removes_row(self):
+        _, item = self.enqueue_item()
+        self.assertTrue(db.delete_queue_item(item["id"]))
+        self.assertEqual(db.list_queue(), [])
+        self.assertFalse(db.delete_queue_item(item["id"]))  # 重复删除返回 False
+
+    def test_api_delete_queue_item(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        _, item = self.enqueue_item()
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            missing = client.delete("/api/queue/99999", headers=headers)
+            self.assertEqual(missing.status_code, 404)
+            response = client.delete(f"/api/queue/{item['id']}", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(db.list_queue(), [])
+
+    def test_delete_stuck_accounting_pending_unblocks_task_deletion(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        task_id, item = self.enqueue_item()
+        self.persist_accounting(item)
+        worker = scheduler.scheduler
+        worker._accounting_blocked.add(item["id"])
+        self.addCleanup(worker._accounting_blocked.discard, item["id"])
+        # 待记账项存在时任务不可删除——正是「卡死无出路」的场景
+        with self.assertRaises(ValueError):
+            db.delete_task(task_id)
+
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test-token"}
+        with patch.dict(os.environ, {"FILEMOVER_API_TOKEN": "test-token"}):
+            response = client.delete(f"/api/queue/{item['id']}", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(db.list_queue(), [])
+        self.assertNotIn(item["id"], worker._accounting_blocked)
+        self.assertNotIn(item["id"], worker._accounting_retry_at)
+        # 移除后任务可正常删除
+        db.delete_task(task_id)
+
     # ---------- L6: 扫描收尾异常不得泄漏 scanning 标记 ----------
 
     def test_run_scan_finally_resets_active_marker_on_db_error(self):

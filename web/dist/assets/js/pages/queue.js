@@ -91,10 +91,13 @@ export async function load() {
           <td>${q.status === "accounting_pending"
             ? `<button class="btn small" data-retry="${q.id}">重试记账</button>`
             : ["failed", "conflict"].includes(q.status)
-              ? `<button class="btn small" data-retry="${q.id}">重试</button>` : ""}</td></tr>`).join("")
+              ? `<button class="btn small" data-retry="${q.id}">重试</button>` : ""}
+            <button class="btn small danger-ghost" data-remove="${q.id}">移除</button></td></tr>`).join("")
         + "</table></div>";
     list.querySelectorAll("button[data-retry]").forEach(b =>
       b.addEventListener("click", () => retryOne(Number(b.dataset.retry))));
+    list.querySelectorAll("button[data-remove]").forEach(b =>
+      b.addEventListener("click", () => removeOne(Number(b.dataset.remove))));
     renderPager("#queue-pager", page, total, PAGE_SIZE, p => {
       page = p; load();
       rootEl.scrollIntoView({ behavior: "smooth" });
@@ -112,6 +115,18 @@ async function retryOne(id) {
     load();
     document.dispatchEvent(new CustomEvent("fm:data-changed"));
   } catch (e) { toast("重试失败: " + e.message, "error"); }
+}
+
+async function removeOne(id) {
+  const ok = await confirmDialog(
+    "确认从队列移除该记录？\n· 待记账/迁移中项：移除后不再补记账，已写入的目标文件保留不清理\n· 源文件仍存在的项：下次扫描会重新入队（需永久排除请用任务的排除规则）",
+    { title: "移除队列项", danger: true, okText: "移除" });
+  if (!ok) return;
+  try {
+    await api(`/api/queue/${id}`, { method: "DELETE" });
+    load();
+    document.dispatchEvent(new CustomEvent("fm:data-changed"));
+  } catch (e) { toast("移除失败: " + e.message, "error"); }
 }
 
 async function clearQueue(scope) {
