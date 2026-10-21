@@ -467,7 +467,8 @@ function renderHeatmap() {
   let months = "";
   let prevMonth = "";
   for (let c = 0; c < cols; c++) {
-    const idx = lead + c * 7;
+    // 第 c 列首格是 days[c*7 - lead]（前 lead 格是首列空白）；负数说明首列只含部分天，取 days[0]。
+    const idx = Math.max(0, c * 7 - lead);
     if (idx >= days.length) break;
     const month = days[idx].day.slice(5, 7);
     if (month !== prevMonth) {

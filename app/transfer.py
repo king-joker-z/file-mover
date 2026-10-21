@@ -203,6 +203,23 @@ def _report_progress(progress_cb, copied: int, total) -> None:
         pass
 
 
+def _discard_published(parent_fd: int, name: str, written_identity):
+    """发布后校验失败时清理已转正目标，避免残留损坏文件让后续重试落成冲突。
+
+    仅当目标仍是本次写入的 inode 才删除：并发竞争者替换过的文件/软链不动。
+    """
+    try:
+        current = os.lstat(name, dir_fd=parent_fd)  # lstat 本身不跟随软链
+    except OSError:
+        return
+    if (current.st_dev, current.st_ino) != (written_identity.st_dev, written_identity.st_ino):
+        return
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
 def _write_verified(dst: str, source: str = None, content: bytes = None, root: str = None,
                     overwrite: bool = False, verify: str = "strict", progress_cb=None,
                     stage_cb=None, direct: bool = False):
@@ -265,6 +282,7 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                 stream.flush()
                 _report_stage(stage_cb, "等待挂载确认落盘 (fsync)")
                 os.fsync(stream.fileno())
+                written_identity = os.fstat(stream.fileno())
             expected_hash = digest.hexdigest()
             if not overwrite:
                 if not direct:
@@ -303,15 +321,26 @@ def _write_verified(dst: str, source: str = None, content: bytes = None, root: s
                         created = False
                 # direct 模式的目标文件就是最终产物：校验成功则保留，失败由 finally 清理
                 if verify == "off":
-                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    try:
+                        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except OSError:
+                        _discard_published(parent_fd, name, written_identity)
+                        raise
                     if info.st_size != expected_size:
+                        _discard_published(parent_fd, name, written_identity)
                         raise IOError("目标文件大小与写入内容不符，源文件已保留")
                     created = False
                     return expected_hash
                 _report_stage(stage_cb, "读回校验目标内容")
-                size, digest = _fd_digest(os.open(name, os.O_RDONLY | os.O_NOFOLLOW,
-                                                  dir_fd=parent_fd))
+                try:
+                    size, digest = _fd_digest(os.open(name, os.O_RDONLY | os.O_NOFOLLOW,
+                                                      dir_fd=parent_fd))
+                except OSError:
+                    _discard_published(parent_fd, name, written_identity)
+                    raise
                 if (size, digest) != (expected_size, expected_hash):
+                    # 已发布目标不可信时删除再重传（源仍在）；否则残留目标会让下次重试变冲突。
+                    _discard_published(parent_fd, name, written_identity)
                     raise IOError("目标文件读回校验失败，源文件已保留")
                 created = False
                 return expected_hash

@@ -21,7 +21,8 @@ export function mount(root) {
         <input id="log-search" type="search" placeholder="源/目标路径、详情" autocomplete="off" maxlength="256">
         <select id="log-status" aria-label="日志结果">
           <option value="">全部结果</option><option value="success">成功</option>
-          <option value="failed">失败</option><option value="conflict">冲突</option></select>
+          <option value="failed">失败</option><option value="conflict">冲突</option>
+          <option value="accounting_pending">待记账</option></select>
         <select id="log-task" aria-label="所属任务"><option value="">全部任务</option></select></div>
       <div id="log-list"><div class="empty">加载日志中…</div></div>
       <div class="pager" id="log-pager"></div>
@@ -63,8 +64,8 @@ export async function load() {
       ? `<div class="empty">${params.has("search") || params.has("status") || params.has("task_id") ? "未找到匹配的日志" : "暂无日志"}</div>`
       : `<div class="table-wrap"><table><tr><th>时间</th><th>文件</th><th>结果</th><th>耗时</th><th>详情</th></tr>` +
         items.map(l => `<tr><td>${esc(l.created_at)}</td><td class="path-cell" title="${esc(l.dst_path)}">${esc(l.src_path)}</td>
-          <td><span class="tag ${l.result === "success" ? "done" : l.result === "failed" ? "failed" : "conflict"}">
-            ${{ success: "成功", failed: "失败", conflict: "冲突" }[l.result] || esc(l.result)}</span></td>
+          <td><span class="tag ${esc(l.result)}">
+            ${{ success: "成功", failed: "失败", conflict: "冲突", accounting_pending: "待记账" }[l.result] || esc(l.result)}</span></td>
           <td>${l.duration_ms}ms</td><td class="log-detail path-cell">${esc(l.detail)}</td></tr>`).join("")
         + "</table></div>";
     renderPager("#log-pager", page, total, PAGE_SIZE, p => {

@@ -78,6 +78,7 @@ export async function load() {
       const hint = rootEl.querySelector("#queue-pause-hint");
       if (hint) hint.textContent = pausedCount ? `已暂停迁移的任务：${pausedCount} 个` : "";
     } catch (_) { /* 暂停提示失败不影响队列展示 */ }
+    if (id !== requestId) return;  // 第二个 await 期间切换了筛选/搜索时，丢弃本次旧响应
     if (!items.length && total && page > 0) { page = Math.ceil(total / PAGE_SIZE) - 1; return load(); }
     const list = rootEl.querySelector("#queue-list");
     list.innerHTML = !items.length
@@ -87,8 +88,10 @@ export async function load() {
           <td>${fmtSize(q.size)}</td>
           <td><span class="tag ${esc(q.status)}">${statusLabels[q.status] || esc(q.status)}</span></td>
           <td>${q.retries}</td><td>${esc(q.updated_at)}</td>
-          <td>${["failed", "conflict"].includes(q.status)
-            ? `<button class="btn small" data-retry="${q.id}">重试</button>` : ""}</td></tr>`).join("")
+          <td>${q.status === "accounting_pending"
+            ? `<button class="btn small" data-retry="${q.id}">重试记账</button>`
+            : ["failed", "conflict"].includes(q.status)
+              ? `<button class="btn small" data-retry="${q.id}">重试</button>` : ""}</td></tr>`).join("")
         + "</table></div>";
     list.querySelectorAll("button[data-retry]").forEach(b =>
       b.addEventListener("click", () => retryOne(Number(b.dataset.retry))));

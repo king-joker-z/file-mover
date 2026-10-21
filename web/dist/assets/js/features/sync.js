@@ -211,6 +211,7 @@ export function tickCountdowns() {
     else if (entry.status === "manual") el.textContent = "手动扫描中";
     else if (entry.status === "scanning") el.textContent = "定时扫描中";
     else if (entry.status === "manual_wait") el.textContent = "等待手动触发";
+    else if (entry.status === "paused") el.textContent = "迁移已暂停";
     else if (entry.next_scan_at == null) el.textContent = "等待调度";
     else {
       const remaining = entry.next_scan_at - (Date.now() / 1000 - store.serverClockOffset);

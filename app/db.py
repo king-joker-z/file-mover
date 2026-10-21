@@ -1084,9 +1084,10 @@ def count_queue(status=None, search=None) -> int:
 def retry_queue(ids):
     conn = get_conn()
     with _lock, conn:
+        # 只允许失败/冲突项重试：done 重试会在源已删除后落成假冲突，accounting_pending 由记账补偿路径处理。
         conn.executemany(
             "UPDATE queue SET status='pending', next_retry_at=NULL, retries=0, updated_at=?"
-            " WHERE id=? AND status NOT IN ('transferring','accounting_pending')",
+            " WHERE id=? AND status IN ('failed','conflict')",
             [(now_str(), i) for i in ids])
         for queue_id in ids:
             row = conn.execute("SELECT task_id, rel_path FROM queue WHERE id=? AND status='pending'",

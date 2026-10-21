@@ -17,14 +17,14 @@ export function confirmDialog(message, { title = "请确认", okText = "确定",
     foot.innerHTML =
       `<button type="button" class="btn gray" data-act="cancel">取消</button>` +
       `<button type="button" class="btn ${danger ? "red" : ""}" data-act="ok">${okText}</button>`;
-    const modal = openModal({ title, body: `<div class="dialog-msg"></div>`, footer: foot, dialogClass: "dialog-card" });
+    // onClose 覆盖全部关闭路径（遮罩/✕/Esc/编程式），漏包会导致 Promise 永不 resolve。
+    const modal = openModal({ title, body: `<div class="dialog-msg"></div>`, footer: foot,
+      dialogClass: "dialog-card", onClose: () => done(false) });
     modal.body.querySelector(".dialog-msg").textContent = message;
     let settled = false;
     const done = value => { if (!settled) { settled = true; resolve(value); modal.close(); } };
     foot.querySelector('[data-act="ok"]').onclick = () => done(true);
     foot.querySelector('[data-act="cancel"]').onclick = () => done(false);
-    const originClose = modal.close;
-    modal.close = () => { done(false); originClose(); };
   });
 }
 
@@ -48,13 +48,12 @@ export function promptDialog(message, { title = "请输入", okText = "确定", 
       `<button type="button" class="btn gray" data-act="cancel">取消</button>` +
       `<button type="button" class="btn" data-act="ok">${okText}</button>`;
 
-    const modal = openModal({ title, body, footer: foot, dialogClass: "dialog-card" });
+    const modal = openModal({ title, body, footer: foot, dialogClass: "dialog-card",
+      onClose: () => done(null) });
     let settled = false;
     const done = value => { if (!settled) { settled = true; resolve(value); modal.close(); } };
     foot.querySelector('[data-act="ok"]').onclick = () => done(input.value);
     foot.querySelector('[data-act="cancel"]').onclick = () => done(null);
-    const originClose = modal.close;
-    modal.close = () => { done(null); originClose(); };
     input.focus();
     input.select();
     input.addEventListener("keydown", e => {

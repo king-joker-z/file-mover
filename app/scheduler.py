@@ -211,6 +211,21 @@ class Scheduler:
         self._scan_wake.set()
         self._work_wake.set()
 
+    def retry_accounting(self, queue_id: int) -> bool:
+        """人工重试记账：解除待核查/限速标记，迁移线程将立即重新校验目标并补记账。
+
+        待记账项的源文件通常已删除，不能按普通迁移重传；只能重跑目标校验。
+        """
+        try:
+            db.get_accounting_pending(queue_id)
+        except ValueError:
+            return False
+        self._accounting_blocked.discard(queue_id)
+        self._accounting_retry_at.pop(queue_id, None)
+        self._work_wake.set()
+        logger.info("人工重试记账：queue_id=%s", queue_id)
+        return True
+
     def request_retention(self):
         """请求尽快执行一次数据保留清理（如设置页刚改过保留天数）。"""
         self._next_retention_at = 0.0
@@ -300,10 +315,11 @@ class Scheduler:
             try:
                 db.finish_round_scan(task_id)
             finally:
+                # 收尾自身抛错（如 DB 故障）时也必须复位，否则 stats() 永远显示 scanning。
                 self._scan_io_waiting.clear()
                 finished.set()
-            self._active_scan_task_id = None
-            self._active_scan_state = None
+                self._active_scan_task_id = None
+                self._active_scan_state = None
 
     def _process_sync_requests(self):
         """在 _scan_loop 线程内执行：每次处理一个立即同步请求。
@@ -1106,6 +1122,7 @@ class Scheduler:
                     self._mount_report_success(source_mount_key)
                 duration_ms = int((time.monotonic() - started) * 1000)
                 report_stage("更新队列与记账")
+                accounted = False
                 if result == "success":
                     with self._stats_lock:
                         self.moved_today += 1
@@ -1127,6 +1144,7 @@ class Scheduler:
                             detail += f"；{self.last_accounting_error}"
                         else:
                             self.last_accounting_error = None
+                            accounted = True
                 elif result == "conflict":
                     db.set_status(item["id"], "conflict")
                 elif result == "failed":
@@ -1166,7 +1184,8 @@ class Scheduler:
                         db.set_status(item["id"], "failed", retries=retries)
                         detail += f"，已达最大重试次数({cfg['max_retries']})，等待手动重试"
                 # DB 将 success 日志索引成迁移凭证；未记账时不能授予该凭证。
-                log_result = "accounting_pending" if result == "success" and self.last_accounting_error else result
+                # 只看本项的 accounted 标记：全局 last_accounting_error 会被并发传输互相覆盖，误标本条日志。
+                log_result = "accounting_pending" if result == "success" and not accounted else result
                 self._log(item, duration_ms, log_result, detail)
                 db.cleanup_orphan_queue(item["id"])
             finally:

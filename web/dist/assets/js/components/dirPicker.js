@@ -28,7 +28,8 @@ export function pickDirectory() {
       `<div class="log-detail" style="margin-bottom:8px">点 <b>▸</b> 展开子层级，点击目录名选中</div>` +
       `<div class="dir-tree" data-tree><div class="empty">加载中…</div></div>`;
 
-    const modal = openModal({ title: "选择目录", body, footer: foot, width: "480px" });
+    const modal = openModal({ title: "选择目录", body, footer: foot, width: "480px",
+      onClose: () => done(null) });
     const tree = modal.body.querySelector("[data-tree]");
     const selLabel = foot.querySelector("[data-sel]");
 
@@ -45,8 +46,6 @@ export function pickDirectory() {
       done(selAbs);
     };
     foot.querySelector('[data-act="cancel"]').onclick = () => done(null);
-    const originClose = modal.close;
-    modal.close = () => { done(null); originClose(); };
 
     function markSelected(row, rel) {
       const id = ++requestId;
@@ -115,7 +114,7 @@ export function pickDirectory() {
       tree.innerHTML = "";
       d.dirs.forEach(n => tree.appendChild(makeNode(d.rel ? d.rel + "/" + n : n, n)));
     }).catch(e => {
-      if (!settled) tree.innerHTML = '<div class="empty">加载失败: ' + e.message + "</div>";
+      if (!settled) tree.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + "</div>";
     });
   });
 }

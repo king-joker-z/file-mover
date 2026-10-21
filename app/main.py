@@ -290,12 +290,24 @@ def api_dirs(rel: Optional[str] = None):
     else:
         target = root
         rel = ""
-    if not target.resolve().is_relative_to(root):
-        raise HTTPException(400, "路径非法")
-    if not target.is_dir():
-        raise HTTPException(404, "目录不存在")
-    dirs = sorted([p.name for p in target.iterdir()
-                   if p.is_dir() and not p.name.startswith(".")])
+    try:
+        if not target.resolve().is_relative_to(root):
+            raise HTTPException(400, "路径非法")
+        if not target.is_dir():
+            raise HTTPException(404, "目录不存在")
+        # 一次性枚举，避免挂载读取失败被误当作空目录（与 /api/browse 一致返回 503）。
+        children = sorted(target.iterdir(), key=lambda x: x.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, f"目录不存在: {target}") from exc
+    except OSError as exc:
+        raise HTTPException(503, f"读取目录失败: {target} ({exc})") from exc
+    dirs = []
+    for p in children:
+        try:
+            if p.is_dir() and not p.name.startswith("."):
+                dirs.append(p.name)
+        except OSError:
+            continue  # 单个子目录 stat 失败只跳过该项，不掩盖其余可用目录
     return {"rel": rel, "path": str(target), "dirs": dirs, "root": str(root)}
 
 
@@ -608,15 +620,22 @@ def api_queue(status: Optional[str] = None, limit: int = 200,
 
 @app.post("/api/queue/{queue_id}/retry")
 def api_retry(queue_id: int):
+    # 待记账项走人工重试记账（重新校验目标后补记），不能当新迁移重传：源文件多已删除。
+    if scheduler.retry_accounting(queue_id):
+        return {"ok": True, "accounting": True}
     db.retry_queue([queue_id])
+    scheduler.wake_scan()
     logger.info("手动重试队列：queue_id=%s", queue_id)
     return {"ok": True}
 
 
 @app.post("/api/queue/retry-batch")
 def api_retry_batch(ids: list[int]):
-    db.retry_queue(ids)
-    logger.info("批量重试队列：数量=%d", len(ids))
+    transfer_ids = [i for i in ids if not scheduler.retry_accounting(i)]
+    if transfer_ids:
+        db.retry_queue(transfer_ids)
+    scheduler.wake_scan()
+    logger.info("批量重试队列：迁移=%d 记账=%d", len(transfer_ids), len(ids) - len(transfer_ids))
     return {"ok": True}
 
 
