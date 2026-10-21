@@ -260,6 +260,43 @@ class InlineRetryTests(unittest.TestCase):
                 state = self.sched._mount_breaker.get(key, {})
             self.assertEqual(state.get("level", 0), 0)
 
+    def test_transient_then_success_reports_absorbed_retries(self):
+        src, dst = self.add_source()
+        calls = {"n": 0}
+
+        def fake_transfer(item, task, stage_cb=None, progress_cb=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                item["_transient_io"] = True
+                item["_eio_origin"] = "target"
+                return "failed", "EIO: input/output error"
+            shutil.copyfile(src, dst)
+            import hashlib
+            digest = hashlib.sha256(open(dst, "rb").read()).hexdigest()
+            size = os.path.getsize(dst)
+            item["_verified_target"] = (size, digest, True, size, digest)
+            return "success", "ok"
+
+        with patch.object(scheduler.transfer, "transfer", fake_transfer):
+            self.sched._execute_transfer(self.claim(), {self.task_id: self.task})
+
+        # 吸收痕迹必须可见：成功日志详情标注内联重试次数，仪表盘能解释冷却来源
+        log = db.list_logs()[0]
+        self.assertEqual(log["result"], "success")
+        self.assertIn("挂载瞬时 I/O 内联重试 1 次后成功", log["detail"])
+        self.assertEqual(self.sched._mount_transient_absorbed, 1)
+        snapshot = self.sched._mount_breaker_snapshot()
+        self.assertEqual(len(snapshot), 1)  # 成功已复位退避；降级串行窗口仍在
+        self.assertEqual(snapshot[0]["backoff_seconds"], 0)
+        self.assertGreater(snapshot[0]["degraded_seconds"], 0)
+
+    def test_breaker_snapshot_empty_without_active_state(self):
+        self.sched._mount_report_failure("/mnt/quiet")
+        with self.sched._stats_lock:
+            self.sched._mount_breaker["/mnt/quiet"]["backoff_until"] = time.monotonic() - 1
+            self.sched._mount_breaker["/mnt/quiet"]["degraded_until"] = time.monotonic() - 1
+        self.assertEqual(self.sched._mount_breaker_snapshot(), [])
+
     def test_non_transient_failure_uses_normal_retry(self):
         src, dst = self.add_source()
 

@@ -81,6 +81,7 @@ class Scheduler:
         self._busy_tasks = {}  # task_id -> 在途迁移数；同一任务最多并发 transfer_workers 个
         self._small_locks = {}  # 挂载 realpath -> 传输互斥锁（小文件常串行；降级窗口内全部串行）
         self._mount_breaker = {}  # 挂载 realpath -> 自适应熔断状态（退避截止/降级截止/失败等级）
+        self._mount_transient_absorbed = 0  # 内联重试吸收的挂载瞬时 I/O 次数（供仪表盘解释冷却）
         self._stats_lock = threading.Lock()
         self._current_transfers = {}  # queue_id -> {"rel_path","task_id","stage"}
         self._next_retention_at = time.monotonic() + 60  # 启动后稍作延迟再首次清理
@@ -406,6 +407,7 @@ class Scheduler:
         now = time.time()
         with self._stats_lock:
             transfers = [dict(entry) for entry in self._current_transfers.values()]
+            mount_transient_absorbed = self._mount_transient_absorbed
         schedules = []
         for task in tasks or []:
             task_id = task["id"]
@@ -484,6 +486,8 @@ class Scheduler:
             "accounting_pending": q.get("accounting_pending", 0) if q is not None else None,
             "last_accounting_error": self.last_accounting_error,
             "last_retention_error": self.last_retention_error,
+            "mount_breakers": self._mount_breaker_snapshot(),
+            "mount_transient_absorbed": mount_transient_absorbed,
             "stats_error": stats_error,
         }
 
@@ -969,6 +973,26 @@ class Scheduler:
                 lock = self._small_locks[mount_key] = threading.Lock()
             return lock
 
+    def _mount_breaker_snapshot(self) -> list:
+        """当前处于冷却/降级窗口的挂载：让「等待挂载冷却」在仪表盘上可解释。
+
+        瞬时 I/O 被内联重试吸收后队列与日志页只显示成功，冷却若不可见
+        就成了「没报错却在等」的谜团；这里把状态与累计吸收数一起暴露。
+        """
+        now = time.monotonic()
+        with self._stats_lock:
+            snapshot = []
+            for mount, state in self._mount_breaker.items():
+                backoff = max(0.0, state.get("backoff_until", 0.0) - now)
+                degraded = max(0.0, state.get("degraded_until", 0.0) - now)
+                if backoff > 0 or degraded > 0:
+                    snapshot.append({
+                        "mount": mount, "level": state.get("level", 0),
+                        "backoff_seconds": int(backoff + 0.5),
+                        "degraded_seconds": int(degraded + 0.5),
+                    })
+            return snapshot
+
     def _transfer_with_mount_state(self, item, task, dst_key, src_key,
                                    stage_cb, progress_cb):
         """按小文件规则与挂载熔断状态决定传输串行或并发。
@@ -1135,6 +1159,12 @@ class Scheduler:
                 if result == "success":
                     with self._stats_lock:
                         self.moved_today += 1
+                        if attempt > 1:
+                            self._mount_transient_absorbed += attempt - 1
+                    if attempt > 1:
+                        # 瞬时 I/O 被内联重试吸收：队列/日志页只显示成功，冷却期却会
+                        # 出现在迁移中心；把吸收次数写进详情，冷却从「无报错之谜」变可解释。
+                        detail += f"；挂载瞬时 I/O 内联重试 {attempt - 1} 次后成功"
                     try:
                         db.persist_accounting_pending(item['id'], item, item.get('_verified_target'))
                     except Exception as exc:
