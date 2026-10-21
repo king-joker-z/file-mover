@@ -28,7 +28,9 @@ class Scheduler:
         self._work_wake = threading.Event()
         self._sync_requests = set()
         self._scan_lock = threading.Lock()
-        # 慢挂载上避免枚举目录与文件迁移同时进行；扫描请求在当前文件结束后优先执行。
+        # _io_lock 只互斥「扫描枚举目录」与「领取队列项」这两个瞬时操作；
+        # 迁移本身在锁外执行（与异步在途传输同等语义），否则单个慢/卡死的
+        # 传输会永久持有 _io_lock，阻塞所有扫描（含手动同步）并冻结全局。
         self._io_lock = threading.Lock()
         self._scan_io_waiting = threading.Event()
         self._requests_lock = threading.Lock()
@@ -731,22 +733,33 @@ class Scheduler:
         if self._scan_io_waiting.is_set():
             self._stop.wait(0.1)
             return
+        # 记账补偿含目标/源全量哈希读回，属于慢挂载 I/O；必须在 _io_lock 外执行，
+        # 保证扫描随时能拿到 _io_lock（否则挂载卡死会连带阻塞所有扫描）。
+        self._last_work_phase = ("检查待补偿记账", time.monotonic())
+        try:
+            self._retry_accounting()
+        finally:
+            self._last_work_phase = None
         with self._io_lock:
             if self._scan_io_waiting.is_set():
                 return
-            idle_timeout = self._work_once_locked()
-        if idle_timeout is not None:
-            self._work_wake.wait(timeout=idle_timeout)
-            self._work_wake.clear()
+            item, task_map, idle_timeout = self._claim_next_locked()
+        if item is None:
+            if idle_timeout is not None:
+                self._work_wake.wait(timeout=idle_timeout)
+                self._work_wake.clear()
+            return
+        # 迁移在 _io_lock 外执行，与异步在途传输同等语义：扫描等待期间只停止
+        # 领取新文件，不等待在途文件完成；单个慢/卡住的传输不再阻塞扫描。
+        self._execute_transfer(item, task_map)
 
-    def _work_once_locked(self):
+    def _claim_next_locked(self):
+        """在 _io_lock 内领取一个待迁移队列项；返回 (item, task_map, idle_timeout)。"""
         for queue_id in tuple(self._unstarted_claims):
             self._last_work_phase = (f"回退迁移前认领 {queue_id}", time.monotonic())
             restored = db.release_unstarted_claim(queue_id)
             self._unstarted_claims.discard(queue_id)
             logger.info("迁移前认领已处理：queue_id=%s 回退数=%s", queue_id, restored)
-        self._last_work_phase = ("检查待补偿记账", time.monotonic())
-        self._retry_accounting()
         self._last_work_phase = ("读取任务列表", time.monotonic())
         task_map = {t["id"]: t for t in db.list_tasks()}
         now = time.monotonic()
@@ -770,8 +783,8 @@ class Scheduler:
             self._last_work_phase = None
             deadlines = [deadline for tid, deadline in self._next_eligible.items()
                          if tid in task_map and task_map[tid].get("enabled") and deadline > now]
-            return min(1, max(0, min(deadlines) - now)) if deadlines else 1
-        self._execute_transfer(item, task_map)
+            return None, None, min(1, max(0, min(deadlines) - now)) if deadlines else 1
+        return item, task_map, None
 
     def _claim_item(self, eligible_task_ids, workers=None):
         """原子认领一条队列项并登记任务占用；同一任务最多 transfer_workers 个在途迁移。"""

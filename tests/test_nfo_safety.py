@@ -724,7 +724,13 @@ class NfoSafetyTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn(task_id, worker._scan_retry_at)
 
-    def test_scan_waits_for_active_transfer_before_enumeration(self):
+    def test_scan_is_not_blocked_by_in_flight_transfer(self):
+        """迁移在 _io_lock 外执行：在途传输不再阻塞扫描枚举（防全局冻结）。
+
+        旧语义是扫描等待当前文件迁移完成；慢挂载/卡死的传输会永久持有
+        _io_lock，导致所有扫描（含手动同步）与所有任务的迁移全部冻结。
+        新语义：扫描与在途传输并行，仅停止领取新文件。
+        """
         task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
         source = self.source("movie.mp4", b"video")
         db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
@@ -751,16 +757,17 @@ class NfoSafetyTests(unittest.TestCase):
             scanning.start()
             try:
                 self.assertTrue(worker._scan_io_waiting.wait(2))
-                self.assertFalse(scanned.wait(0.05))
+                # 在途传输未完成时扫描也应继续进行，而不是永久等待当前文件
+                self.assertTrue(scanned.wait(2))
                 self.assertEqual(db.list_queue()[0]["status"], "transferring")
             finally:
                 release.set()
-                uploading.join(2)
-                scanning.join(2)
-        self.assertFalse(uploading.is_alive())
-        self.assertFalse(scanning.is_alive())
-        self.assertTrue(scanned.is_set())
-        self.assertTrue(source.exists())
+            uploading.join(2)
+            scanning.join(2)
+            self.assertFalse(uploading.is_alive())
+            self.assertFalse(scanning.is_alive())
+            self.assertTrue(scanned.is_set())
+            self.assertTrue(source.exists())
 
     def test_failed_scan_blocks_pending_transfer_before_releasing_io_lock(self):
         task_id = db.create_task(dict(self.task, name="test", enabled=True, interval_seconds=0))
@@ -3429,7 +3436,8 @@ class LaneSchedulingTests(unittest.TestCase):
         db.enqueue(task_id, str(source), source.name, str(self.dst / source.name), 5)
         worker = scheduler.Scheduler()
         with patch.object(worker, "_task_paths_safe", return_value=True):
-            worker._work_once_locked()  # 串行线程不得领取异步任务
+            item, _, _ = worker._claim_next_locked()  # 串行线程不得领取异步任务
+            self.assertIsNone(item)
             self.assertEqual(db.list_queue()[0]["status"], "pending")
             self.assertTrue(worker._async_work_once())  # 异步线程完成迁移
         self.assertEqual(db.queue_stats().get("done"), 1)
@@ -3546,8 +3554,9 @@ class LaneSchedulingTests(unittest.TestCase):
             first.start()
             self.assertTrue(entered.wait(2))
             try:
-                idle = worker._work_once_locked()
-                self.assertEqual(idle, 1)  # 无其他任务时返回空闲超时，不领取在途任务
+                item, task_map, idle = worker._claim_next_locked()
+                self.assertIsNone(item)  # 无其他任务时不领取在途任务
+                self.assertEqual(idle, 1)
                 self.assertEqual(db.queue_stats().get("transferring"), 1)
             finally:
                 release.set()
