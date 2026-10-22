@@ -138,6 +138,54 @@ class QueueRetryAndDirsTests(unittest.TestCase):
 
     # ---------- 采样凭证（trusted=False）的记账恢复 ----------
 
+    def test_normal_accounting_path_accepts_sampled_credential_with_deleted_source(self):
+        # fast/off 去重成功的真实链路：源已按迁移语义删除、凭证为采样强度，
+        # 即时复核（rehash=False）与崩溃恢复复核（rehash=True）都必须放行，
+        # 否则每次去重命中都会误落「未授权目标且源文件缺失」人工核查
+        content = b"x" * 4096
+        _, item = self.enqueue_item(content=content)
+        target = self.dst / "movie.mp4"
+        target.write_bytes(content)
+        sampled = transfer._sampled_digest(str(target))
+        db.set_status(item["id"], "transferring")
+        db.persist_accounting_pending(item["id"], item, (4096, sampled, 0, 4096, sampled))
+        os.unlink(item["src_path"])   # 去重路径在传输阶段已删除源
+
+        task = db.get_task(item["task_id"])
+        pending = db.get_accounting_pending(item["id"])
+        scheduler.Scheduler._verify_accounting(pending, task, rehash=False)
+        db.complete_accounting(pending)
+        self.assertEqual(db.list_queue()[0]["status"], "done")
+
+        # 崩溃恢复等价路径：rehash=True 时按采样强度复核目标，同样放行
+        src2 = self.source("b.mp4", content)
+        db.enqueue(item["task_id"], str(src2), "b.mp4", str(self.dst / "b.mp4"), len(content))
+        item2 = next(r for r in db.list_queue() if r["rel_path"] == "b.mp4")
+        (self.dst / "b.mp4").write_bytes(content)
+        db.set_status(item2["id"], "transferring")
+        db.persist_accounting_pending(item2["id"], item2, (4096, sampled, 0, 4096, sampled))
+        os.unlink(item2["src_path"])
+        pending2 = db.get_accounting_pending(item2["id"])
+        scheduler.Scheduler._verify_accounting(pending2, task, rehash=True)
+        db.complete_accounting(pending2)
+        self.assertEqual([r["status"] for r in db.list_queue()], ["done", "done"])
+
+    def test_verify_accounting_keeps_source_gate_for_keep_tasks(self):
+        # 留源任务（NFO 修正须与源核对）：源缺失时仍须人工核查，不得放行
+        content = b"x" * 64
+        task_id, item = self.enqueue_item(name="show.nfo", content=content)
+        db.update_task(task_id, {"after_action": "keep"})
+        task = db.get_task(task_id)
+        target = self.dst / "show.nfo"
+        target.write_bytes(content)
+        db.set_status(item["id"], "transferring")
+        db.persist_accounting_pending(item["id"], item,
+                                      (len(content), "a" * 64, 0, len(content), "b" * 64))
+        os.unlink(item["src_path"])
+        pending = db.get_accounting_pending(item["id"])
+        with self.assertRaisesRegex(OSError, "未授权目标且源文件缺失"):
+            scheduler.Scheduler._verify_accounting(pending, task, rehash=False)
+
     def test_retry_accounting_sampled_credential_reverifies_by_sampling(self):
         # fast/off 去重落下的采样凭证：恢复时按采样复核，dst_sha256 不落采样摘要
         _, item = self.enqueue_item(content=b"x" * 4096)

@@ -745,7 +745,11 @@ class Scheduler:
         try:
             source_stat = os.lstat(src)
         except FileNotFoundError:
-            if not item['verified_trusted']:
+            # 只有留源任务（NFO 内容修正须与源核对）才要求源文件仍在场；
+            # 删源任务的源已在传输阶段按任务校验强度删除，凭证本身即删除
+            # 授权——采样凭证（trusted=False）同样适用，否则 fast/off 去重
+            # 命中会全部误落「未授权」人工核查。
+            if not item['verified_trusted'] and task.get("after_action", "delete") == "keep":
                 raise OSError('未授权目标且源文件缺失，需人工核查')
         else:
             if src.lower().endswith('.nfo'):
